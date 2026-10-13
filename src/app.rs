@@ -4,7 +4,7 @@ use crate::forms::*;
 use crate::model::*;
 use crate::store::Store;
 use crate::util::{clean, empty_dash, now};
-use crate::widgets::{combo, pill, record_frame, system_combo, tab_button};
+use crate::widgets::{pill, record_frame};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,14 +20,8 @@ pub(crate) struct NomadeerApp {
     data: AppData,
     store: Store,
     status: String,
-    active_tab: PanelTab,
     esi_settings_form: EsiSettingsForm,
     show_esi_settings: bool,
-    system_form: SystemForm,
-    connection_form: ConnectionForm,
-    signature_form: SignatureForm,
-    visit_form: VisitForm,
-    note_form: NoteForm,
     id_counter: u64,
     esi_tx: Sender<Result<EsiTaskResult, String>>,
     esi_rx: Receiver<Result<EsiTaskResult, String>>,
@@ -42,27 +36,8 @@ impl NomadeerApp {
             data: AppData::default(),
             store,
             status: "Ready".to_owned(),
-            active_tab: PanelTab::Systems,
             esi_settings_form: EsiSettingsForm::default(),
             show_esi_settings: false,
-            system_form: SystemForm {
-                class: "C3".to_owned(),
-                status: "scouted".to_owned(),
-                ..Default::default()
-            },
-            connection_form: ConnectionForm {
-                mass_status: "fresh".to_owned(),
-                life_status: "fresh".to_owned(),
-                ..Default::default()
-            },
-            signature_form: SignatureForm {
-                sig_type: "wormhole".to_owned(),
-                life: "fresh".to_owned(),
-                status: "unscanned".to_owned(),
-                ..Default::default()
-            },
-            visit_form: VisitForm::default(),
-            note_form: NoteForm::default(),
             id_counter: 0,
             esi_tx,
             esi_rx,
@@ -177,24 +152,6 @@ impl NomadeerApp {
         self.show_esi_settings = open;
     }
 
-    fn side_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("forms")
-            .resizable(true)
-            .default_width(340.0)
-            .show(ctx, |ui| {
-                ui.heading("Intel forms");
-                self.system_form_ui(ui);
-                ui.separator();
-                self.connection_form_ui(ui);
-                ui.separator();
-                self.signature_form_ui(ui);
-                ui.separator();
-                self.visit_form_ui(ui);
-                ui.separator();
-                self.note_form_ui(ui);
-            });
-    }
-
     fn esi_settings_contents(&mut self, ui: &mut egui::Ui) -> bool {
         let mut close_requested = false;
         ui.label("Register an EVE app with this callback URL:");
@@ -232,266 +189,6 @@ impl NomadeerApp {
         ui.separator();
         ui.label(format!("Database: {}", self.store.path().display()));
         close_requested
-    }
-
-    fn system_form_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("System")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.label("System name");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.system_form.name)
-                        .hint_text("J123456, Thera, Amarr, etc."),
-                );
-                combo(ui, "Class", &mut self.system_form.class, SYSTEM_CLASSES);
-                ui.label("Effect");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.system_form.effect)
-                        .hint_text("Magnetar, Pulsar, Wolf-Rayet..."),
-                );
-                combo(ui, "Status", &mut self.system_form.status, SYSTEM_STATUSES);
-                ui.label("Owner / occupants");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.system_form.owner)
-                        .hint_text("Corp/alliance or occupants"),
-                );
-                ui.label("Notes");
-                ui.add(egui::TextEdit::multiline(&mut self.system_form.notes));
-
-                let can_add = !self.system_form.name.trim().is_empty();
-                if ui
-                    .add_enabled(can_add, egui::Button::new("Add system"))
-                    .clicked()
-                {
-                    let system = SystemNode {
-                        id: self.new_id("sys"),
-                        name: clean(&self.system_form.name),
-                        class: clean(&self.system_form.class),
-                        effect: clean(&self.system_form.effect),
-                        status: clean(&self.system_form.status),
-                        owner: clean(&self.system_form.owner),
-                        notes: clean(&self.system_form.notes),
-                        created_at: now(),
-                    };
-                    self.data.systems.push(system);
-                    self.system_form.name.clear();
-                    self.system_form.effect.clear();
-                    self.system_form.owner.clear();
-                    self.system_form.notes.clear();
-                    self.save();
-                }
-            });
-    }
-
-    fn connection_form_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Connection")
-            .default_open(true)
-            .show(ui, |ui| {
-                system_combo(
-                    ui,
-                    "From",
-                    &self.data.systems,
-                    &mut self.connection_form.from_system,
-                );
-                system_combo(
-                    ui,
-                    "To",
-                    &self.data.systems,
-                    &mut self.connection_form.to_system,
-                );
-                ui.label("Source signature");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.connection_form.signature_from)
-                        .hint_text("ABC-123"),
-                );
-                ui.label("Destination signature");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.connection_form.signature_to)
-                        .hint_text("Optional destination side sig"),
-                );
-                combo(
-                    ui,
-                    "Mass",
-                    &mut self.connection_form.mass_status,
-                    MASS_STATES,
-                );
-                combo(
-                    ui,
-                    "Life",
-                    &mut self.connection_form.life_status,
-                    LIFE_STATES,
-                );
-                ui.label("Ship size");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.connection_form.ship_size)
-                        .hint_text("frig, medium, large, capital"),
-                );
-                ui.label("Notes");
-                ui.add(egui::TextEdit::multiline(&mut self.connection_form.notes));
-
-                let can_add = !self.connection_form.from_system.is_empty()
-                    && !self.connection_form.to_system.is_empty()
-                    && self.connection_form.from_system != self.connection_form.to_system;
-                if ui
-                    .add_enabled(can_add, egui::Button::new("Add connection"))
-                    .clicked()
-                {
-                    let connection = Connection {
-                        id: self.new_id("conn"),
-                        from_system: self.connection_form.from_system.clone(),
-                        to_system: self.connection_form.to_system.clone(),
-                        signature_from: clean(&self.connection_form.signature_from),
-                        signature_to: clean(&self.connection_form.signature_to),
-                        mass_status: clean(&self.connection_form.mass_status),
-                        life_status: clean(&self.connection_form.life_status),
-                        ship_size: clean(&self.connection_form.ship_size),
-                        notes: clean(&self.connection_form.notes),
-                        created_at: now(),
-                    };
-                    self.data.connections.push(connection);
-                    self.connection_form.signature_from.clear();
-                    self.connection_form.signature_to.clear();
-                    self.connection_form.ship_size.clear();
-                    self.connection_form.notes.clear();
-                    self.save();
-                }
-            });
-    }
-
-    fn signature_form_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Signature")
-            .default_open(false)
-            .show(ui, |ui| {
-                system_combo(
-                    ui,
-                    "System",
-                    &self.data.systems,
-                    &mut self.signature_form.system_id,
-                );
-                ui.label("Signature code");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.signature_form.code).hint_text("ABC-123"),
-                );
-                combo(ui, "Type", &mut self.signature_form.sig_type, SIG_TYPES);
-                ui.label("Target");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.signature_form.target)
-                        .hint_text("Destination or site name"),
-                );
-                combo(ui, "Life", &mut self.signature_form.life, LIFE_STATES);
-                ui.label("Scan status");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.signature_form.status)
-                        .hint_text("unscanned, scanned, ignored, despawned"),
-                );
-                ui.label("Notes");
-                ui.add(egui::TextEdit::multiline(&mut self.signature_form.notes));
-
-                let can_add = !self.signature_form.system_id.is_empty()
-                    && !self.signature_form.code.trim().is_empty();
-                if ui
-                    .add_enabled(can_add, egui::Button::new("Add signature"))
-                    .clicked()
-                {
-                    let signature = Signature {
-                        id: self.new_id("sig"),
-                        system_id: self.signature_form.system_id.clone(),
-                        code: clean(&self.signature_form.code),
-                        sig_type: clean(&self.signature_form.sig_type),
-                        target: clean(&self.signature_form.target),
-                        life: clean(&self.signature_form.life),
-                        status: clean(&self.signature_form.status),
-                        notes: clean(&self.signature_form.notes),
-                        created_at: now(),
-                    };
-                    self.data.signatures.push(signature);
-                    self.signature_form.code.clear();
-                    self.signature_form.target.clear();
-                    self.signature_form.notes.clear();
-                    self.save();
-                }
-            });
-    }
-
-    fn visit_form_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Visit log")
-            .default_open(false)
-            .show(ui, |ui| {
-                system_combo(
-                    ui,
-                    "System",
-                    &self.data.systems,
-                    &mut self.visit_form.system_id,
-                );
-                ui.label("Pilot");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.visit_form.pilot).hint_text("Pilot name"),
-                );
-                ui.label("Activity");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.visit_form.activity)
-                        .hint_text("scanned, hacked, rolled, observed hostiles..."),
-                );
-                ui.label("Notes");
-                ui.add(egui::TextEdit::multiline(&mut self.visit_form.notes));
-
-                let can_add = !self.visit_form.system_id.is_empty();
-                if ui
-                    .add_enabled(can_add, egui::Button::new("Log visit"))
-                    .clicked()
-                {
-                    let visit = VisitLog {
-                        id: self.new_id("visit"),
-                        system_id: self.visit_form.system_id.clone(),
-                        pilot: clean(&self.visit_form.pilot),
-                        activity: clean(&self.visit_form.activity),
-                        notes: clean(&self.visit_form.notes),
-                        created_at: now(),
-                    };
-                    self.data.visits.push(visit);
-                    self.visit_form.activity.clear();
-                    self.visit_form.notes.clear();
-                    self.save();
-                }
-            });
-    }
-
-    fn note_form_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Note")
-            .default_open(false)
-            .show(ui, |ui| {
-                system_combo(
-                    ui,
-                    "System",
-                    &self.data.systems,
-                    &mut self.note_form.system_id,
-                );
-                ui.label("Title");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.note_form.title).hint_text("Note title"),
-                );
-                ui.label("Body");
-                ui.add(egui::TextEdit::multiline(&mut self.note_form.body));
-
-                let can_add = !self.note_form.title.trim().is_empty()
-                    || !self.note_form.body.trim().is_empty();
-                if ui
-                    .add_enabled(can_add, egui::Button::new("Add note"))
-                    .clicked()
-                {
-                    let note = Note {
-                        id: self.new_id("note"),
-                        system_id: self.note_form.system_id.clone(),
-                        title: clean(&self.note_form.title),
-                        body: clean(&self.note_form.body),
-                        created_at: now(),
-                    };
-                    self.data.notes.push(note);
-                    self.note_form.title.clear();
-                    self.note_form.body.clear();
-                    self.save();
-                }
-            });
     }
 
     fn start_authorize_account(&mut self, account_id: String) {
@@ -726,25 +423,28 @@ impl NomadeerApp {
     fn central_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Chain map");
+                ui.heading("Reactive dashboard");
                 ui.label(format!(
-                    "{} systems · {} connections · {} signatures",
+                    "{} characters · {} systems · {} inferred connections",
+                    self.data.accounts.len(),
                     self.data.systems.len(),
-                    self.data.connections.len(),
-                    self.data.signatures.len()
+                    self.data.connections.len()
                 ));
+            });
+            ui.add_space(8.0);
+            self.characters_dashboard(ui);
+            ui.separator();
+            self.current_systems_dashboard(ui);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.heading("Chain map");
+                ui.label("Built from ESI movement syncs");
             });
             self.chain_map(ui);
             ui.separator();
-            self.tabs(ui);
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| match self.active_tab {
-                PanelTab::Accounts => self.accounts_list(ui),
-                PanelTab::Systems => self.systems_list(ui),
-                PanelTab::Connections => self.connections_list(ui),
-                PanelTab::Signatures => self.signatures_list(ui),
-                PanelTab::Visits => self.visits_list(ui),
-                PanelTab::Notes => self.notes_list(ui),
+            ui.columns(2, |columns| {
+                self.recent_movements(&mut columns[0]);
+                self.inferred_connections(&mut columns[1]);
             });
         });
     }
@@ -765,7 +465,7 @@ impl NomadeerApp {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                "Add your home system to start mapping the chain",
+                "Sync a character location to start mapping the chain",
                 FontId::proportional(18.0),
                 theme::muted_text(),
             );
@@ -829,43 +529,46 @@ impl NomadeerApp {
         }
     }
 
-    fn tabs(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            tab_button(ui, &mut self.active_tab, PanelTab::Accounts, "Accounts");
-            tab_button(ui, &mut self.active_tab, PanelTab::Systems, "Systems");
-            tab_button(
-                ui,
-                &mut self.active_tab,
-                PanelTab::Connections,
-                "Connections",
-            );
-            tab_button(ui, &mut self.active_tab, PanelTab::Signatures, "Signatures");
-            tab_button(ui, &mut self.active_tab, PanelTab::Visits, "Visits");
-            tab_button(ui, &mut self.active_tab, PanelTab::Notes, "Notes");
-        });
-    }
-
-    fn accounts_list(&mut self, ui: &mut egui::Ui) {
-        let mut delete_id = None;
+    fn characters_dashboard(&mut self, ui: &mut egui::Ui) {
         let mut authorize_id = None;
         let mut sync_id = None;
-        if ui
-            .add_enabled(!self.esi_busy, egui::Button::new("Add character"))
-            .clicked()
-        {
-            self.start_add_character();
+        let mut delete_id = None;
+
+        ui.horizontal(|ui| {
+            ui.heading("Characters");
+            if ui
+                .add_enabled(!self.esi_busy, egui::Button::new("Add character"))
+                .clicked()
+            {
+                self.start_add_character();
+            }
+        });
+
+        if self.data.accounts.is_empty() {
+            record_frame(ui, |ui| {
+                ui.label("No ESI characters yet.");
+                ui.label("Add a character to let Nomadeer react to your current location.");
+            });
         }
-        ui.add_space(8.0);
+
         for account in &self.data.accounts {
             record_frame(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(&account.character_name);
+                ui.horizontal_wrapped(|ui| {
+                    ui.heading(
+                        egui::RichText::new(&account.character_name).color(theme::character_text()),
+                    );
                     pill(ui, &account.auth_status);
                     if !account.last_system_name.is_empty() {
-                        pill(ui, &account.last_system_name);
+                        ui.label(egui::RichText::new("Current system:").color(theme::muted_text()));
+                        ui.label(
+                            egui::RichText::new(&account.last_system_name)
+                                .color(theme::system_text()),
+                        );
                     }
+                });
+                ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(!self.esi_busy, egui::Button::new("Authorize ESI"))
+                        .add_enabled(!self.esi_busy, egui::Button::new("Authorize"))
                         .clicked()
                     {
                         authorize_id = Some(account.id.clone());
@@ -879,24 +582,19 @@ impl NomadeerApp {
                     {
                         sync_id = Some(account.id.clone());
                     }
-                    if ui.small_button("Delete").clicked() {
+                    if ui.small_button("Remove").clicked() {
                         delete_id = Some(account.id.clone());
                     }
                 });
                 if !account.character_id.is_empty() {
                     ui.label(format!("Character ID: {}", account.character_id));
                 }
-                if account.auth_status == "unauthorized" {
-                    ui.label("Not authorized with ESI yet.");
-                }
                 if account.auth_status == "authorized" && account.refresh_token.is_some() {
                     ui.label("ESI tokens are stored locally in SQLite.");
                 }
             });
         }
-        if self.data.accounts.is_empty() {
-            ui.label("No characters yet. Use Add character to authorize with ESI.");
-        }
+
         if let Some(id) = delete_id {
             self.data.accounts.retain(|account| account.id != id);
             self.save();
@@ -909,184 +607,132 @@ impl NomadeerApp {
         }
     }
 
-    fn systems_list(&mut self, ui: &mut egui::Ui) {
-        let mut delete_id = None;
-        for system in &self.data.systems {
+    fn current_systems_dashboard(&self, ui: &mut egui::Ui) {
+        ui.heading("Current systems");
+
+        let mut system_ids = Vec::new();
+        for account in &self.data.accounts {
+            if !account.last_system_id.is_empty() && !system_ids.contains(&account.last_system_id) {
+                system_ids.push(account.last_system_id.clone());
+            }
+        }
+
+        if system_ids.is_empty() {
             record_frame(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(&system.name);
-                    pill(ui, &system.class);
-                    pill(ui, &system.status);
-                    if !system.effect.is_empty() {
-                        pill(ui, &system.effect);
-                    }
-                    if ui.small_button("Delete").clicked() {
-                        delete_id = Some(system.id.clone());
+                ui.label("No current system yet.");
+                ui.label("Sync a character location to populate this dashboard.");
+            });
+            return;
+        }
+
+        for system_id in system_ids {
+            let system = self
+                .data
+                .systems
+                .iter()
+                .find(|system| system.id == system_id);
+            let system_name = system
+                .map(|system| system.name.as_str())
+                .unwrap_or("Unknown system");
+            let pilots: Vec<&str> = self
+                .data
+                .accounts
+                .iter()
+                .filter(|account| account.last_system_id == system_id)
+                .map(|account| account.character_name.as_str())
+                .collect();
+            let connection_count = self
+                .data
+                .connections
+                .iter()
+                .filter(|connection| {
+                    connection.from_system == system_id || connection.to_system == system_id
+                })
+                .count();
+            let visit_count = self
+                .data
+                .visits
+                .iter()
+                .filter(|visit| visit.system_id == system_id)
+                .count();
+
+            record_frame(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.heading(egui::RichText::new(system_name).color(theme::system_text()));
+                    if let Some(system) = system {
+                        pill(ui, &system.class);
+                        pill(ui, &system.status);
                     }
                 });
-                if !system.owner.is_empty() {
-                    ui.label(format!("Owner/occupants: {}", system.owner));
-                }
-                if !system.notes.is_empty() {
+                ui.label(format!("Characters here: {}", pilots.join(", ")));
+                ui.label(format!(
+                    "{} inferred connections · {} visits",
+                    connection_count, visit_count
+                ));
+                if let Some(system) = system
+                    && !system.notes.is_empty()
+                {
                     ui.label(&system.notes);
                 }
             });
         }
-        if self.data.systems.is_empty() {
-            ui.label("No systems yet.");
+    }
+
+    fn recent_movements(&self, ui: &mut egui::Ui) {
+        ui.heading("Recent movement");
+        let mut visits: Vec<&VisitLog> = self.data.visits.iter().collect();
+        visits.sort_by_key(|visit| std::cmp::Reverse(visit.created_at));
+
+        if visits.is_empty() {
+            ui.label("No ESI movement history yet.");
+            return;
         }
-        if let Some(id) = delete_id {
-            self.delete_system(&id);
+
+        for visit in visits.into_iter().take(8) {
+            record_frame(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(&visit.pilot).color(theme::character_text()));
+                    ui.label(egui::RichText::new("entered").color(theme::muted_text()));
+                    ui.label(
+                        egui::RichText::new(self.system_name(&visit.system_id))
+                            .color(theme::system_text()),
+                    );
+                });
+                if !visit.activity.is_empty() {
+                    ui.label(&visit.activity);
+                }
+            });
         }
     }
 
-    fn connections_list(&mut self, ui: &mut egui::Ui) {
-        let mut delete_id = None;
-        for connection in &self.data.connections {
+    fn inferred_connections(&self, ui: &mut egui::Ui) {
+        ui.heading("Inferred connections");
+        let mut connections: Vec<&Connection> = self.data.connections.iter().collect();
+        connections.sort_by_key(|connection| std::cmp::Reverse(connection.created_at));
+
+        if connections.is_empty() {
+            ui.label("No movement-derived connections yet.");
+            return;
+        }
+
+        for connection in connections.into_iter().take(8) {
             record_frame(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(format!(
-                        "{} → {}",
-                        self.system_name(&connection.from_system),
-                        self.system_name(&connection.to_system)
-                    ));
-                    pill(ui, &connection.mass_status);
-                    pill(ui, &connection.life_status);
-                    if ui.small_button("Delete").clicked() {
-                        delete_id = Some(connection.id.clone());
-                    }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(self.system_name(&connection.from_system))
+                            .color(theme::system_text()),
+                    );
+                    ui.label(egui::RichText::new("→").color(theme::muted_text()));
+                    ui.label(
+                        egui::RichText::new(self.system_name(&connection.to_system))
+                            .color(theme::system_text()),
+                    );
                 });
-                ui.label(format!(
-                    "Sigs: {} / {}",
-                    empty_dash(&connection.signature_from),
-                    empty_dash(&connection.signature_to)
-                ));
-                if !connection.ship_size.is_empty() {
-                    ui.label(format!("Ship size: {}", connection.ship_size));
-                }
                 if !connection.notes.is_empty() {
                     ui.label(&connection.notes);
                 }
             });
         }
-        if self.data.connections.is_empty() {
-            ui.label("No connections yet.");
-        }
-        if let Some(id) = delete_id {
-            self.data
-                .connections
-                .retain(|connection| connection.id != id);
-            self.save();
-        }
-    }
-
-    fn signatures_list(&mut self, ui: &mut egui::Ui) {
-        let mut delete_id = None;
-        for signature in &self.data.signatures {
-            record_frame(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(format!(
-                        "{} · {}",
-                        signature.code,
-                        self.system_name(&signature.system_id)
-                    ));
-                    pill(ui, &signature.sig_type);
-                    pill(ui, &signature.life);
-                    pill(ui, &signature.status);
-                    if ui.small_button("Delete").clicked() {
-                        delete_id = Some(signature.id.clone());
-                    }
-                });
-                if !signature.target.is_empty() {
-                    ui.label(format!("Target: {}", signature.target));
-                }
-                if !signature.notes.is_empty() {
-                    ui.label(&signature.notes);
-                }
-            });
-        }
-        if self.data.signatures.is_empty() {
-            ui.label("No signatures yet.");
-        }
-        if let Some(id) = delete_id {
-            self.data.signatures.retain(|signature| signature.id != id);
-            self.save();
-        }
-    }
-
-    fn visits_list(&mut self, ui: &mut egui::Ui) {
-        let mut delete_id = None;
-        for visit in &self.data.visits {
-            record_frame(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(format!(
-                        "{} · {}",
-                        empty_dash(&visit.activity),
-                        self.system_name(&visit.system_id)
-                    ));
-                    if !visit.pilot.is_empty() {
-                        pill(ui, &visit.pilot);
-                    }
-                    if ui.small_button("Delete").clicked() {
-                        delete_id = Some(visit.id.clone());
-                    }
-                });
-                if !visit.notes.is_empty() {
-                    ui.label(&visit.notes);
-                }
-            });
-        }
-        if self.data.visits.is_empty() {
-            ui.label("No visits yet.");
-        }
-        if let Some(id) = delete_id {
-            self.data.visits.retain(|visit| visit.id != id);
-            self.save();
-        }
-    }
-
-    fn notes_list(&mut self, ui: &mut egui::Ui) {
-        let mut delete_id = None;
-        for note in &self.data.notes {
-            record_frame(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(if note.title.is_empty() {
-                        "Untitled note"
-                    } else {
-                        &note.title
-                    });
-                    if !note.system_id.is_empty() {
-                        pill(ui, &self.system_name(&note.system_id));
-                    }
-                    if ui.small_button("Delete").clicked() {
-                        delete_id = Some(note.id.clone());
-                    }
-                });
-                if !note.body.is_empty() {
-                    ui.label(&note.body);
-                }
-            });
-        }
-        if self.data.notes.is_empty() {
-            ui.label("No notes yet.");
-        }
-        if let Some(id) = delete_id {
-            self.data.notes.retain(|note| note.id != id);
-            self.save();
-        }
-    }
-
-    fn delete_system(&mut self, id: &str) {
-        self.data.systems.retain(|system| system.id != id);
-        self.data
-            .connections
-            .retain(|connection| connection.from_system != id && connection.to_system != id);
-        self.data
-            .signatures
-            .retain(|signature| signature.system_id != id);
-        self.data.visits.retain(|visit| visit.system_id != id);
-        self.data.notes.retain(|note| note.system_id != id);
-        self.save();
     }
 }
 
@@ -1095,7 +741,6 @@ impl eframe::App for NomadeerApp {
         self.poll_esi_tasks();
         self.top_bar(ctx);
         self.esi_settings_window(ctx);
-        self.side_panel(ctx);
         self.central_panel(ctx);
     }
 }
