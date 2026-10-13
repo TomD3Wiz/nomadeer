@@ -1,5 +1,6 @@
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use serde_json::Value;
 use std::time::Duration;
 
 const USER_AGENT: &str = "Nomadeer/0.1 private wormhole mapper";
@@ -56,8 +57,8 @@ struct ApiZkb {
 }
 
 pub(crate) fn fetch_system_report(solar_system_id: u64) -> Result<ZkillReport, String> {
-    let url = format!("https://zkillboard.com/api/kills/solarSystemID/{solar_system_id}/limit/10/");
-    let kills = Client::builder()
+    let url = format!("https://zkillboard.com/api/kills/solarSystemID/{solar_system_id}/");
+    let response = Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| format!("Could not start zKill request: {error}"))?
@@ -66,20 +67,27 @@ pub(crate) fn fetch_system_report(solar_system_id: u64) -> Result<ZkillReport, S
         .send()
         .map_err(|error| format!("Could not reach zKillboard: {error}"))?;
 
-    if !kills.status().is_success() {
-        let status = kills.status();
-        let body = kills
-            .text()
-            .unwrap_or_else(|_| "<unreadable body>".to_owned());
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| format!("Could not read zKillboard response: {error}"))?;
+
+    if !status.is_success() {
         return Err(format!("zKillboard returned {status}: {body}"));
     }
 
-    let kills = kills
-        .json::<Vec<ApiKillmail>>()
+    let json = serde_json::from_str::<Value>(&body)
         .map_err(|error| format!("Could not parse zKillboard response: {error}"))?;
+    if let Some(message) = json.get("error").and_then(Value::as_str) {
+        return Err(format!("zKillboard says: {message}"));
+    }
+
+    let kills = serde_json::from_value::<Vec<ApiKillmail>>(json)
+        .map_err(|error| format!("Could not read zKillboard kills: {error}"))?;
 
     let recent_kills = kills
         .into_iter()
+        .take(10)
         .map(|kill| {
             let zkb = kill.zkb.unwrap_or(ApiZkb {
                 total_value: 0.0,
