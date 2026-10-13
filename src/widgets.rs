@@ -1,6 +1,7 @@
+use crate::config::theme;
 use crate::forms::PanelTab;
 use crate::model::SystemNode;
-use eframe::egui::{self, Color32};
+use eframe::egui;
 
 pub(crate) fn combo(ui: &mut egui::Ui, label: &str, value: &mut String, options: &[&str]) {
     egui::ComboBox::from_label(label)
@@ -56,6 +57,6 @@ pub(crate) fn record_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egu
 
 pub(crate) fn pill(ui: &mut egui::Ui, text: &str) {
     if !text.trim().is_empty() {
-        ui.label(egui::RichText::new(text).color(Color32::from_rgb(93, 242, 255)));
+        ui.label(egui::RichText::new(text).color(theme::accent()));
     }
 }

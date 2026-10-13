@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod esi;
 mod forms;
 mod model;

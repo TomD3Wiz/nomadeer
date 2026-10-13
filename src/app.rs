@@ -1,3 +1,4 @@
+use crate::config::theme;
 use crate::esi::{self, AccountAuthorization, LocationSync};
 use crate::forms::*;
 use crate::model::*;
@@ -146,11 +147,14 @@ impl NomadeerApp {
                     ui.label("No authorized characters");
                 }
                 for account in &self.data.accounts {
-                    ui.label(format!(
-                        "{} · {}",
-                        account.character_name,
-                        empty_dash(&account.last_system_name)
-                    ));
+                    ui.label(
+                        egui::RichText::new(&account.character_name).color(theme::character_text()),
+                    );
+                    ui.label(egui::RichText::new("·").color(theme::muted_text()));
+                    ui.label(
+                        egui::RichText::new(empty_dash(&account.last_system_name))
+                            .color(theme::system_text()),
+                    );
                     pill(ui, &account.auth_status);
                 }
             });
@@ -749,11 +753,11 @@ impl NomadeerApp {
         let desired = Vec2::new(ui.available_width(), 360.0);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 12.0, Color32::from_rgb(6, 17, 22));
+        painter.rect_filled(rect, 12.0, theme::panel_background());
         painter.rect_stroke(
             rect,
             12.0,
-            Stroke::new(1.0_f32, Color32::from_rgb(34, 78, 90)),
+            Stroke::new(1.0_f32, theme::panel_stroke()),
             egui::StrokeKind::Inside,
         );
 
@@ -763,7 +767,7 @@ impl NomadeerApp {
                 Align2::CENTER_CENTER,
                 "Add your home system to start mapping the chain",
                 FontId::proportional(18.0),
-                Color32::from_rgb(130, 165, 173),
+                theme::muted_text(),
             );
             return;
         }
@@ -806,11 +810,7 @@ impl NomadeerApp {
                     _ => Color32::from_rgb(16, 41, 50),
                 };
                 painter.circle_filled(*pos, 38.0, fill);
-                painter.circle_stroke(
-                    *pos,
-                    38.0,
-                    Stroke::new(2.0_f32, Color32::from_rgb(93, 242, 255)),
-                );
+                painter.circle_stroke(*pos, 38.0, Stroke::new(2.0_f32, theme::accent()));
                 painter.text(
                     *pos + Vec2::new(0.0, -6.0),
                     Align2::CENTER_CENTER,
@@ -823,7 +823,7 @@ impl NomadeerApp {
                     Align2::CENTER_CENTER,
                     &system.class,
                     FontId::proportional(12.0),
-                    Color32::from_rgb(150, 180, 188),
+                    theme::muted_text(),
                 );
             }
         }
