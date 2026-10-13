@@ -11,6 +11,7 @@ pub(crate) const SIG_TYPES: &[&str] = &[
 ];
 pub(crate) const LIFE_STATES: &[&str] = &["fresh", "eol", "unknown"];
 pub(crate) const MASS_STATES: &[&str] = &["fresh", "destab", "critical", "unknown"];
+pub(crate) const DEFAULT_ESI_SCOPES: &str = "publicData esi-location.read_location.v1 esi-location.read_ship_type.v1 esi-search.search_structures.v1 esi-universe.read_structures.v1 esi-ui.open_window.v1 esi-ui.write_waypoint.v1 esi-location.read_online.v1 esi-planets.read_customs_offices.v1 esi-structures.read_corporation.v1 esi-structures.read_character.v1 esi-activities.read_character.v1 esi.activity.char:read esi.cosmetic.char:read";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct AppData {
@@ -42,7 +43,7 @@ impl Default for EsiSettings {
         Self {
             client_id: String::new(),
             callback_port: 8788,
-            scopes: "esi-location.read_location.v1 esi-location.read_ship_type.v1".to_owned(),
+            scopes: DEFAULT_ESI_SCOPES.to_owned(),
         }
     }
 }

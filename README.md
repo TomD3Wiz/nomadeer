@@ -67,7 +67,7 @@ http://localhost:8788/callback
 In Nomadeer, enter the app's Client ID under **ESI settings**. The default scopes are:
 
 ```text
-esi-location.read_location.v1 esi-location.read_ship_type.v1
+publicData esi-location.read_location.v1 esi-location.read_ship_type.v1 esi-search.search_structures.v1 esi-universe.read_structures.v1 esi-ui.open_window.v1 esi-ui.write_waypoint.v1 esi-location.read_online.v1 esi-planets.read_customs_offices.v1 esi-structures.read_corporation.v1 esi-structures.read_character.v1 esi-activities.read_character.v1 esi.activity.char:read esi.cosmetic.char:read
 ```
 
 Then add an account placeholder, authorize it from the **Accounts** tab, and use **Sync location** to pull the character's current system. Access and refresh tokens are stored only in the local SQLite database.
