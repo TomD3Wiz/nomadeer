@@ -1060,11 +1060,8 @@ impl NomadeerApp {
         for kill in &report.recent_kills {
             record_frame(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(if kill.killmail_time.is_empty() {
-                        "Unknown time"
-                    } else {
-                        &kill.killmail_time
-                    });
+                    let (relative_time, time_color) = Self::relative_kill_time(&kill.killmail_time);
+                    ui.label(egui::RichText::new(relative_time).color(time_color));
                     ui.hyperlink_to(
                         format!("Kill {}", kill.killmail_id),
                         format!("https://zkillboard.com/kill/{}/", kill.killmail_id),
@@ -1086,6 +1083,81 @@ impl NomadeerApp {
                 ));
             });
         }
+    }
+
+    fn relative_kill_time(killmail_time: &str) -> (String, Color32) {
+        let Some(kill_time) = Self::parse_zkill_time(killmail_time) else {
+            return ("Unknown time".to_owned(), theme::muted_text());
+        };
+        let current_time = now();
+        let age_seconds = current_time.saturating_sub(kill_time);
+        let label = Self::format_duration_ago(age_seconds);
+
+        let color = if age_seconds <= 4 * 60 * 60 {
+            Color32::from_rgb(255, 91, 112)
+        } else if age_seconds <= 8 * 60 * 60 {
+            Color32::from_rgb(255, 194, 87)
+        } else if age_seconds <= 24 * 60 * 60 {
+            Color32::from_rgb(126, 231, 135)
+        } else {
+            theme::muted_text()
+        };
+
+        (label, color)
+    }
+
+    fn format_duration_ago(seconds: u64) -> String {
+        if seconds < 60 {
+            "just now".to_owned()
+        } else if seconds < 60 * 60 {
+            format!("{}m ago", seconds / 60)
+        } else if seconds < 24 * 60 * 60 {
+            let hours = seconds / (60 * 60);
+            let minutes = (seconds % (60 * 60)) / 60;
+            if minutes == 0 {
+                format!("{hours}h ago")
+            } else {
+                format!("{hours}h {minutes}m ago")
+            }
+        } else {
+            format!("{}d ago", seconds / (24 * 60 * 60))
+        }
+    }
+
+    fn parse_zkill_time(value: &str) -> Option<u64> {
+        if value.len() < 20 {
+            return None;
+        }
+
+        let year = value.get(0..4)?.parse::<i64>().ok()?;
+        let month = value.get(5..7)?.parse::<i64>().ok()?;
+        let day = value.get(8..10)?.parse::<i64>().ok()?;
+        let hour = value.get(11..13)?.parse::<i64>().ok()?;
+        let minute = value.get(14..16)?.parse::<i64>().ok()?;
+        let second = value.get(17..19)?.parse::<i64>().ok()?;
+
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || !(0..=23).contains(&hour)
+            || !(0..=59).contains(&minute)
+            || !(0..=60).contains(&second)
+        {
+            return None;
+        }
+
+        let days = Self::days_from_civil(year, month, day);
+        let timestamp = days * 86_400 + hour * 3_600 + minute * 60 + second;
+        u64::try_from(timestamp).ok()
+    }
+
+    fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+        let year = year - i64::from(month <= 2);
+        let era = if year >= 0 { year } else { year - 399 } / 400;
+        let year_of_era = year - era * 400;
+        let month_prime = month + if month > 2 { -3 } else { 9 };
+        let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        era * 146_097 + day_of_era - 719_468
     }
 
     fn format_isk(value: f64) -> String {
