@@ -5,6 +5,7 @@ use crate::model::*;
 use crate::store::Store;
 use crate::util::{clean, now};
 use crate::widgets::{pill, record_frame};
+use crate::zkill::{self, ZkillReport};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,11 +20,16 @@ enum EsiTaskResult {
     Location(LocationSync),
 }
 
+enum ZkillTaskResult {
+    Report(ZkillReport),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardTab {
     Movement,
     Connections,
     Systems,
+    Intel,
 }
 
 pub(crate) struct NomadeerApp {
@@ -37,7 +43,11 @@ pub(crate) struct NomadeerApp {
     id_counter: u64,
     esi_tx: Sender<Result<EsiTaskResult, String>>,
     esi_rx: Receiver<Result<EsiTaskResult, String>>,
+    zkill_tx: Sender<Result<ZkillTaskResult, String>>,
+    zkill_rx: Receiver<Result<ZkillTaskResult, String>>,
     esi_busy: bool,
+    zkill_busy_system_id: Option<u64>,
+    zkill_reports: HashMap<u64, ZkillReport>,
     next_auto_sync: Instant,
     auto_sync_index: usize,
 }
@@ -46,6 +56,7 @@ impl NomadeerApp {
     pub(crate) fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let store = Store::new(PathBuf::from("data/nomadeer.sqlite3"));
         let (esi_tx, esi_rx) = mpsc::channel();
+        let (zkill_tx, zkill_rx) = mpsc::channel();
         let mut app = Self {
             data: AppData::default(),
             store,
@@ -57,7 +68,11 @@ impl NomadeerApp {
             id_counter: 0,
             esi_tx,
             esi_rx,
+            zkill_tx,
+            zkill_rx,
             esi_busy: false,
+            zkill_busy_system_id: None,
+            zkill_reports: HashMap::new(),
             next_auto_sync: Instant::now() + Duration::from_secs(5),
             auto_sync_index: 0,
         };
@@ -403,6 +418,54 @@ impl NomadeerApp {
         self.spawn_sync_location(accounts[index].clone(), false);
     }
 
+    fn start_zkill_refresh(&mut self) {
+        let Some(system) = self.selected_system() else {
+            self.status = "Select a system first".to_owned();
+            return;
+        };
+        if system.solar_system_id == 0 {
+            self.status = "Selected system has no EVE system ID yet".to_owned();
+            return;
+        }
+        if self.zkill_busy_system_id.is_some() {
+            self.status = "Already fetching killboard intel".to_owned();
+            return;
+        }
+
+        let solar_system_id = system.solar_system_id;
+        let system_name = system.name.clone();
+        self.zkill_busy_system_id = Some(solar_system_id);
+        self.status = format!("Fetching killboard intel for {system_name}...");
+        let tx = self.zkill_tx.clone();
+        thread::spawn(move || {
+            let result = zkill::fetch_system_report(solar_system_id).map(ZkillTaskResult::Report);
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_zkill_tasks(&mut self) {
+        loop {
+            match self.zkill_rx.try_recv() {
+                Ok(Ok(ZkillTaskResult::Report(report))) => {
+                    let kill_count = report.recent_kills.len();
+                    self.zkill_busy_system_id = None;
+                    self.status = format!("Loaded {kill_count} recent kills from zKillboard");
+                    self.zkill_reports.insert(report.solar_system_id, report);
+                }
+                Ok(Err(error)) => {
+                    self.zkill_busy_system_id = None;
+                    self.status = format!("Killboard intel failed: {error}");
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.zkill_busy_system_id = None;
+                    self.status = "Killboard update stopped unexpectedly".to_owned();
+                    break;
+                }
+            }
+        }
+    }
+
     fn poll_esi_tasks(&mut self) {
         loop {
             match self.esi_rx.try_recv() {
@@ -629,6 +692,7 @@ impl NomadeerApp {
                 DashboardTab::Movement => self.recent_movements(ui),
                 DashboardTab::Connections => self.inferred_connections(ui),
                 DashboardTab::Systems => self.systems_overview(ui),
+                DashboardTab::Intel => self.selected_system_intel(ui),
             });
         });
     }
@@ -933,7 +997,107 @@ impl NomadeerApp {
             {
                 self.active_tab = DashboardTab::Systems;
             }
+            if ui
+                .selectable_label(self.active_tab == DashboardTab::Intel, "Intel")
+                .clicked()
+            {
+                self.active_tab = DashboardTab::Intel;
+            }
         });
+    }
+
+    fn selected_system_intel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Intel");
+        let Some(system) = self.selected_system().cloned() else {
+            ui.label("Select a system on the chain map first.");
+            return;
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(&system.name).color(theme::system_text()));
+            pill(ui, &Self::inferred_system_class(&system));
+            if system.solar_system_id != 0 {
+                ui.hyperlink_to(
+                    "Open zKillboard",
+                    format!("https://zkillboard.com/system/{}/", system.solar_system_id),
+                );
+                ui.hyperlink_to(
+                    "Open Anoik.is",
+                    format!("https://anoik.is/systems/{}", system.name),
+                );
+            }
+            if ui
+                .add_enabled(
+                    self.zkill_busy_system_id.is_none() && system.solar_system_id != 0,
+                    egui::Button::new("Refresh zKill"),
+                )
+                .clicked()
+            {
+                self.start_zkill_refresh();
+            }
+        });
+
+        let Some(report) = self.zkill_reports.get(&system.solar_system_id) else {
+            ui.label(
+                "No zKillboard data loaded yet. Refresh to pull recent kills for this system.",
+            );
+            return;
+        };
+
+        ui.label(format!(
+            "{} recent kills · {} total · {} solo · {} NPC",
+            report.recent_kills.len(),
+            Self::format_isk(report.total_value),
+            report.solo_kills,
+            report.npc_kills
+        ));
+
+        if report.recent_kills.is_empty() {
+            ui.label("No recent kills returned by zKillboard.");
+            return;
+        }
+
+        for kill in &report.recent_kills {
+            record_frame(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(if kill.killmail_time.is_empty() {
+                        "Unknown time"
+                    } else {
+                        &kill.killmail_time
+                    });
+                    ui.hyperlink_to(
+                        format!("Kill {}", kill.killmail_id),
+                        format!("https://zkillboard.com/kill/{}/", kill.killmail_id),
+                    );
+                    if kill.solo {
+                        pill(ui, "solo");
+                    }
+                    if kill.npc {
+                        pill(ui, "NPC");
+                    }
+                });
+                ui.label(format!(
+                    "Victim ship type {} · {} attackers · {}",
+                    kill.victim_ship_type_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    kill.attacker_count,
+                    Self::format_isk(kill.total_value)
+                ));
+            });
+        }
+    }
+
+    fn format_isk(value: f64) -> String {
+        if value >= 1_000_000_000.0 {
+            format!("{:.1}b ISK", value / 1_000_000_000.0)
+        } else if value >= 1_000_000.0 {
+            format!("{:.1}m ISK", value / 1_000_000.0)
+        } else if value >= 1_000.0 {
+            format!("{:.1}k ISK", value / 1_000.0)
+        } else {
+            format!("{value:.0} ISK")
+        }
     }
 
     fn systems_overview(&mut self, ui: &mut egui::Ui) {
@@ -1039,6 +1203,7 @@ impl NomadeerApp {
 impl eframe::App for NomadeerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_esi_tasks();
+        self.poll_zkill_tasks();
         self.maybe_auto_sync();
         self.top_bar(ctx);
         self.esi_settings_window(ctx);

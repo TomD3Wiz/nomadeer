@@ -6,6 +6,7 @@ mod model;
 mod store;
 mod util;
 mod widgets;
+mod zkill;
 
 use app::NomadeerApp;
 use eframe::egui;
