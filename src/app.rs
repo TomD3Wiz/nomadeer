@@ -150,6 +150,12 @@ impl NomadeerApp {
         if let Some(class) = Self::wormhole_class_from_security_class(&system.class) {
             return class;
         }
+        if let Some(class) = Self::wormhole_class_from_security_class(&system.constellation_name) {
+            return class;
+        }
+        if let Some(class) = Self::wormhole_class_from_security_class(&system.region_name) {
+            return class;
+        }
 
         if system.security_status >= 0.45 {
             "HS".to_owned()
@@ -759,7 +765,10 @@ impl NomadeerApp {
             ui.heading(egui::RichText::new(system_name).color(theme::system_text()));
             ui.horizontal_wrapped(|ui| {
                 pill(ui, &system_class);
-                if raw_system_class != system_class && !raw_system_class.is_empty() {
+                if raw_system_class != system_class
+                    && !raw_system_class.is_empty()
+                    && raw_system_class != "unknown"
+                {
                     ui.label(egui::RichText::new(raw_system_class).color(theme::muted_text()));
                 }
                 pill(ui, &system_status);
