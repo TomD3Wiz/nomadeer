@@ -21,7 +21,7 @@ pub(crate) struct NomadeerApp {
     status: String,
     active_tab: PanelTab,
     esi_settings_form: EsiSettingsForm,
-    account_form: AccountForm,
+    show_esi_settings: bool,
     system_form: SystemForm,
     connection_form: ConnectionForm,
     signature_form: SignatureForm,
@@ -43,7 +43,7 @@ impl NomadeerApp {
             status: "Ready".to_owned(),
             active_tab: PanelTab::Systems,
             esi_settings_form: EsiSettingsForm::default(),
-            account_form: AccountForm::default(),
+            show_esi_settings: false,
             system_form: SystemForm {
                 class: "C3".to_owned(),
                 status: "scouted".to_owned(),
@@ -128,22 +128,49 @@ impl NomadeerApp {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Nomadeer");
-                ui.label("Private native wormhole chain tracker");
+                if ui.button("ESI settings").clicked() {
+                    self.show_esi_settings = true;
+                }
+                if ui
+                    .add_enabled(!self.esi_busy, egui::Button::new("Add character"))
+                    .clicked()
+                {
+                    self.start_add_character();
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Reload").clicked() {
-                        self.load();
-                    }
-                    if ui.button("Save").clicked() {
-                        self.save();
-                    }
+                    ui.label(&self.status);
                 });
             });
-            ui.label(format!(
-                "Data: {} · {}",
-                self.store.path().display(),
-                self.status
-            ));
+            ui.horizontal_wrapped(|ui| {
+                if self.data.accounts.is_empty() {
+                    ui.label("No authorized characters");
+                }
+                for account in &self.data.accounts {
+                    ui.label(format!(
+                        "{} · {}",
+                        account.character_name,
+                        empty_dash(&account.last_system_name)
+                    ));
+                    pill(ui, &account.auth_status);
+                }
+            });
         });
+    }
+
+    fn esi_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_esi_settings;
+        let mut close_requested = false;
+        egui::Window::new("ESI settings")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                close_requested = self.esi_settings_contents(ui);
+            });
+        if close_requested {
+            open = false;
+        }
+        self.show_esi_settings = open;
     }
 
     fn side_panel(&mut self, ctx: &egui::Context) {
@@ -151,12 +178,7 @@ impl NomadeerApp {
             .resizable(true)
             .default_width(340.0)
             .show(ctx, |ui| {
-                ui.heading("Add intel");
-                ui.separator();
-                self.esi_settings_ui(ui);
-                ui.separator();
-                self.account_form_ui(ui);
-                ui.separator();
+                ui.heading("Intel forms");
                 self.system_form_ui(ui);
                 ui.separator();
                 self.connection_form_ui(ui);
@@ -169,78 +191,43 @@ impl NomadeerApp {
             });
     }
 
-    fn esi_settings_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("ESI settings")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.label("Register an EVE app with this callback URL:");
-                ui.monospace(format!(
-                    "http://localhost:{}/callback",
-                    self.esi_settings_form.callback_port
-                ));
-                ui.label("Client ID");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.esi_settings_form.client_id)
-                        .hint_text("EVE Developers application Client ID"),
-                );
-                ui.label("Callback port");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.esi_settings_form.callback_port)
-                        .hint_text("8788"),
-                );
-                ui.label("Scopes");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.esi_settings_form.scopes)
-                        .hint_text("Space-separated ESI scopes"),
-                );
-                if ui.button("Save ESI settings").clicked() {
-                    self.save_esi_settings_from_form();
-                }
-            });
-    }
-
-    fn account_form_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Account")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label("Add a character placeholder, then authorize it from the Accounts tab.");
-                ui.label("Character name");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.account_form.character_name)
-                        .hint_text("Pilot name"),
-                );
-                ui.label("Character ID");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.account_form.character_id)
-                        .hint_text("Optional; filled by ESI authorization"),
-                );
-
-                let can_add = !self.account_form.character_name.trim().is_empty();
-                if ui
-                    .add_enabled(can_add, egui::Button::new("Add account"))
-                    .clicked()
-                {
-                    let timestamp = now();
-                    let account = Account {
-                        id: self.new_id("acct"),
-                        character_id: clean(&self.account_form.character_id),
-                        character_name: clean(&self.account_form.character_name),
-                        owner_hash: String::new(),
-                        auth_status: "unauthorized".to_owned(),
-                        last_system_id: String::new(),
-                        last_system_name: String::new(),
-                        access_token: None,
-                        refresh_token: None,
-                        token_expires_at: None,
-                        created_at: timestamp,
-                        updated_at: timestamp,
-                    };
-                    self.data.accounts.push(account);
-                    self.account_form.character_name.clear();
-                    self.account_form.character_id.clear();
-                    self.save();
-                }
-            });
+    fn esi_settings_contents(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut close_requested = false;
+        ui.label("Register an EVE app with this callback URL:");
+        ui.monospace(format!(
+            "http://localhost:{}/callback",
+            self.esi_settings_form.callback_port
+        ));
+        ui.add_space(8.0);
+        ui.label("Client ID");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.esi_settings_form.client_id)
+                .hint_text("EVE Developers application Client ID"),
+        );
+        ui.label("Callback port");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.esi_settings_form.callback_port).hint_text("8788"),
+        );
+        ui.label("Scopes");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.esi_settings_form.scopes)
+                .desired_rows(5)
+                .hint_text("Space-separated ESI scopes"),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Save and close").clicked() && self.save_esi_settings_from_form() {
+                close_requested = true;
+            }
+            if ui.button("Reload database").clicked() {
+                self.load();
+            }
+            if ui.button("Save database").clicked() {
+                self.save();
+            }
+        });
+        ui.separator();
+        ui.label(format!("Database: {}", self.store.path().display()));
+        close_requested
     }
 
     fn system_form_ui(&mut self, ui: &mut egui::Ui) {
@@ -516,6 +503,45 @@ impl NomadeerApp {
             return;
         }
 
+        self.spawn_authorize_account(account_id);
+    }
+
+    fn start_add_character(&mut self) {
+        if self.esi_busy {
+            self.status = "An ESI task is already running".to_owned();
+            return;
+        }
+        if !self.save_esi_settings_from_form() {
+            self.show_esi_settings = true;
+            return;
+        }
+        if self.data.esi_settings.client_id.is_empty() {
+            self.status = "Set your ESI Client ID before adding a character".to_owned();
+            self.show_esi_settings = true;
+            return;
+        }
+
+        let timestamp = now();
+        let account_id = self.new_id("acct");
+        self.data.accounts.push(Account {
+            id: account_id.clone(),
+            character_id: String::new(),
+            character_name: "Authorizing...".to_owned(),
+            owner_hash: String::new(),
+            auth_status: "authorizing".to_owned(),
+            last_system_id: String::new(),
+            last_system_name: String::new(),
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        });
+        self.save();
+        self.spawn_authorize_account(account_id);
+    }
+
+    fn spawn_authorize_account(&mut self, account_id: String) {
         self.esi_busy = true;
         self.status = "Opening browser for ESI authorization...".to_owned();
         let tx = self.esi_tx.clone();
@@ -823,6 +849,13 @@ impl NomadeerApp {
         let mut delete_id = None;
         let mut authorize_id = None;
         let mut sync_id = None;
+        if ui
+            .add_enabled(!self.esi_busy, egui::Button::new("Add character"))
+            .clicked()
+        {
+            self.start_add_character();
+        }
+        ui.add_space(8.0);
         for account in &self.data.accounts {
             record_frame(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -862,7 +895,7 @@ impl NomadeerApp {
             });
         }
         if self.data.accounts.is_empty() {
-            ui.label("No accounts yet. Add a character from the Account form.");
+            ui.label("No characters yet. Use Add character to authorize with ESI.");
         }
         if let Some(id) = delete_id {
             self.data.accounts.retain(|account| account.id != id);
@@ -1061,6 +1094,7 @@ impl eframe::App for NomadeerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_esi_tasks();
         self.top_bar(ctx);
+        self.esi_settings_window(ctx);
         self.side_panel(ctx);
         self.central_panel(ctx);
     }

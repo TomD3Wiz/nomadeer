@@ -6,12 +6,6 @@ pub(crate) struct EsiSettingsForm {
 }
 
 #[derive(Default)]
-pub(crate) struct AccountForm {
-    pub(crate) character_name: String,
-    pub(crate) character_id: String,
-}
-
-#[derive(Default)]
 pub(crate) struct SystemForm {
     pub(crate) name: String,
     pub(crate) class: String,
