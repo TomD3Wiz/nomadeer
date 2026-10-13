@@ -178,12 +178,21 @@ impl NomadeerApp {
                     "http://localhost:{}/callback",
                     self.esi_settings_form.callback_port
                 ));
-                ui.text_edit_singleline(&mut self.esi_settings_form.client_id)
-                    .on_hover_text("EVE Developers application Client ID");
-                ui.text_edit_singleline(&mut self.esi_settings_form.callback_port)
-                    .on_hover_text("Local callback port");
-                ui.text_edit_multiline(&mut self.esi_settings_form.scopes)
-                    .on_hover_text("Space-separated ESI scopes");
+                ui.label("Client ID");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.esi_settings_form.client_id)
+                        .hint_text("EVE Developers application Client ID"),
+                );
+                ui.label("Callback port");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.esi_settings_form.callback_port)
+                        .hint_text("8788"),
+                );
+                ui.label("Scopes");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.esi_settings_form.scopes)
+                        .hint_text("Space-separated ESI scopes"),
+                );
                 if ui.button("Save ESI settings").clicked() {
                     self.save_esi_settings_from_form();
                 }
@@ -195,10 +204,16 @@ impl NomadeerApp {
             .default_open(false)
             .show(ui, |ui| {
                 ui.label("Add a character placeholder, then authorize it from the Accounts tab.");
-                ui.text_edit_singleline(&mut self.account_form.character_name)
-                    .on_hover_text("Character name");
-                ui.text_edit_singleline(&mut self.account_form.character_id)
-                    .on_hover_text("Optional EVE character ID");
+                ui.label("Character name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.account_form.character_name)
+                        .hint_text("Pilot name"),
+                );
+                ui.label("Character ID");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.account_form.character_id)
+                        .hint_text("Optional; filled by ESI authorization"),
+                );
 
                 let can_add = !self.account_form.character_name.trim().is_empty();
                 if ui
@@ -232,15 +247,25 @@ impl NomadeerApp {
         egui::CollapsingHeader::new("System")
             .default_open(true)
             .show(ui, |ui| {
-                ui.text_edit_singleline(&mut self.system_form.name)
-                    .on_hover_text("J123456, Thera, Amarr, etc.");
+                ui.label("System name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.system_form.name)
+                        .hint_text("J123456, Thera, Amarr, etc."),
+                );
                 combo(ui, "Class", &mut self.system_form.class, SYSTEM_CLASSES);
-                ui.text_edit_singleline(&mut self.system_form.effect)
-                    .on_hover_text("Magnetar, Pulsar, Wolf-Rayet...");
+                ui.label("Effect");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.system_form.effect)
+                        .hint_text("Magnetar, Pulsar, Wolf-Rayet..."),
+                );
                 combo(ui, "Status", &mut self.system_form.status, SYSTEM_STATUSES);
-                ui.text_edit_singleline(&mut self.system_form.owner)
-                    .on_hover_text("Corp/alliance or occupants");
-                ui.text_edit_multiline(&mut self.system_form.notes);
+                ui.label("Owner / occupants");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.system_form.owner)
+                        .hint_text("Corp/alliance or occupants"),
+                );
+                ui.label("Notes");
+                ui.add(egui::TextEdit::multiline(&mut self.system_form.notes));
 
                 let can_add = !self.system_form.name.trim().is_empty();
                 if ui
@@ -283,10 +308,16 @@ impl NomadeerApp {
                     &self.data.systems,
                     &mut self.connection_form.to_system,
                 );
-                ui.text_edit_singleline(&mut self.connection_form.signature_from)
-                    .on_hover_text("Source side sig, e.g. ABC-123");
-                ui.text_edit_singleline(&mut self.connection_form.signature_to)
-                    .on_hover_text("Destination side sig");
+                ui.label("Source signature");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connection_form.signature_from)
+                        .hint_text("ABC-123"),
+                );
+                ui.label("Destination signature");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connection_form.signature_to)
+                        .hint_text("Optional destination side sig"),
+                );
                 combo(
                     ui,
                     "Mass",
@@ -299,9 +330,13 @@ impl NomadeerApp {
                     &mut self.connection_form.life_status,
                     LIFE_STATES,
                 );
-                ui.text_edit_singleline(&mut self.connection_form.ship_size)
-                    .on_hover_text("frig, medium, large, capital");
-                ui.text_edit_multiline(&mut self.connection_form.notes);
+                ui.label("Ship size");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connection_form.ship_size)
+                        .hint_text("frig, medium, large, capital"),
+                );
+                ui.label("Notes");
+                ui.add(egui::TextEdit::multiline(&mut self.connection_form.notes));
 
                 let can_add = !self.connection_form.from_system.is_empty()
                     && !self.connection_form.to_system.is_empty()
@@ -342,15 +377,24 @@ impl NomadeerApp {
                     &self.data.systems,
                     &mut self.signature_form.system_id,
                 );
-                ui.text_edit_singleline(&mut self.signature_form.code)
-                    .on_hover_text("ABC-123");
+                ui.label("Signature code");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.signature_form.code).hint_text("ABC-123"),
+                );
                 combo(ui, "Type", &mut self.signature_form.sig_type, SIG_TYPES);
-                ui.text_edit_singleline(&mut self.signature_form.target)
-                    .on_hover_text("Destination or site name");
+                ui.label("Target");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.signature_form.target)
+                        .hint_text("Destination or site name"),
+                );
                 combo(ui, "Life", &mut self.signature_form.life, LIFE_STATES);
-                ui.text_edit_singleline(&mut self.signature_form.status)
-                    .on_hover_text("unscanned, scanned, ignored, despawned");
-                ui.text_edit_multiline(&mut self.signature_form.notes);
+                ui.label("Scan status");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.signature_form.status)
+                        .hint_text("unscanned, scanned, ignored, despawned"),
+                );
+                ui.label("Notes");
+                ui.add(egui::TextEdit::multiline(&mut self.signature_form.notes));
 
                 let can_add = !self.signature_form.system_id.is_empty()
                     && !self.signature_form.code.trim().is_empty();
@@ -388,10 +432,17 @@ impl NomadeerApp {
                     &self.data.systems,
                     &mut self.visit_form.system_id,
                 );
-                ui.text_edit_singleline(&mut self.visit_form.pilot);
-                ui.text_edit_singleline(&mut self.visit_form.activity)
-                    .on_hover_text("scanned, hacked, rolled, observed hostiles...");
-                ui.text_edit_multiline(&mut self.visit_form.notes);
+                ui.label("Pilot");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.visit_form.pilot).hint_text("Pilot name"),
+                );
+                ui.label("Activity");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.visit_form.activity)
+                        .hint_text("scanned, hacked, rolled, observed hostiles..."),
+                );
+                ui.label("Notes");
+                ui.add(egui::TextEdit::multiline(&mut self.visit_form.notes));
 
                 let can_add = !self.visit_form.system_id.is_empty();
                 if ui
@@ -424,8 +475,12 @@ impl NomadeerApp {
                     &self.data.systems,
                     &mut self.note_form.system_id,
                 );
-                ui.text_edit_singleline(&mut self.note_form.title);
-                ui.text_edit_multiline(&mut self.note_form.body);
+                ui.label("Title");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.note_form.title).hint_text("Note title"),
+                );
+                ui.label("Body");
+                ui.add(egui::TextEdit::multiline(&mut self.note_form.body));
 
                 let can_add = !self.note_form.title.trim().is_empty()
                     || !self.note_form.body.trim().is_empty();
