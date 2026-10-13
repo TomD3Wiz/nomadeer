@@ -146,6 +146,42 @@ impl NomadeerApp {
             .find(|system| system.id == self.selected_system_id)
     }
 
+    fn inferred_system_class(system: &SystemNode) -> String {
+        if let Some(class) = Self::wormhole_class_from_security_class(&system.class) {
+            return class;
+        }
+
+        if system.security_status >= 0.45 {
+            "HS".to_owned()
+        } else if system.security_status > 0.0 {
+            "LS".to_owned()
+        } else if system.security_status <= 0.0 && !system.name.starts_with('J') {
+            "NS".to_owned()
+        } else {
+            "Unknown".to_owned()
+        }
+    }
+
+    fn wormhole_class_from_security_class(security_class: &str) -> Option<String> {
+        let mut parts = security_class.split('-');
+        let prefix = parts.next()?;
+        let class_code = parts.next()?.chars().next()?;
+        if prefix != "C" {
+            return None;
+        }
+
+        let class = match class_code {
+            'A' => "C1",
+            'B' => "C2",
+            'C' => "C3",
+            'D' => "C4",
+            'E' => "C5",
+            'F' => "C6",
+            _ => return None,
+        };
+        Some(class.to_owned())
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -646,7 +682,7 @@ impl NomadeerApp {
                 painter.text(
                     *pos + Vec2::new(0.0, 12.0),
                     Align2::CENTER_CENTER,
-                    &system.class,
+                    Self::inferred_system_class(system),
                     FontId::proportional(12.0),
                     theme::muted_text(),
                 );
@@ -683,7 +719,8 @@ impl NomadeerApp {
 
         let system_id = system.id.clone();
         let system_name = system.name.clone();
-        let system_class = system.class.clone();
+        let system_class = Self::inferred_system_class(system);
+        let raw_system_class = system.class.clone();
         let system_status = system.status.clone();
         let system_notes = system.notes.clone();
         let security_status = system.security_status;
@@ -722,6 +759,9 @@ impl NomadeerApp {
             ui.heading(egui::RichText::new(system_name).color(theme::system_text()));
             ui.horizontal_wrapped(|ui| {
                 pill(ui, &system_class);
+                if raw_system_class != system_class && !raw_system_class.is_empty() {
+                    ui.label(egui::RichText::new(raw_system_class).color(theme::muted_text()));
+                }
                 pill(ui, &system_status);
                 ui.label(format!("sec {:.1}", security_status));
             });
@@ -879,7 +919,7 @@ impl NomadeerApp {
                     if ui.selectable_label(is_selected, &system.name).clicked() {
                         self.selected_system_id = system.id.clone();
                     }
-                    pill(ui, &system.class);
+                    pill(ui, &Self::inferred_system_class(system));
                     pill(ui, &system.status);
                     if !system.region_name.is_empty() {
                         ui.label(&system.region_name);
