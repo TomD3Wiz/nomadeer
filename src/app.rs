@@ -410,15 +410,21 @@ impl NomadeerApp {
         self.data.accounts[account_index].auth_status = "authorized".to_owned();
         self.data.accounts[account_index].updated_at = now();
 
-        let visit_id = self.new_id("visit");
-        self.data.visits.push(VisitLog {
-            id: visit_id,
-            system_id: system_id.clone(),
-            pilot: character_name.clone(),
-            activity: "Location updated".to_owned(),
-            notes: String::new(),
-            created_at: now(),
-        });
+        if previous_system_id.is_empty() || previous_system_id != system_id {
+            let visit_id = self.new_id("visit");
+            self.data.visits.push(VisitLog {
+                id: visit_id,
+                system_id: system_id.clone(),
+                pilot: character_name.clone(),
+                activity: if previous_system_id.is_empty() {
+                    "Location found".to_owned()
+                } else {
+                    "Moved system".to_owned()
+                },
+                notes: String::new(),
+                created_at: now(),
+            });
+        }
 
         if !previous_system_id.is_empty() && previous_system_id != system_id {
             self.ensure_connection(&previous_system_id, &system_id, &character_name);
