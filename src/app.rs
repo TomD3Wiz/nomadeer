@@ -1,5 +1,5 @@
 use crate::config::theme;
-use crate::esi::{self, AccountAuthorization, LocationSync};
+use crate::esi::{self, AccountAuthorization, LocationSync, SystemIntel};
 use crate::forms::*;
 use crate::model::*;
 use crate::store::Store;
@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant};
+
+const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 enum EsiTaskResult {
     Authorized(AccountAuthorization),
@@ -35,6 +38,8 @@ pub(crate) struct NomadeerApp {
     esi_tx: Sender<Result<EsiTaskResult, String>>,
     esi_rx: Receiver<Result<EsiTaskResult, String>>,
     esi_busy: bool,
+    next_auto_sync: Instant,
+    auto_sync_index: usize,
 }
 
 impl NomadeerApp {
@@ -53,6 +58,8 @@ impl NomadeerApp {
             esi_tx,
             esi_rx,
             esi_busy: false,
+            next_auto_sync: Instant::now() + Duration::from_secs(5),
+            auto_sync_index: 0,
         };
         app.load();
         app
@@ -293,14 +300,43 @@ impl NomadeerApp {
             return;
         };
 
+        self.spawn_sync_location(account, true);
+    }
+
+    fn spawn_sync_location(&mut self, account: Account, show_status: bool) {
         self.esi_busy = true;
-        self.status = format!("Updating {} location...", account.character_name);
+        if show_status {
+            self.status = format!("Updating {} location...", account.character_name);
+        }
         let tx = self.esi_tx.clone();
         let settings = self.data.esi_settings.clone();
         thread::spawn(move || {
             let result = esi::sync_location(settings, account).map(EsiTaskResult::Location);
             let _ = tx.send(result);
         });
+    }
+
+    fn maybe_auto_sync(&mut self) {
+        if self.esi_busy || Instant::now() < self.next_auto_sync {
+            return;
+        }
+
+        let accounts: Vec<Account> = self
+            .data
+            .accounts
+            .iter()
+            .filter(|account| account.auth_status == "authorized")
+            .cloned()
+            .collect();
+        if accounts.is_empty() || self.data.esi_settings.client_id.is_empty() {
+            self.next_auto_sync = Instant::now() + AUTO_SYNC_INTERVAL;
+            return;
+        }
+
+        let index = self.auto_sync_index % accounts.len();
+        self.auto_sync_index = self.auto_sync_index.wrapping_add(1);
+        self.next_auto_sync = Instant::now() + AUTO_SYNC_INTERVAL;
+        self.spawn_sync_location(accounts[index].clone(), false);
     }
 
     fn poll_esi_tasks(&mut self) {
@@ -351,11 +387,7 @@ impl NomadeerApp {
     }
 
     fn apply_location_sync(&mut self, location: LocationSync) {
-        let system_id = self.ensure_esi_system(
-            location.solar_system_id,
-            &location.solar_system_name,
-            &location.solar_system_class,
-        );
+        let system_id = self.ensure_esi_system(&location.system);
 
         let Some(account_index) = self
             .data
@@ -374,7 +406,7 @@ impl NomadeerApp {
         self.data.accounts[account_index].refresh_token = Some(location.refresh_token);
         self.data.accounts[account_index].token_expires_at = Some(location.token_expires_at);
         self.data.accounts[account_index].last_system_id = system_id.clone();
-        self.data.accounts[account_index].last_system_name = location.solar_system_name.clone();
+        self.data.accounts[account_index].last_system_name = location.system.name.clone();
         self.data.accounts[account_index].auth_status = "authorized".to_owned();
         self.data.accounts[account_index].updated_at = now();
 
@@ -396,29 +428,74 @@ impl NomadeerApp {
         if self.selected_system_id.is_empty() {
             self.selected_system_id = system_id;
         }
-        self.status = format!("{character_name} is in {}", location.solar_system_name);
+        self.status = format!("{character_name} is in {}", location.system.name);
     }
 
-    fn ensure_esi_system(&mut self, solar_system_id: u64, name: &str, class: &str) -> String {
-        let esi_id = format!("esi_sys_{solar_system_id}");
-        if self.data.systems.iter().any(|system| system.id == esi_id) {
+    fn ensure_esi_system(&mut self, intel: &SystemIntel) -> String {
+        let esi_id = format!("esi_sys_{}", intel.solar_system_id);
+        if let Some(existing) = self
+            .data
+            .systems
+            .iter_mut()
+            .find(|system| system.id == esi_id)
+        {
+            Self::apply_system_intel(existing, intel);
             return esi_id;
         }
-        if let Some(existing) = self.data.systems.iter().find(|system| system.name == name) {
+        if let Some(existing) = self
+            .data
+            .systems
+            .iter_mut()
+            .find(|system| system.name == intel.name)
+        {
+            Self::apply_system_intel(existing, intel);
             return existing.id.clone();
         }
 
         self.data.systems.push(SystemNode {
             id: esi_id.clone(),
-            name: name.to_owned(),
-            class: class.to_owned(),
+            solar_system_id: intel.solar_system_id,
+            name: intel.name.clone(),
+            class: intel.security_class.clone(),
+            security_status: intel.security_status,
+            constellation_id: intel.constellation_id,
+            constellation_name: intel.constellation_name.clone(),
+            region_id: intel.region_id,
+            region_name: intel.region_name.clone(),
+            planet_count: intel.planet_count,
+            stargate_count: intel.stargate_count,
+            station_count: intel.station_count,
+            jumps_1h: intel.jumps_1h,
+            ship_kills_1h: intel.ship_kills_1h,
+            pod_kills_1h: intel.pod_kills_1h,
+            npc_kills_1h: intel.npc_kills_1h,
+            intel_updated_at: now(),
             effect: String::new(),
             status: "scouted".to_owned(),
             owner: String::new(),
-            notes: format!("Solar system ID {solar_system_id}"),
+            notes: format!("Solar system ID {}", intel.solar_system_id),
             created_at: now(),
         });
         esi_id
+    }
+
+    fn apply_system_intel(system: &mut SystemNode, intel: &SystemIntel) {
+        system.solar_system_id = intel.solar_system_id;
+        system.name = intel.name.clone();
+        system.class = intel.security_class.clone();
+        system.security_status = intel.security_status;
+        system.constellation_id = intel.constellation_id;
+        system.constellation_name = intel.constellation_name.clone();
+        system.region_id = intel.region_id;
+        system.region_name = intel.region_name.clone();
+        system.planet_count = intel.planet_count;
+        system.stargate_count = intel.stargate_count;
+        system.station_count = intel.station_count;
+        system.jumps_1h = intel.jumps_1h;
+        system.ship_kills_1h = intel.ship_kills_1h;
+        system.pod_kills_1h = intel.pod_kills_1h;
+        system.npc_kills_1h = intel.npc_kills_1h;
+        system.intel_updated_at = now();
     }
 
     fn ensure_connection(&mut self, from_system: &str, to_system: &str, character_name: &str) {
@@ -450,6 +527,7 @@ impl NomadeerApp {
             .resizable(true)
             .default_width(320.0)
             .show(ctx, |ui| {
+                ui.add_space(2.0);
                 self.selected_system_sidebar(ui);
                 ui.separator();
                 self.characters_sidebar(ui);
@@ -458,6 +536,7 @@ impl NomadeerApp {
 
     fn central_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.heading("Dashboard");
                 ui.label(format!(
@@ -584,7 +663,9 @@ impl NomadeerApp {
 
     fn selected_system_sidebar(&mut self, ui: &mut egui::Ui) {
         self.reconcile_selected_system();
-        ui.heading("Selected System");
+        ui.horizontal(|ui| {
+            ui.heading("Selected System");
+        });
 
         let Some(system) = self.selected_system() else {
             record_frame(ui, |ui| {
@@ -599,6 +680,16 @@ impl NomadeerApp {
         let system_class = system.class.clone();
         let system_status = system.status.clone();
         let system_notes = system.notes.clone();
+        let security_status = system.security_status;
+        let constellation_name = system.constellation_name.clone();
+        let region_name = system.region_name.clone();
+        let planet_count = system.planet_count;
+        let stargate_count = system.stargate_count;
+        let station_count = system.station_count;
+        let jumps_1h = system.jumps_1h;
+        let ship_kills_1h = system.ship_kills_1h;
+        let pod_kills_1h = system.pod_kills_1h;
+        let npc_kills_1h = system.npc_kills_1h;
         let pilots: Vec<String> = self
             .data
             .accounts
@@ -626,7 +717,31 @@ impl NomadeerApp {
             ui.horizontal_wrapped(|ui| {
                 pill(ui, &system_class);
                 pill(ui, &system_status);
+                ui.label(format!("sec {:.1}", security_status));
             });
+            if !region_name.is_empty() || !constellation_name.is_empty() {
+                ui.label(format!(
+                    "{} / {}",
+                    if region_name.is_empty() {
+                        "Unknown region"
+                    } else {
+                        &region_name
+                    },
+                    if constellation_name.is_empty() {
+                        "Unknown constellation"
+                    } else {
+                        &constellation_name
+                    }
+                ));
+            }
+            ui.label(format!(
+                "{} planets · {} gates · {} stations",
+                planet_count, stargate_count, station_count
+            ));
+            ui.label(format!(
+                "Last hour: {} jumps · {} ships · {} pods · {} NPCs",
+                jumps_1h, ship_kills_1h, pod_kills_1h, npc_kills_1h
+            ));
             ui.label(format!(
                 "{} connections · {} visits",
                 connection_count, visit_count
@@ -760,7 +875,17 @@ impl NomadeerApp {
                     }
                     pill(ui, &system.class);
                     pill(ui, &system.status);
+                    if !system.region_name.is_empty() {
+                        ui.label(&system.region_name);
+                    }
                 });
+                ui.label(format!(
+                    "sec {:.1} · {} planets · {} gates · {} jumps last hour",
+                    system.security_status,
+                    system.planet_count,
+                    system.stargate_count,
+                    system.jumps_1h
+                ));
                 if !system.notes.is_empty() {
                     ui.label(&system.notes);
                 }
@@ -829,9 +954,11 @@ impl NomadeerApp {
 impl eframe::App for NomadeerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_esi_tasks();
+        self.maybe_auto_sync();
         self.top_bar(ctx);
         self.esi_settings_window(ctx);
         self.side_panel(ctx);
         self.central_panel(ctx);
+        ctx.request_repaint_after(Duration::from_secs(1));
     }
 }

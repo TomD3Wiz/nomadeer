@@ -95,12 +95,33 @@ impl Store {
 
         for system in &data.systems {
             tx.execute(
-                "INSERT INTO systems (id, name, class, effect, status, owner, notes, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO systems (
+                    id, solar_system_id, name, class, security_status, constellation_id,
+                    constellation_name, region_id, region_name, planet_count, stargate_count,
+                    station_count, jumps_1h, ship_kills_1h, pod_kills_1h, npc_kills_1h,
+                    intel_updated_at, effect, status, owner, notes, created_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                    ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+                 )",
                 params![
                     system.id,
+                    system.solar_system_id as i64,
                     system.name,
                     system.class,
+                    system.security_status,
+                    system.constellation_id as i64,
+                    system.constellation_name,
+                    system.region_id as i64,
+                    system.region_name,
+                    system.planet_count as i64,
+                    system.stargate_count as i64,
+                    system.station_count as i64,
+                    system.jumps_1h as i64,
+                    system.ship_kills_1h as i64,
+                    system.pod_kills_1h as i64,
+                    system.npc_kills_1h as i64,
+                    system.intel_updated_at as i64,
                     system.effect,
                     system.status,
                     system.owner,
@@ -235,11 +256,25 @@ impl Store {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS systems (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                class TEXT NOT NULL DEFAULT '',
-                effect TEXT NOT NULL DEFAULT '',
+              CREATE TABLE IF NOT EXISTS systems (
+                 id TEXT PRIMARY KEY,
+                 solar_system_id INTEGER NOT NULL DEFAULT 0,
+                 name TEXT NOT NULL,
+                 class TEXT NOT NULL DEFAULT '',
+                 security_status REAL NOT NULL DEFAULT 0,
+                 constellation_id INTEGER NOT NULL DEFAULT 0,
+                 constellation_name TEXT NOT NULL DEFAULT '',
+                 region_id INTEGER NOT NULL DEFAULT 0,
+                 region_name TEXT NOT NULL DEFAULT '',
+                 planet_count INTEGER NOT NULL DEFAULT 0,
+                 stargate_count INTEGER NOT NULL DEFAULT 0,
+                 station_count INTEGER NOT NULL DEFAULT 0,
+                 jumps_1h INTEGER NOT NULL DEFAULT 0,
+                 ship_kills_1h INTEGER NOT NULL DEFAULT 0,
+                 pod_kills_1h INTEGER NOT NULL DEFAULT 0,
+                 npc_kills_1h INTEGER NOT NULL DEFAULT 0,
+                 intel_updated_at INTEGER NOT NULL DEFAULT 0,
+                 effect TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '',
                 owner TEXT NOT NULL DEFAULT '',
                 notes TEXT NOT NULL DEFAULT '',
@@ -287,7 +322,107 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_visits_system_id ON visits(system_id);
              CREATE INDEX IF NOT EXISTS idx_notes_system_id ON notes(system_id);",
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+        self.add_missing_column(
+            conn,
+            "systems",
+            "solar_system_id",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_missing_column(
+            conn,
+            "systems",
+            "security_status",
+            "REAL NOT NULL DEFAULT 0",
+        )?;
+        self.add_missing_column(
+            conn,
+            "systems",
+            "constellation_id",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_missing_column(
+            conn,
+            "systems",
+            "constellation_name",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        self.add_missing_column(conn, "systems", "region_id", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_missing_column(conn, "systems", "region_name", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_missing_column(
+            conn,
+            "systems",
+            "planet_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_missing_column(
+            conn,
+            "systems",
+            "stargate_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_missing_column(
+            conn,
+            "systems",
+            "station_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_missing_column(conn, "systems", "jumps_1h", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_missing_column(
+            conn,
+            "systems",
+            "ship_kills_1h",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_missing_column(
+            conn,
+            "systems",
+            "pod_kills_1h",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_missing_column(
+            conn,
+            "systems",
+            "npc_kills_1h",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_missing_column(
+            conn,
+            "systems",
+            "intel_updated_at",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        Ok(())
+    }
+
+    fn add_missing_column(
+        &self,
+        conn: &SqliteConnection,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| error.to_string())?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| error.to_string())?;
+
+        for existing in columns {
+            if existing.map_err(|error| error.to_string())? == column {
+                return Ok(());
+            }
+        }
+
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     fn load_all(&self, conn: &SqliteConnection) -> Result<AppData, String> {
@@ -365,21 +500,38 @@ impl Store {
     fn load_systems(&self, conn: &SqliteConnection) -> Result<Vec<SystemNode>, String> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, class, effect, status, owner, notes, created_at
-             FROM systems ORDER BY created_at, name",
+                "SELECT id, solar_system_id, name, class, security_status, constellation_id,
+                    constellation_name, region_id, region_name, planet_count, stargate_count,
+                    station_count, jumps_1h, ship_kills_1h, pod_kills_1h, npc_kills_1h,
+                    intel_updated_at, effect, status, owner, notes, created_at
+              FROM systems ORDER BY created_at, name",
             )
             .map_err(|error| error.to_string())?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(SystemNode {
                     id: row.get(0)?,
-                    name: row.get(1)?,
-                    class: row.get(2)?,
-                    effect: row.get(3)?,
-                    status: row.get(4)?,
-                    owner: row.get(5)?,
-                    notes: row.get(6)?,
-                    created_at: row.get::<_, i64>(7)? as u64,
+                    solar_system_id: row.get::<_, i64>(1)? as u64,
+                    name: row.get(2)?,
+                    class: row.get(3)?,
+                    security_status: row.get(4)?,
+                    constellation_id: row.get::<_, i64>(5)? as u64,
+                    constellation_name: row.get(6)?,
+                    region_id: row.get::<_, i64>(7)? as u64,
+                    region_name: row.get(8)?,
+                    planet_count: row.get::<_, i64>(9)? as u32,
+                    stargate_count: row.get::<_, i64>(10)? as u32,
+                    station_count: row.get::<_, i64>(11)? as u32,
+                    jumps_1h: row.get::<_, i64>(12)? as u32,
+                    ship_kills_1h: row.get::<_, i64>(13)? as u32,
+                    pod_kills_1h: row.get::<_, i64>(14)? as u32,
+                    npc_kills_1h: row.get::<_, i64>(15)? as u32,
+                    intel_updated_at: row.get::<_, i64>(16)? as u64,
+                    effect: row.get(17)?,
+                    status: row.get(18)?,
+                    owner: row.get(19)?,
+                    notes: row.get(20)?,
+                    created_at: row.get::<_, i64>(21)? as u64,
                 })
             })
             .map_err(|error| error.to_string())?;

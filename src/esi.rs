@@ -33,9 +33,26 @@ pub(crate) struct LocationSync {
     pub(crate) access_token: String,
     pub(crate) refresh_token: String,
     pub(crate) token_expires_at: u64,
+    pub(crate) system: SystemIntel,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SystemIntel {
     pub(crate) solar_system_id: u64,
-    pub(crate) solar_system_name: String,
-    pub(crate) solar_system_class: String,
+    pub(crate) name: String,
+    pub(crate) security_class: String,
+    pub(crate) security_status: f32,
+    pub(crate) constellation_id: u64,
+    pub(crate) constellation_name: String,
+    pub(crate) region_id: u64,
+    pub(crate) region_name: String,
+    pub(crate) planet_count: u32,
+    pub(crate) stargate_count: u32,
+    pub(crate) station_count: u32,
+    pub(crate) jumps_1h: u32,
+    pub(crate) ship_kills_1h: u32,
+    pub(crate) pod_kills_1h: u32,
+    pub(crate) npc_kills_1h: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,7 +80,43 @@ struct LocationResponse {
 #[derive(Debug, Deserialize)]
 struct SystemResponse {
     name: String,
+    constellation_id: u64,
     security_class: Option<String>,
+    security_status: Option<f32>,
+    planets: Option<Vec<SystemPlanetResponse>>,
+    stargates: Option<Vec<u64>>,
+    stations: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemPlanetResponse {
+    #[allow(dead_code)]
+    planet_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConstellationResponse {
+    name: String,
+    region_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegionResponse {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemJumpResponse {
+    system_id: u64,
+    ship_jumps: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SystemKillResponse {
+    system_id: u64,
+    ship_kills: u32,
+    pod_kills: u32,
+    npc_kills: u32,
 }
 
 pub(crate) fn authorize_account(
@@ -130,18 +183,14 @@ pub(crate) fn sync_location(
         .parse::<u64>()
         .map_err(|_| "Account does not have a valid EVE character ID".to_owned())?;
     let location = fetch_location(character_id, &access_token)?;
-    let system = fetch_system(location.solar_system_id)?;
+    let system = fetch_system_intel(location.solar_system_id)?;
 
     Ok(LocationSync {
         account_id: account.id,
         access_token,
         refresh_token,
         token_expires_at,
-        solar_system_id: location.solar_system_id,
-        solar_system_name: system.name,
-        solar_system_class: system
-            .security_class
-            .unwrap_or_else(|| "unknown".to_owned()),
+        system,
     })
 }
 
@@ -312,6 +361,83 @@ fn fetch_location(character_id: u64, access_token: &str) -> Result<LocationRespo
 fn fetch_system(solar_system_id: u64) -> Result<SystemResponse, String> {
     let url = format!("{ESI_BASE_URL}/universe/systems/{solar_system_id}/?datasource=tranquility");
     get_json(&url, None)
+}
+
+fn fetch_system_intel(solar_system_id: u64) -> Result<SystemIntel, String> {
+    let system = fetch_system(solar_system_id)?;
+    let constellation = fetch_constellation(system.constellation_id)?;
+    let region = fetch_region(constellation.region_id)?;
+    let jumps = fetch_system_jumps(solar_system_id).unwrap_or_default();
+    let kills = fetch_system_kills(solar_system_id).unwrap_or_default();
+
+    Ok(SystemIntel {
+        solar_system_id,
+        name: system.name,
+        security_class: system
+            .security_class
+            .unwrap_or_else(|| "unknown".to_owned()),
+        security_status: system.security_status.unwrap_or_default(),
+        constellation_id: system.constellation_id,
+        constellation_name: constellation.name,
+        region_id: constellation.region_id,
+        region_name: region.name,
+        planet_count: system
+            .planets
+            .map(|items| items.len() as u32)
+            .unwrap_or_default(),
+        stargate_count: system
+            .stargates
+            .map(|items| items.len() as u32)
+            .unwrap_or_default(),
+        station_count: system
+            .stations
+            .map(|items| items.len() as u32)
+            .unwrap_or_default(),
+        jumps_1h: jumps,
+        ship_kills_1h: kills.ship_kills,
+        pod_kills_1h: kills.pod_kills,
+        npc_kills_1h: kills.npc_kills,
+    })
+}
+
+fn fetch_constellation(constellation_id: u64) -> Result<ConstellationResponse, String> {
+    let url = format!(
+        "{ESI_BASE_URL}/universe/constellations/{constellation_id}/?datasource=tranquility"
+    );
+    get_json(&url, None)
+}
+
+fn fetch_region(region_id: u64) -> Result<RegionResponse, String> {
+    let url = format!("{ESI_BASE_URL}/universe/regions/{region_id}/?datasource=tranquility");
+    get_json(&url, None)
+}
+
+fn fetch_system_jumps(solar_system_id: u64) -> Result<u32, String> {
+    let jumps: Vec<SystemJumpResponse> = get_json(
+        &format!("{ESI_BASE_URL}/universe/system_jumps/?datasource=tranquility"),
+        None,
+    )?;
+    Ok(jumps
+        .into_iter()
+        .find(|jump| jump.system_id == solar_system_id)
+        .map(|jump| jump.ship_jumps)
+        .unwrap_or_default())
+}
+
+fn fetch_system_kills(solar_system_id: u64) -> Result<SystemKillResponse, String> {
+    let kills: Vec<SystemKillResponse> = get_json(
+        &format!("{ESI_BASE_URL}/universe/system_kills/?datasource=tranquility"),
+        None,
+    )?;
+    Ok(kills
+        .into_iter()
+        .find(|kill| kill.system_id == solar_system_id)
+        .unwrap_or(SystemKillResponse {
+            system_id: solar_system_id,
+            ship_kills: 0,
+            pod_kills: 0,
+            npc_kills: 0,
+        }))
 }
 
 fn get_json<T>(url: &str, access_token: Option<&str>) -> Result<T, String>

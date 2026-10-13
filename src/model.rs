@@ -56,8 +56,36 @@ pub(crate) struct Account {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SystemNode {
     pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) solar_system_id: u64,
     pub(crate) name: String,
     pub(crate) class: String,
+    #[serde(default)]
+    pub(crate) security_status: f32,
+    #[serde(default)]
+    pub(crate) constellation_id: u64,
+    #[serde(default)]
+    pub(crate) constellation_name: String,
+    #[serde(default)]
+    pub(crate) region_id: u64,
+    #[serde(default)]
+    pub(crate) region_name: String,
+    #[serde(default)]
+    pub(crate) planet_count: u32,
+    #[serde(default)]
+    pub(crate) stargate_count: u32,
+    #[serde(default)]
+    pub(crate) station_count: u32,
+    #[serde(default)]
+    pub(crate) jumps_1h: u32,
+    #[serde(default)]
+    pub(crate) ship_kills_1h: u32,
+    #[serde(default)]
+    pub(crate) pod_kills_1h: u32,
+    #[serde(default)]
+    pub(crate) npc_kills_1h: u32,
+    #[serde(default)]
+    pub(crate) intel_updated_at: u64,
     pub(crate) effect: String,
     pub(crate) status: String,
     pub(crate) owner: String,
