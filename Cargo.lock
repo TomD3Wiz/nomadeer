@@ -1243,6 +1243,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1574,6 +1576,7 @@ dependencies = [
  "base64 0.22.1",
  "eframe",
  "getrandom 0.3.4",
+ "image",
  "reqwest",
  "rusqlite",
  "serde",

@@ -2,12 +2,13 @@ use crate::config::theme;
 use crate::esi::{self, AccountAuthorization, LocationSync, SystemIntel};
 use crate::forms::*;
 use crate::model::*;
+use crate::portrait;
 use crate::store::Store;
 use crate::util::{clean, now};
 use crate::widgets::{pill, record_frame};
 use crate::zkill::{self, ZkillReport};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
@@ -22,6 +23,11 @@ enum EsiTaskResult {
 
 enum ZkillTaskResult {
     Report(ZkillReport),
+}
+
+struct PortraitTaskResult {
+    account_id: String,
+    image: egui::ColorImage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,9 +51,13 @@ pub(crate) struct NomadeerApp {
     esi_rx: Receiver<Result<EsiTaskResult, String>>,
     zkill_tx: Sender<Result<ZkillTaskResult, String>>,
     zkill_rx: Receiver<Result<ZkillTaskResult, String>>,
+    portrait_tx: Sender<Result<PortraitTaskResult, String>>,
+    portrait_rx: Receiver<Result<PortraitTaskResult, String>>,
     esi_busy: bool,
     zkill_busy_system_id: Option<u64>,
     zkill_reports: HashMap<u64, ZkillReport>,
+    portrait_textures: HashMap<String, egui::TextureHandle>,
+    portrait_requested: HashSet<String>,
     next_auto_sync: Instant,
     auto_sync_index: usize,
 }
@@ -57,6 +67,7 @@ impl NomadeerApp {
         let store = Store::new(PathBuf::from("data/nomadeer.sqlite3"));
         let (esi_tx, esi_rx) = mpsc::channel();
         let (zkill_tx, zkill_rx) = mpsc::channel();
+        let (portrait_tx, portrait_rx) = mpsc::channel();
         let mut app = Self {
             data: AppData::default(),
             store,
@@ -70,9 +81,13 @@ impl NomadeerApp {
             esi_rx,
             zkill_tx,
             zkill_rx,
+            portrait_tx,
+            portrait_rx,
             esi_busy: false,
             zkill_busy_system_id: None,
             zkill_reports: HashMap::new(),
+            portrait_textures: HashMap::new(),
+            portrait_requested: HashSet::new(),
             next_auto_sync: Instant::now() + Duration::from_secs(5),
             auto_sync_index: 0,
         };
@@ -462,6 +477,47 @@ impl NomadeerApp {
                     self.status = "Killboard update stopped unexpectedly".to_owned();
                     break;
                 }
+            }
+        }
+    }
+
+    fn maybe_request_portraits(&mut self) {
+        for account in &self.data.accounts {
+            if account.character_id.is_empty()
+                || self.portrait_textures.contains_key(&account.id)
+                || self.portrait_requested.contains(&account.id)
+            {
+                continue;
+            }
+
+            self.portrait_requested.insert(account.id.clone());
+            let account_id = account.id.clone();
+            let character_id = account.character_id.clone();
+            let tx = self.portrait_tx.clone();
+            thread::spawn(move || {
+                let result = portrait::fetch_character_portrait(&character_id)
+                    .map(|image| PortraitTaskResult { account_id, image });
+                let _ = tx.send(result);
+            });
+        }
+    }
+
+    fn poll_portrait_tasks(&mut self, ctx: &egui::Context) {
+        loop {
+            match self.portrait_rx.try_recv() {
+                Ok(Ok(result)) => {
+                    let texture = ctx.load_texture(
+                        format!("portrait_{}", result.account_id),
+                        result.image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.portrait_textures.insert(result.account_id, texture);
+                }
+                Ok(Err(_error)) => {
+                    // Keep portrait failures quiet; names/location still matter more than cosmetics.
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
             }
         }
     }
@@ -926,40 +982,57 @@ impl NomadeerApp {
 
         for account in &self.data.accounts {
             record_frame(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.heading(
-                        egui::RichText::new(&account.character_name).color(theme::character_text()),
-                    );
-                    pill(ui, &account.auth_status);
-                });
-                if !account.last_system_name.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("Current:").color(theme::muted_text()));
-                        ui.label(
-                            egui::RichText::new(&account.last_system_name)
-                                .color(theme::system_text()),
-                        );
-                    });
-                }
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!self.esi_busy, egui::Button::new("Reconnect"))
-                        .clicked()
-                    {
-                        authorize_id = Some(account.id.clone());
+                    if let Some(texture) = self.portrait_textures.get(&account.id) {
+                        ui.add(
+                            egui::Image::new(texture)
+                                .fit_to_exact_size(Vec2::splat(56.0))
+                                .corner_radius(6.0),
+                        );
+                    } else {
+                        ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
                     }
-                    if ui
-                        .add_enabled(
-                            !self.esi_busy && account.auth_status == "authorized",
-                            egui::Button::new("Update location"),
-                        )
-                        .clicked()
-                    {
-                        sync_id = Some(account.id.clone());
-                    }
-                    if ui.small_button("Remove").clicked() {
-                        delete_id = Some(account.id.clone());
-                    }
+
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.heading(
+                                egui::RichText::new(&account.character_name)
+                                    .color(theme::character_text()),
+                            );
+                            pill(ui, &account.auth_status);
+                        });
+                        if !account.last_system_name.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Current:").color(theme::muted_text()),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&account.last_system_name)
+                                        .color(theme::system_text()),
+                                );
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!self.esi_busy, egui::Button::new("Reconnect"))
+                                .clicked()
+                            {
+                                authorize_id = Some(account.id.clone());
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.esi_busy && account.auth_status == "authorized",
+                                    egui::Button::new("Update location"),
+                                )
+                                .clicked()
+                            {
+                                sync_id = Some(account.id.clone());
+                            }
+                            if ui.small_button("Remove").clicked() {
+                                delete_id = Some(account.id.clone());
+                            }
+                        });
+                    });
                 });
             });
         }
@@ -1276,6 +1349,8 @@ impl eframe::App for NomadeerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_esi_tasks();
         self.poll_zkill_tasks();
+        self.poll_portrait_tasks(ctx);
+        self.maybe_request_portraits();
         self.maybe_auto_sync();
         self.top_bar(ctx);
         self.esi_settings_window(ctx);

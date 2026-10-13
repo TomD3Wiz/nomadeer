@@ -3,6 +3,7 @@ mod config;
 mod esi;
 mod forms;
 mod model;
+mod portrait;
 mod store;
 mod util;
 mod widgets;
