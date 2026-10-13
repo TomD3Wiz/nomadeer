@@ -8,7 +8,7 @@ use crate::util::{clean, now};
 use crate::widgets::{pill, record_frame};
 use crate::zkill::{self, ZkillReport};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
@@ -776,19 +776,7 @@ impl NomadeerApp {
             return;
         }
 
-        let mut positions = HashMap::<String, Pos2>::new();
-        let columns = ((self.data.systems.len() as f32).sqrt().ceil() as usize).max(1);
-        let cell_w = rect.width() / columns as f32;
-        let rows = self.data.systems.len().div_ceil(columns).max(1);
-        let cell_h = rect.height() / rows as f32;
-
-        for (index, system) in self.data.systems.iter().enumerate() {
-            let col = index % columns;
-            let row = index / columns;
-            let x = rect.left() + cell_w * (col as f32 + 0.5);
-            let y = rect.top() + cell_h * (row as f32 + 0.5);
-            positions.insert(system.id.clone(), Pos2::new(x, y));
-        }
+        let positions = self.chain_positions(rect);
 
         for connection in &self.data.connections {
             if let (Some(a), Some(b)) = (
@@ -800,7 +788,15 @@ impl NomadeerApp {
                     "destab" => Color32::from_rgb(255, 194, 87),
                     _ => Color32::from_rgb(93, 242, 255),
                 };
-                painter.line_segment([*a, *b], Stroke::new(2.0_f32, color));
+                let delta = *b - *a;
+                let distance = delta.length();
+                let endpoints = if distance > 76.0 {
+                    let offset = delta / distance * 38.0;
+                    [*a + offset, *b - offset]
+                } else {
+                    [*a, *b]
+                };
+                painter.line_segment(endpoints, Stroke::new(2.0_f32, color));
             }
         }
 
@@ -849,6 +845,129 @@ impl NomadeerApp {
                 }
             }
         }
+    }
+
+    fn chain_positions(&self, rect: egui::Rect) -> HashMap<String, Pos2> {
+        let mut positions = HashMap::<String, Pos2>::new();
+        if self.data.systems.is_empty() {
+            return positions;
+        }
+
+        let node_margin = 54.0;
+        let inner = rect.shrink(node_margin);
+        let system_order = self
+            .data
+            .systems
+            .iter()
+            .enumerate()
+            .map(|(index, system)| (system.id.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let system_ids = self
+            .data
+            .systems
+            .iter()
+            .map(|system| system.id.clone())
+            .collect::<HashSet<_>>();
+        let mut adjacency = self
+            .data
+            .systems
+            .iter()
+            .map(|system| (system.id.clone(), Vec::<String>::new()))
+            .collect::<HashMap<_, _>>();
+
+        for connection in &self.data.connections {
+            if connection.from_system == connection.to_system
+                || !system_ids.contains(&connection.from_system)
+                || !system_ids.contains(&connection.to_system)
+            {
+                continue;
+            }
+
+            if let Some(neighbors) = adjacency.get_mut(&connection.from_system) {
+                neighbors.push(connection.to_system.clone());
+            }
+            if let Some(neighbors) = adjacency.get_mut(&connection.to_system) {
+                neighbors.push(connection.from_system.clone());
+            }
+        }
+
+        for neighbors in adjacency.values_mut() {
+            neighbors.sort_by_key(|id| system_order.get(id).copied().unwrap_or(usize::MAX));
+            neighbors.dedup();
+        }
+
+        let mut visited = HashSet::<String>::new();
+        let mut components = Vec::<Vec<Vec<String>>>::new();
+        while visited.len() < self.data.systems.len() {
+            let Some(root) = self
+                .data
+                .systems
+                .iter()
+                .filter(|system| !visited.contains(&system.id))
+                .max_by_key(|system| {
+                    (
+                        adjacency.get(&system.id).map_or(0, Vec::len),
+                        std::cmp::Reverse(system_order.get(&system.id).copied().unwrap_or(0)),
+                    )
+                })
+                .map(|system| system.id.clone())
+            else {
+                break;
+            };
+
+            let mut levels = Vec::<Vec<String>>::new();
+            let mut queue = VecDeque::from([(root.clone(), 0_usize)]);
+            visited.insert(root);
+
+            while let Some((system_id, depth)) = queue.pop_front() {
+                if levels.len() <= depth {
+                    levels.push(Vec::new());
+                }
+                levels[depth].push(system_id.clone());
+
+                for neighbor in adjacency.get(&system_id).into_iter().flatten() {
+                    if visited.insert(neighbor.clone()) {
+                        queue.push_back((neighbor.clone(), depth + 1));
+                    }
+                }
+            }
+
+            components.push(levels);
+        }
+
+        let max_depth = components.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let component_gap = usize::from(components.len() > 1);
+        let total_slots = components
+            .iter()
+            .map(|levels| levels.iter().map(Vec::len).max().unwrap_or(1).max(1))
+            .sum::<usize>()
+            + component_gap * components.len().saturating_sub(1);
+
+        let mut slot_cursor = 0_usize;
+        for levels in components {
+            let component_slots = levels.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            for (depth, nodes) in levels.iter().enumerate() {
+                let x = if max_depth == 1 {
+                    inner.center().x
+                } else {
+                    inner.left() + inner.width() * depth as f32 / (max_depth - 1) as f32
+                };
+                let level_offset = (component_slots.saturating_sub(nodes.len())) as f32 / 2.0;
+
+                for (index, system_id) in nodes.iter().enumerate() {
+                    let slot = slot_cursor as f32 + level_offset + index as f32;
+                    let y = if total_slots <= 1 {
+                        inner.center().y
+                    } else {
+                        inner.top() + inner.height() * (slot + 0.5) / total_slots as f32
+                    };
+                    positions.insert(system_id.clone(), Pos2::new(x, y));
+                }
+            }
+            slot_cursor += component_slots + component_gap;
+        }
+
+        positions
     }
 
     fn selected_system_sidebar(&mut self, ui: &mut egui::Ui) {
