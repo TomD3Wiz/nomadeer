@@ -146,6 +146,10 @@ impl NomadeerApp {
             .find(|system| system.id == self.selected_system_id)
     }
 
+    fn system_by_id(&self, id: &str) -> Option<&SystemNode> {
+        self.data.systems.iter().find(|system| system.id == id)
+    }
+
     fn inferred_system_class(system: &SystemNode) -> String {
         if let Some(class) = Self::wormhole_class_from_security_class(&system.class) {
             return class;
@@ -186,6 +190,24 @@ impl NomadeerApp {
             _ => return None,
         };
         Some(class.to_owned())
+    }
+
+    fn system_intel_summary(system: &SystemNode) -> String {
+        let region = if system.region_name.is_empty() {
+            "Unknown region"
+        } else {
+            &system.region_name
+        };
+
+        format!(
+            "{} · {} · {} jumps · kills {} ship / {} pod / {} NPC",
+            Self::inferred_system_class(system),
+            region,
+            system.jumps_1h,
+            system.ship_kills_1h,
+            system.pod_kills_1h,
+            system.npc_kills_1h
+        )
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
@@ -987,6 +1009,8 @@ impl NomadeerApp {
 
         for connection in connections.into_iter().take(8) {
             record_frame(ui, |ui| {
+                let from_system = self.system_by_id(&connection.from_system);
+                let to_system = self.system_by_id(&connection.to_system);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         egui::RichText::new(self.system_name(&connection.from_system))
@@ -998,6 +1022,12 @@ impl NomadeerApp {
                             .color(theme::system_text()),
                     );
                 });
+                if let Some(system) = from_system {
+                    ui.label(Self::system_intel_summary(system));
+                }
+                if let Some(system) = to_system {
+                    ui.label(Self::system_intel_summary(system));
+                }
                 if !connection.notes.is_empty() {
                     ui.label(&connection.notes);
                 }
