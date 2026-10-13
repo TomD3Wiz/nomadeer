@@ -14,12 +14,37 @@ pub(crate) const MASS_STATES: &[&str] = &["fresh", "destab", "critical", "unknow
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct AppData {
+    #[serde(default)]
+    pub(crate) esi_settings: EsiSettings,
+    #[serde(default)]
     pub(crate) accounts: Vec<Account>,
+    #[serde(default)]
     pub(crate) systems: Vec<SystemNode>,
+    #[serde(default)]
     pub(crate) connections: Vec<Connection>,
+    #[serde(default)]
     pub(crate) signatures: Vec<Signature>,
+    #[serde(default)]
     pub(crate) visits: Vec<VisitLog>,
+    #[serde(default)]
     pub(crate) notes: Vec<Note>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct EsiSettings {
+    pub(crate) client_id: String,
+    pub(crate) callback_port: u16,
+    pub(crate) scopes: String,
+}
+
+impl Default for EsiSettings {
+    fn default() -> Self {
+        Self {
+            client_id: String::new(),
+            callback_port: 8788,
+            scopes: "esi-location.read_location.v1 esi-location.read_ship_type.v1".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

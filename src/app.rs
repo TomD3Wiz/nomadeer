@@ -1,3 +1,4 @@
+use crate::esi::{self, AccountAuthorization, LocationSync};
 use crate::forms::*;
 use crate::model::*;
 use crate::store::Store;
@@ -6,12 +7,20 @@ use crate::widgets::{combo, pill, record_frame, system_combo, tab_button};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
+
+enum EsiTaskResult {
+    Authorized(AccountAuthorization),
+    Location(LocationSync),
+}
 
 pub(crate) struct NomadeerApp {
     data: AppData,
     store: Store,
     status: String,
     active_tab: PanelTab,
+    esi_settings_form: EsiSettingsForm,
     account_form: AccountForm,
     system_form: SystemForm,
     connection_form: ConnectionForm,
@@ -19,16 +28,21 @@ pub(crate) struct NomadeerApp {
     visit_form: VisitForm,
     note_form: NoteForm,
     id_counter: u64,
+    esi_tx: Sender<Result<EsiTaskResult, String>>,
+    esi_rx: Receiver<Result<EsiTaskResult, String>>,
+    esi_busy: bool,
 }
 
 impl NomadeerApp {
     pub(crate) fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let store = Store::new(PathBuf::from("data/nomadeer.sqlite3"));
+        let (esi_tx, esi_rx) = mpsc::channel();
         let mut app = Self {
             data: AppData::default(),
             store,
             status: "Ready".to_owned(),
             active_tab: PanelTab::Systems,
+            esi_settings_form: EsiSettingsForm::default(),
             account_form: AccountForm::default(),
             system_form: SystemForm {
                 class: "C3".to_owned(),
@@ -49,6 +63,9 @@ impl NomadeerApp {
             visit_form: VisitForm::default(),
             note_form: NoteForm::default(),
             id_counter: 0,
+            esi_tx,
+            esi_rx,
+            esi_busy: false,
         };
         app.load();
         app
@@ -58,6 +75,7 @@ impl NomadeerApp {
         match self.store.load() {
             Ok(data) => {
                 self.data = data;
+                self.sync_esi_settings_form();
                 self.status = format!("Loaded {}", self.store.path().display());
             }
             Err(error) => {
@@ -76,6 +94,25 @@ impl NomadeerApp {
     fn new_id(&mut self, prefix: &str) -> String {
         self.id_counter += 1;
         format!("{prefix}_{}_{}", now(), self.id_counter)
+    }
+
+    fn sync_esi_settings_form(&mut self) {
+        self.esi_settings_form.client_id = self.data.esi_settings.client_id.clone();
+        self.esi_settings_form.callback_port = self.data.esi_settings.callback_port.to_string();
+        self.esi_settings_form.scopes = self.data.esi_settings.scopes.clone();
+    }
+
+    fn save_esi_settings_from_form(&mut self) -> bool {
+        let Ok(callback_port) = self.esi_settings_form.callback_port.trim().parse::<u16>() else {
+            self.status = "ESI callback port must be a number from 1 to 65535".to_owned();
+            return false;
+        };
+
+        self.data.esi_settings.client_id = clean(&self.esi_settings_form.client_id);
+        self.data.esi_settings.callback_port = callback_port;
+        self.data.esi_settings.scopes = clean(&self.esi_settings_form.scopes);
+        self.save();
+        true
     }
 
     fn system_name(&self, id: &str) -> String {
@@ -116,6 +153,8 @@ impl NomadeerApp {
             .show(ctx, |ui| {
                 ui.heading("Add intel");
                 ui.separator();
+                self.esi_settings_ui(ui);
+                ui.separator();
                 self.account_form_ui(ui);
                 ui.separator();
                 self.system_form_ui(ui);
@@ -130,11 +169,32 @@ impl NomadeerApp {
             });
     }
 
+    fn esi_settings_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("ESI settings")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("Register an EVE app with this callback URL:");
+                ui.monospace(format!(
+                    "http://localhost:{}/callback",
+                    self.esi_settings_form.callback_port
+                ));
+                ui.text_edit_singleline(&mut self.esi_settings_form.client_id)
+                    .on_hover_text("EVE Developers application Client ID");
+                ui.text_edit_singleline(&mut self.esi_settings_form.callback_port)
+                    .on_hover_text("Local callback port");
+                ui.text_edit_multiline(&mut self.esi_settings_form.scopes)
+                    .on_hover_text("Space-separated ESI scopes");
+                if ui.button("Save ESI settings").clicked() {
+                    self.save_esi_settings_from_form();
+                }
+            });
+    }
+
     fn account_form_ui(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Account")
             .default_open(false)
             .show(ui, |ui| {
-                ui.label("ESI authorization will use these account records next.");
+                ui.label("Add a character placeholder, then authorize it from the Accounts tab.");
                 ui.text_edit_singleline(&mut self.account_form.character_name)
                     .on_hover_text("Character name");
                 ui.text_edit_singleline(&mut self.account_form.character_id)
@@ -142,7 +202,7 @@ impl NomadeerApp {
 
                 let can_add = !self.account_form.character_name.trim().is_empty();
                 if ui
-                    .add_enabled(can_add, egui::Button::new("Add account placeholder"))
+                    .add_enabled(can_add, egui::Button::new("Add account"))
                     .clicked()
                 {
                     let timestamp = now();
@@ -388,6 +448,196 @@ impl NomadeerApp {
             });
     }
 
+    fn start_authorize_account(&mut self, account_id: String) {
+        if self.esi_busy {
+            self.status = "An ESI task is already running".to_owned();
+            return;
+        }
+        if !self.save_esi_settings_from_form() {
+            return;
+        }
+        if self.data.esi_settings.client_id.is_empty() {
+            self.status = "Set your ESI Client ID before authorizing an account".to_owned();
+            return;
+        }
+
+        self.esi_busy = true;
+        self.status = "Opening browser for ESI authorization...".to_owned();
+        let tx = self.esi_tx.clone();
+        let settings = self.data.esi_settings.clone();
+        thread::spawn(move || {
+            let result =
+                esi::authorize_account(settings, account_id).map(EsiTaskResult::Authorized);
+            let _ = tx.send(result);
+        });
+    }
+
+    fn start_sync_location(&mut self, account_id: String) {
+        if self.esi_busy {
+            self.status = "An ESI task is already running".to_owned();
+            return;
+        }
+        let Some(account) = self
+            .data
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned()
+        else {
+            self.status = "Account not found".to_owned();
+            return;
+        };
+
+        self.esi_busy = true;
+        self.status = format!("Syncing {} location from ESI...", account.character_name);
+        let tx = self.esi_tx.clone();
+        let settings = self.data.esi_settings.clone();
+        thread::spawn(move || {
+            let result = esi::sync_location(settings, account).map(EsiTaskResult::Location);
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_esi_tasks(&mut self) {
+        loop {
+            match self.esi_rx.try_recv() {
+                Ok(Ok(EsiTaskResult::Authorized(auth))) => {
+                    self.esi_busy = false;
+                    self.apply_authorization(auth);
+                }
+                Ok(Ok(EsiTaskResult::Location(location))) => {
+                    self.esi_busy = false;
+                    self.apply_location_sync(location);
+                }
+                Ok(Err(error)) => {
+                    self.esi_busy = false;
+                    self.status = format!("ESI failed: {error}");
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.esi_busy = false;
+                    self.status = "ESI worker disconnected".to_owned();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn apply_authorization(&mut self, auth: AccountAuthorization) {
+        if let Some(account) = self
+            .data
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == auth.account_id)
+        {
+            account.character_id = auth.character_id;
+            account.character_name = auth.character_name;
+            account.owner_hash = auth.owner_hash;
+            account.auth_status = "authorized".to_owned();
+            account.access_token = Some(auth.access_token);
+            account.refresh_token = Some(auth.refresh_token);
+            account.token_expires_at = Some(auth.token_expires_at);
+            account.updated_at = now();
+            self.save();
+            self.status = "ESI account authorized".to_owned();
+        } else {
+            self.status =
+                "ESI authorization completed, but the account no longer exists".to_owned();
+        }
+    }
+
+    fn apply_location_sync(&mut self, location: LocationSync) {
+        let system_id = self.ensure_esi_system(
+            location.solar_system_id,
+            &location.solar_system_name,
+            &location.solar_system_class,
+        );
+
+        let Some(account_index) = self
+            .data
+            .accounts
+            .iter()
+            .position(|account| account.id == location.account_id)
+        else {
+            self.status = "ESI location synced, but the account no longer exists".to_owned();
+            return;
+        };
+
+        let previous_system_id = self.data.accounts[account_index].last_system_id.clone();
+        let character_name = self.data.accounts[account_index].character_name.clone();
+
+        self.data.accounts[account_index].access_token = Some(location.access_token);
+        self.data.accounts[account_index].refresh_token = Some(location.refresh_token);
+        self.data.accounts[account_index].token_expires_at = Some(location.token_expires_at);
+        self.data.accounts[account_index].last_system_id = system_id.clone();
+        self.data.accounts[account_index].last_system_name = location.solar_system_name.clone();
+        self.data.accounts[account_index].auth_status = "authorized".to_owned();
+        self.data.accounts[account_index].updated_at = now();
+
+        let visit_id = self.new_id("visit");
+        self.data.visits.push(VisitLog {
+            id: visit_id,
+            system_id: system_id.clone(),
+            pilot: character_name.clone(),
+            activity: "ESI location sync".to_owned(),
+            notes: String::new(),
+            created_at: now(),
+        });
+
+        if !previous_system_id.is_empty() && previous_system_id != system_id {
+            self.ensure_connection(&previous_system_id, &system_id, &character_name);
+        }
+
+        self.save();
+        self.status = format!("Synced {character_name} in {}", location.solar_system_name);
+    }
+
+    fn ensure_esi_system(&mut self, solar_system_id: u64, name: &str, class: &str) -> String {
+        let esi_id = format!("esi_sys_{solar_system_id}");
+        if self.data.systems.iter().any(|system| system.id == esi_id) {
+            return esi_id;
+        }
+        if let Some(existing) = self.data.systems.iter().find(|system| system.name == name) {
+            return existing.id.clone();
+        }
+
+        self.data.systems.push(SystemNode {
+            id: esi_id.clone(),
+            name: name.to_owned(),
+            class: class.to_owned(),
+            effect: String::new(),
+            status: "scouted".to_owned(),
+            owner: String::new(),
+            notes: format!("Added from ESI solar system ID {solar_system_id}"),
+            created_at: now(),
+        });
+        esi_id
+    }
+
+    fn ensure_connection(&mut self, from_system: &str, to_system: &str, character_name: &str) {
+        let exists = self.data.connections.iter().any(|connection| {
+            (connection.from_system == from_system && connection.to_system == to_system)
+                || (connection.from_system == to_system && connection.to_system == from_system)
+        });
+        if exists {
+            return;
+        }
+
+        let connection_id = self.new_id("conn");
+        self.data.connections.push(Connection {
+            id: connection_id,
+            from_system: from_system.to_owned(),
+            to_system: to_system.to_owned(),
+            signature_from: String::new(),
+            signature_to: String::new(),
+            mass_status: "unknown".to_owned(),
+            life_status: "unknown".to_owned(),
+            ship_size: String::new(),
+            notes: format!("Inferred from {character_name} ESI movement"),
+            created_at: now(),
+        });
+    }
+
     fn central_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -516,6 +766,8 @@ impl NomadeerApp {
 
     fn accounts_list(&mut self, ui: &mut egui::Ui) {
         let mut delete_id = None;
+        let mut authorize_id = None;
+        let mut sync_id = None;
         for account in &self.data.accounts {
             record_frame(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -523,6 +775,21 @@ impl NomadeerApp {
                     pill(ui, &account.auth_status);
                     if !account.last_system_name.is_empty() {
                         pill(ui, &account.last_system_name);
+                    }
+                    if ui
+                        .add_enabled(!self.esi_busy, egui::Button::new("Authorize ESI"))
+                        .clicked()
+                    {
+                        authorize_id = Some(account.id.clone());
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.esi_busy && account.auth_status == "authorized",
+                            egui::Button::new("Sync location"),
+                        )
+                        .clicked()
+                    {
+                        sync_id = Some(account.id.clone());
                     }
                     if ui.small_button("Delete").clicked() {
                         delete_id = Some(account.id.clone());
@@ -534,6 +801,9 @@ impl NomadeerApp {
                 if account.auth_status == "unauthorized" {
                     ui.label("Not authorized with ESI yet.");
                 }
+                if account.auth_status == "authorized" && account.refresh_token.is_some() {
+                    ui.label("ESI tokens are stored locally in SQLite.");
+                }
             });
         }
         if self.data.accounts.is_empty() {
@@ -542,6 +812,12 @@ impl NomadeerApp {
         if let Some(id) = delete_id {
             self.data.accounts.retain(|account| account.id != id);
             self.save();
+        }
+        if let Some(id) = authorize_id {
+            self.start_authorize_account(id);
+        }
+        if let Some(id) = sync_id {
+            self.start_sync_location(id);
         }
     }
 
@@ -728,6 +1004,7 @@ impl NomadeerApp {
 
 impl eframe::App for NomadeerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_esi_tasks();
         self.top_bar(ctx);
         self.side_panel(ctx);
         self.central_panel(ctx);

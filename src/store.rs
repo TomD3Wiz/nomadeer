@@ -1,4 +1,6 @@
-use crate::model::{Account, AppData, Connection, Note, Signature, SystemNode, VisitLog};
+use crate::model::{
+    Account, AppData, Connection, EsiSettings, Note, Signature, SystemNode, VisitLog,
+};
 use rusqlite::{Connection as SqliteConnection, params};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,12 +39,32 @@ impl Store {
         let tx = conn.transaction().map_err(|error| error.to_string())?;
 
         tx.execute_batch(
-            "DELETE FROM accounts;
+            "DELETE FROM app_settings;
+             DELETE FROM accounts;
              DELETE FROM systems;
              DELETE FROM connections;
              DELETE FROM signatures;
              DELETE FROM visits;
              DELETE FROM notes;",
+        )
+        .map_err(|error| error.to_string())?;
+
+        tx.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)",
+            params!["esi_client_id", data.esi_settings.client_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)",
+            params![
+                "esi_callback_port",
+                data.esi_settings.callback_port.to_string()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)",
+            params!["esi_scopes", data.esi_settings.scopes],
         )
         .map_err(|error| error.to_string())?;
 
@@ -195,6 +217,10 @@ impl Store {
     fn init_schema(&self, conn: &SqliteConnection) -> Result<(), String> {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
+             CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+             );
              CREATE TABLE IF NOT EXISTS accounts (
                 id TEXT PRIMARY KEY,
                 character_id TEXT NOT NULL DEFAULT '',
@@ -266,6 +292,7 @@ impl Store {
 
     fn load_all(&self, conn: &SqliteConnection) -> Result<AppData, String> {
         Ok(AppData {
+            esi_settings: self.load_esi_settings(conn)?,
             accounts: self.load_accounts(conn)?,
             systems: self.load_systems(conn)?,
             connections: self.load_connections(conn)?,
@@ -273,6 +300,32 @@ impl Store {
             visits: self.load_visits(conn)?,
             notes: self.load_notes(conn)?,
         })
+    }
+
+    fn load_esi_settings(&self, conn: &SqliteConnection) -> Result<EsiSettings, String> {
+        let mut settings = EsiSettings::default();
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM app_settings")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+
+        for row in rows {
+            let (key, value) = row.map_err(|error| error.to_string())?;
+            match key.as_str() {
+                "esi_client_id" => settings.client_id = value,
+                "esi_callback_port" => {
+                    settings.callback_port = value.parse().unwrap_or(settings.callback_port);
+                }
+                "esi_scopes" => settings.scopes = value,
+                _ => {}
+            }
+        }
+
+        Ok(settings)
     }
 
     fn load_accounts(&self, conn: &SqliteConnection) -> Result<Vec<Account>, String> {
@@ -434,6 +487,7 @@ impl Store {
 
     fn is_empty(&self, data: &AppData) -> bool {
         data.accounts.is_empty()
+            && data.esi_settings.client_id.is_empty()
             && data.systems.is_empty()
             && data.connections.is_empty()
             && data.signatures.is_empty()

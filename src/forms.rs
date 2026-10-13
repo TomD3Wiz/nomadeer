@@ -1,4 +1,11 @@
 #[derive(Default)]
+pub(crate) struct EsiSettingsForm {
+    pub(crate) client_id: String,
+    pub(crate) callback_port: String,
+    pub(crate) scopes: String,
+}
+
+#[derive(Default)]
 pub(crate) struct AccountForm {
     pub(crate) character_name: String,
     pub(crate) character_id: String,

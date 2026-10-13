@@ -8,7 +8,8 @@ This scaffold is a Rust GUI application built with `egui`/`eframe`. It stores yo
 
 - Native desktop window.
 - Track systems, signatures, wormhole connections, visits, and notes.
-- Track local accounts as the foundation for ESI authorization.
+- Authorize characters with EVE ESI using local loopback OAuth + PKCE.
+- Sync authorized character location from ESI and infer movement connections.
 - Visual chain map with mass/status coloring.
 - Local SQLite persistence.
 - Single binary target via Cargo.
@@ -55,12 +56,28 @@ data/nomadeer.sqlite3
 
 Those files are ignored by git. Existing `data/eve_wanderer.sqlite3` data is copied to the new Nomadeer database path on first launch. Existing `data/eve_wanderer.json` data is imported into SQLite on first empty database load.
 
+## ESI setup
+
+Create an application at <https://developers.eveonline.com/> and use this callback URL:
+
+```text
+http://localhost:8788/callback
+```
+
+In Nomadeer, enter the app's Client ID under **ESI settings**. The default scopes are:
+
+```text
+esi-location.read_location.v1 esi-location.read_ship_type.v1
+```
+
+Then add an account placeholder, authorize it from the **Accounts** tab, and use **Sync location** to pull the character's current system. Access and refresh tokens are stored only in the local SQLite database.
+
 ## Roadmap ideas
 
 - Editable records instead of delete/recreate.
 - Drag/drop chain map nodes and saved layout positions.
 - Wormhole type presets for mass, life, and ship size.
-- ESI integration for current character location.
+- Background ESI location polling.
 - Import/export chain snapshots.
 - Optional encrypted data store.
 
