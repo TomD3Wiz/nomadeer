@@ -3,7 +3,7 @@ use crate::esi::{self, AccountAuthorization, LocationSync};
 use crate::forms::*;
 use crate::model::*;
 use crate::store::Store;
-use crate::util::{clean, empty_dash, now};
+use crate::util::{clean, now};
 use crate::widgets::{pill, record_frame};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
 use std::collections::HashMap;
@@ -16,10 +16,19 @@ enum EsiTaskResult {
     Location(LocationSync),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardTab {
+    Movement,
+    Connections,
+    Systems,
+}
+
 pub(crate) struct NomadeerApp {
     data: AppData,
     store: Store,
     status: String,
+    selected_system_id: String,
+    active_tab: DashboardTab,
     esi_settings_form: EsiSettingsForm,
     show_esi_settings: bool,
     id_counter: u64,
@@ -36,6 +45,8 @@ impl NomadeerApp {
             data: AppData::default(),
             store,
             status: "Ready".to_owned(),
+            selected_system_id: String::new(),
+            active_tab: DashboardTab::Movement,
             esi_settings_form: EsiSettingsForm::default(),
             show_esi_settings: false,
             id_counter: 0,
@@ -52,7 +63,8 @@ impl NomadeerApp {
             Ok(data) => {
                 self.data = data;
                 self.sync_esi_settings_form();
-                self.status = format!("Loaded {}", self.store.path().display());
+                self.reconcile_selected_system();
+                self.status = "Loaded".to_owned();
             }
             Err(error) => {
                 self.status = format!("Could not load database: {error}");
@@ -62,7 +74,7 @@ impl NomadeerApp {
 
     fn save(&mut self) {
         match self.store.save(&self.data) {
-            Ok(()) => self.status = format!("Saved {}", self.store.path().display()),
+            Ok(()) => self.status = "Saved".to_owned(),
             Err(error) => self.status = format!("Save failed: {error}"),
         }
     }
@@ -100,6 +112,33 @@ impl NomadeerApp {
             .unwrap_or_else(|| "Unknown".to_owned())
     }
 
+    fn reconcile_selected_system(&mut self) {
+        let selected_is_valid = self
+            .data
+            .systems
+            .iter()
+            .any(|system| system.id == self.selected_system_id);
+        if selected_is_valid {
+            return;
+        }
+
+        self.selected_system_id = self
+            .data
+            .accounts
+            .iter()
+            .find(|account| !account.last_system_id.is_empty())
+            .map(|account| account.last_system_id.clone())
+            .or_else(|| self.data.systems.first().map(|system| system.id.clone()))
+            .unwrap_or_default();
+    }
+
+    fn selected_system(&self) -> Option<&SystemNode> {
+        self.data
+            .systems
+            .iter()
+            .find(|system| system.id == self.selected_system_id)
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -116,22 +155,6 @@ impl NomadeerApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(&self.status);
                 });
-            });
-            ui.horizontal_wrapped(|ui| {
-                if self.data.accounts.is_empty() {
-                    ui.label("No authorized characters");
-                }
-                for account in &self.data.accounts {
-                    ui.label(
-                        egui::RichText::new(&account.character_name).color(theme::character_text()),
-                    );
-                    ui.label(egui::RichText::new("·").color(theme::muted_text()));
-                    ui.label(
-                        egui::RichText::new(empty_dash(&account.last_system_name))
-                            .color(theme::system_text()),
-                    );
-                    pill(ui, &account.auth_status);
-                }
             });
         });
     }
@@ -193,14 +216,14 @@ impl NomadeerApp {
 
     fn start_authorize_account(&mut self, account_id: String) {
         if self.esi_busy {
-            self.status = "An ESI task is already running".to_owned();
+            self.status = "Already working on a character update".to_owned();
             return;
         }
         if !self.save_esi_settings_from_form() {
             return;
         }
         if self.data.esi_settings.client_id.is_empty() {
-            self.status = "Set your ESI Client ID before authorizing an account".to_owned();
+            self.status = "Set your ESI Client ID before connecting a character".to_owned();
             return;
         }
 
@@ -209,7 +232,7 @@ impl NomadeerApp {
 
     fn start_add_character(&mut self) {
         if self.esi_busy {
-            self.status = "An ESI task is already running".to_owned();
+            self.status = "Already working on a character update".to_owned();
             return;
         }
         if !self.save_esi_settings_from_form() {
@@ -244,7 +267,7 @@ impl NomadeerApp {
 
     fn spawn_authorize_account(&mut self, account_id: String) {
         self.esi_busy = true;
-        self.status = "Opening browser for ESI authorization...".to_owned();
+        self.status = "Opening browser to connect character...".to_owned();
         let tx = self.esi_tx.clone();
         let settings = self.data.esi_settings.clone();
         thread::spawn(move || {
@@ -256,7 +279,7 @@ impl NomadeerApp {
 
     fn start_sync_location(&mut self, account_id: String) {
         if self.esi_busy {
-            self.status = "An ESI task is already running".to_owned();
+            self.status = "Already working on a character update".to_owned();
             return;
         }
         let Some(account) = self
@@ -266,12 +289,12 @@ impl NomadeerApp {
             .find(|account| account.id == account_id)
             .cloned()
         else {
-            self.status = "Account not found".to_owned();
+            self.status = "Character not found".to_owned();
             return;
         };
 
         self.esi_busy = true;
-        self.status = format!("Syncing {} location from ESI...", account.character_name);
+        self.status = format!("Updating {} location...", account.character_name);
         let tx = self.esi_tx.clone();
         let settings = self.data.esi_settings.clone();
         thread::spawn(move || {
@@ -293,12 +316,12 @@ impl NomadeerApp {
                 }
                 Ok(Err(error)) => {
                     self.esi_busy = false;
-                    self.status = format!("ESI failed: {error}");
+                    self.status = format!("Character update failed: {error}");
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.esi_busy = false;
-                    self.status = "ESI worker disconnected".to_owned();
+                    self.status = "Character update stopped unexpectedly".to_owned();
                     break;
                 }
             }
@@ -321,10 +344,9 @@ impl NomadeerApp {
             account.token_expires_at = Some(auth.token_expires_at);
             account.updated_at = now();
             self.save();
-            self.status = "ESI account authorized".to_owned();
+            self.status = "Character connected".to_owned();
         } else {
-            self.status =
-                "ESI authorization completed, but the account no longer exists".to_owned();
+            self.status = "Character connected, but it is no longer in the list".to_owned();
         }
     }
 
@@ -341,7 +363,7 @@ impl NomadeerApp {
             .iter()
             .position(|account| account.id == location.account_id)
         else {
-            self.status = "ESI location synced, but the account no longer exists".to_owned();
+            self.status = "Location updated, but the character is no longer in the list".to_owned();
             return;
         };
 
@@ -361,7 +383,7 @@ impl NomadeerApp {
             id: visit_id,
             system_id: system_id.clone(),
             pilot: character_name.clone(),
-            activity: "ESI location sync".to_owned(),
+            activity: "Location updated".to_owned(),
             notes: String::new(),
             created_at: now(),
         });
@@ -371,7 +393,10 @@ impl NomadeerApp {
         }
 
         self.save();
-        self.status = format!("Synced {character_name} in {}", location.solar_system_name);
+        if self.selected_system_id.is_empty() {
+            self.selected_system_id = system_id;
+        }
+        self.status = format!("{character_name} is in {}", location.solar_system_name);
     }
 
     fn ensure_esi_system(&mut self, solar_system_id: u64, name: &str, class: &str) -> String {
@@ -390,7 +415,7 @@ impl NomadeerApp {
             effect: String::new(),
             status: "scouted".to_owned(),
             owner: String::new(),
-            notes: format!("Added from ESI solar system ID {solar_system_id}"),
+            notes: format!("Solar system ID {solar_system_id}"),
             created_at: now(),
         });
         esi_id
@@ -415,43 +440,53 @@ impl NomadeerApp {
             mass_status: "unknown".to_owned(),
             life_status: "unknown".to_owned(),
             ship_size: String::new(),
-            notes: format!("Inferred from {character_name} ESI movement"),
+            notes: format!("Inferred from {character_name} movement"),
             created_at: now(),
         });
+    }
+
+    fn side_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("dashboard_sidebar")
+            .resizable(true)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                self.selected_system_sidebar(ui);
+                ui.separator();
+                self.characters_sidebar(ui);
+            });
     }
 
     fn central_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Reactive dashboard");
+                ui.heading("Dashboard");
                 ui.label(format!(
-                    "{} characters · {} systems · {} inferred connections",
-                    self.data.accounts.len(),
+                    "{} systems · {} connections · {} visits",
                     self.data.systems.len(),
-                    self.data.connections.len()
+                    self.data.connections.len(),
+                    self.data.visits.len()
                 ));
             });
             ui.add_space(8.0);
-            self.characters_dashboard(ui);
-            ui.separator();
-            self.current_systems_dashboard(ui);
-            ui.separator();
             ui.horizontal(|ui| {
                 ui.heading("Chain map");
-                ui.label("Built from ESI movement syncs");
+                ui.label("Select a system to inspect it");
             });
             self.chain_map(ui);
             ui.separator();
-            ui.columns(2, |columns| {
-                self.recent_movements(&mut columns[0]);
-                self.inferred_connections(&mut columns[1]);
+            self.dashboard_tabs(ui);
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| match self.active_tab {
+                DashboardTab::Movement => self.recent_movements(ui),
+                DashboardTab::Connections => self.inferred_connections(ui),
+                DashboardTab::Systems => self.systems_overview(ui),
             });
         });
     }
 
-    fn chain_map(&self, ui: &mut egui::Ui) {
+    fn chain_map(&mut self, ui: &mut egui::Ui) {
         let desired = Vec2::new(ui.available_width(), 360.0);
-        let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(desired, Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 12.0, theme::panel_background());
         painter.rect_stroke(
@@ -510,7 +545,12 @@ impl NomadeerApp {
                     _ => Color32::from_rgb(16, 41, 50),
                 };
                 painter.circle_filled(*pos, 38.0, fill);
-                painter.circle_stroke(*pos, 38.0, Stroke::new(2.0_f32, theme::accent()));
+                let stroke = if system.id == self.selected_system_id {
+                    Stroke::new(4.0_f32, theme::character_text())
+                } else {
+                    Stroke::new(2.0_f32, theme::accent())
+                };
+                painter.circle_stroke(*pos, 38.0, stroke);
                 painter.text(
                     *pos + Vec2::new(0.0, -6.0),
                     Align2::CENTER_CENTER,
@@ -527,9 +567,86 @@ impl NomadeerApp {
                 );
             }
         }
+
+        if response.clicked()
+            && let Some(pointer_pos) = response.interact_pointer_pos()
+        {
+            for system in &self.data.systems {
+                if let Some(pos) = positions.get(&system.id)
+                    && pos.distance(pointer_pos) <= 38.0
+                {
+                    self.selected_system_id = system.id.clone();
+                    break;
+                }
+            }
+        }
     }
 
-    fn characters_dashboard(&mut self, ui: &mut egui::Ui) {
+    fn selected_system_sidebar(&mut self, ui: &mut egui::Ui) {
+        self.reconcile_selected_system();
+        ui.heading("Selected System");
+
+        let Some(system) = self.selected_system() else {
+            record_frame(ui, |ui| {
+                ui.label("No system selected.");
+                ui.label("Sync a character location or select a system on the chain map.");
+            });
+            return;
+        };
+
+        let system_id = system.id.clone();
+        let system_name = system.name.clone();
+        let system_class = system.class.clone();
+        let system_status = system.status.clone();
+        let system_notes = system.notes.clone();
+        let pilots: Vec<String> = self
+            .data
+            .accounts
+            .iter()
+            .filter(|account| account.last_system_id == system_id)
+            .map(|account| account.character_name.clone())
+            .collect();
+        let connection_count = self
+            .data
+            .connections
+            .iter()
+            .filter(|connection| {
+                connection.from_system == system_id || connection.to_system == system_id
+            })
+            .count();
+        let visit_count = self
+            .data
+            .visits
+            .iter()
+            .filter(|visit| visit.system_id == system_id)
+            .count();
+
+        record_frame(ui, |ui| {
+            ui.heading(egui::RichText::new(system_name).color(theme::system_text()));
+            ui.horizontal_wrapped(|ui| {
+                pill(ui, &system_class);
+                pill(ui, &system_status);
+            });
+            ui.label(format!(
+                "{} connections · {} visits",
+                connection_count, visit_count
+            ));
+            if pilots.is_empty() {
+                ui.label("No characters currently here.");
+            } else {
+                ui.label("Characters here:");
+                for pilot in pilots {
+                    ui.label(egui::RichText::new(pilot).color(theme::character_text()));
+                }
+            }
+            if !system_notes.is_empty() {
+                ui.separator();
+                ui.label(system_notes);
+            }
+        });
+    }
+
+    fn characters_sidebar(&mut self, ui: &mut egui::Ui) {
         let mut authorize_id = None;
         let mut sync_id = None;
         let mut delete_id = None;
@@ -537,7 +654,7 @@ impl NomadeerApp {
         ui.horizontal(|ui| {
             ui.heading("Characters");
             if ui
-                .add_enabled(!self.esi_busy, egui::Button::new("Add character"))
+                .add_enabled(!self.esi_busy, egui::Button::new("Add"))
                 .clicked()
             {
                 self.start_add_character();
@@ -546,8 +663,8 @@ impl NomadeerApp {
 
         if self.data.accounts.is_empty() {
             record_frame(ui, |ui| {
-                ui.label("No ESI characters yet.");
-                ui.label("Add a character to let Nomadeer react to your current location.");
+                ui.label("No characters yet.");
+                ui.label("Add a character to track current location.");
             });
         }
 
@@ -558,17 +675,19 @@ impl NomadeerApp {
                         egui::RichText::new(&account.character_name).color(theme::character_text()),
                     );
                     pill(ui, &account.auth_status);
-                    if !account.last_system_name.is_empty() {
-                        ui.label(egui::RichText::new("Current system:").color(theme::muted_text()));
+                });
+                if !account.last_system_name.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Current:").color(theme::muted_text()));
                         ui.label(
                             egui::RichText::new(&account.last_system_name)
                                 .color(theme::system_text()),
                         );
-                    }
-                });
+                    });
+                }
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(!self.esi_busy, egui::Button::new("Authorize"))
+                        .add_enabled(!self.esi_busy, egui::Button::new("Reconnect"))
                         .clicked()
                     {
                         authorize_id = Some(account.id.clone());
@@ -576,7 +695,7 @@ impl NomadeerApp {
                     if ui
                         .add_enabled(
                             !self.esi_busy && account.auth_status == "authorized",
-                            egui::Button::new("Sync location"),
+                            egui::Button::new("Update location"),
                         )
                         .clicked()
                     {
@@ -586,17 +705,12 @@ impl NomadeerApp {
                         delete_id = Some(account.id.clone());
                     }
                 });
-                if !account.character_id.is_empty() {
-                    ui.label(format!("Character ID: {}", account.character_id));
-                }
-                if account.auth_status == "authorized" && account.refresh_token.is_some() {
-                    ui.label("ESI tokens are stored locally in SQLite.");
-                }
             });
         }
 
         if let Some(id) = delete_id {
             self.data.accounts.retain(|account| account.id != id);
+            self.reconcile_selected_system();
             self.save();
         }
         if let Some(id) = authorize_id {
@@ -607,71 +721,47 @@ impl NomadeerApp {
         }
     }
 
-    fn current_systems_dashboard(&self, ui: &mut egui::Ui) {
-        ui.heading("Current systems");
-
-        let mut system_ids = Vec::new();
-        for account in &self.data.accounts {
-            if !account.last_system_id.is_empty() && !system_ids.contains(&account.last_system_id) {
-                system_ids.push(account.last_system_id.clone());
+    fn dashboard_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(self.active_tab == DashboardTab::Movement, "Movement")
+                .clicked()
+            {
+                self.active_tab = DashboardTab::Movement;
             }
-        }
+            if ui
+                .selectable_label(self.active_tab == DashboardTab::Connections, "Connections")
+                .clicked()
+            {
+                self.active_tab = DashboardTab::Connections;
+            }
+            if ui
+                .selectable_label(self.active_tab == DashboardTab::Systems, "Systems")
+                .clicked()
+            {
+                self.active_tab = DashboardTab::Systems;
+            }
+        });
+    }
 
-        if system_ids.is_empty() {
-            record_frame(ui, |ui| {
-                ui.label("No current system yet.");
-                ui.label("Sync a character location to populate this dashboard.");
-            });
+    fn systems_overview(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Systems");
+        if self.data.systems.is_empty() {
+            ui.label("No systems yet.");
             return;
         }
 
-        for system_id in system_ids {
-            let system = self
-                .data
-                .systems
-                .iter()
-                .find(|system| system.id == system_id);
-            let system_name = system
-                .map(|system| system.name.as_str())
-                .unwrap_or("Unknown system");
-            let pilots: Vec<&str> = self
-                .data
-                .accounts
-                .iter()
-                .filter(|account| account.last_system_id == system_id)
-                .map(|account| account.character_name.as_str())
-                .collect();
-            let connection_count = self
-                .data
-                .connections
-                .iter()
-                .filter(|connection| {
-                    connection.from_system == system_id || connection.to_system == system_id
-                })
-                .count();
-            let visit_count = self
-                .data
-                .visits
-                .iter()
-                .filter(|visit| visit.system_id == system_id)
-                .count();
-
+        for system in &self.data.systems {
+            let is_selected = system.id == self.selected_system_id;
             record_frame(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.heading(egui::RichText::new(system_name).color(theme::system_text()));
-                    if let Some(system) = system {
-                        pill(ui, &system.class);
-                        pill(ui, &system.status);
+                    if ui.selectable_label(is_selected, &system.name).clicked() {
+                        self.selected_system_id = system.id.clone();
                     }
+                    pill(ui, &system.class);
+                    pill(ui, &system.status);
                 });
-                ui.label(format!("Characters here: {}", pilots.join(", ")));
-                ui.label(format!(
-                    "{} inferred connections · {} visits",
-                    connection_count, visit_count
-                ));
-                if let Some(system) = system
-                    && !system.notes.is_empty()
-                {
+                if !system.notes.is_empty() {
                     ui.label(&system.notes);
                 }
             });
@@ -684,7 +774,7 @@ impl NomadeerApp {
         visits.sort_by_key(|visit| std::cmp::Reverse(visit.created_at));
 
         if visits.is_empty() {
-            ui.label("No ESI movement history yet.");
+            ui.label("No movement history yet.");
             return;
         }
 
@@ -741,6 +831,7 @@ impl eframe::App for NomadeerApp {
         self.poll_esi_tasks();
         self.top_bar(ctx);
         self.esi_settings_window(ctx);
+        self.side_panel(ctx);
         self.central_panel(ctx);
     }
 }
