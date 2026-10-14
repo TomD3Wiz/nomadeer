@@ -1,3 +1,4 @@
+use crate::chain_archive::{self, ChainSnapshot, ChainSnapshotMeta};
 use crate::config::theme;
 use crate::esi::{self, AccountAuthorization, LocationSync, SystemIntel};
 use crate::forms::*;
@@ -14,7 +15,8 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+const CHAIN_ARCHIVE_DIR: &str = "data/chains";
 
 enum EsiTaskResult {
     Authorized(AccountAuthorization),
@@ -36,6 +38,7 @@ enum DashboardTab {
     Connections,
     Systems,
     Intel,
+    Chain,
 }
 
 pub(crate) struct NomadeerApp {
@@ -58,6 +61,8 @@ pub(crate) struct NomadeerApp {
     zkill_reports: HashMap<u64, ZkillReport>,
     portrait_textures: HashMap<String, egui::TextureHandle>,
     portrait_requested: HashSet<String>,
+    chain_snapshot_name: String,
+    chain_snapshots: Vec<ChainSnapshotMeta>,
     next_auto_sync: Instant,
     auto_sync_index: usize,
 }
@@ -88,6 +93,8 @@ impl NomadeerApp {
             zkill_reports: HashMap::new(),
             portrait_textures: HashMap::new(),
             portrait_requested: HashSet::new(),
+            chain_snapshot_name: String::new(),
+            chain_snapshots: Vec::new(),
             next_auto_sync: Instant::now() + Duration::from_secs(5),
             auto_sync_index: 0,
         };
@@ -101,6 +108,8 @@ impl NomadeerApp {
                 self.data = data;
                 self.sync_esi_settings_form();
                 self.reconcile_selected_system();
+                self.refresh_chain_snapshots();
+                self.default_chain_snapshot_name();
                 self.status = "Loaded".to_owned();
             }
             Err(error) => {
@@ -113,6 +122,19 @@ impl NomadeerApp {
         match self.store.save(&self.data) {
             Ok(()) => self.status = "Saved".to_owned(),
             Err(error) => self.status = format!("Save failed: {error}"),
+        }
+    }
+
+    fn refresh_chain_snapshots(&mut self) {
+        match chain_archive::list_snapshots(&PathBuf::from(CHAIN_ARCHIVE_DIR)) {
+            Ok(snapshots) => self.chain_snapshots = snapshots,
+            Err(error) => self.status = format!("Could not list saved chains: {error}"),
+        }
+    }
+
+    fn default_chain_snapshot_name(&mut self) {
+        if self.chain_snapshot_name.trim().is_empty() {
+            self.chain_snapshot_name = format!("Chain {}", now());
         }
     }
 
@@ -711,6 +733,143 @@ impl NomadeerApp {
         });
     }
 
+    fn save_chain_snapshot(&mut self) {
+        let name = clean(&self.chain_snapshot_name);
+        if name.is_empty() {
+            self.status = "Name this chain before saving it".to_owned();
+            return;
+        }
+
+        let snapshot = ChainSnapshot {
+            name: name.clone(),
+            created_at: now(),
+            selected_system_id: self.selected_system_id.clone(),
+            systems: self.data.systems.clone(),
+            connections: self.data.connections.clone(),
+            signatures: self.data.signatures.clone(),
+            visits: self.data.visits.clone(),
+            notes: self.data.notes.clone(),
+        };
+
+        match chain_archive::save_snapshot(&PathBuf::from(CHAIN_ARCHIVE_DIR), &snapshot) {
+            Ok(_) => {
+                self.chain_snapshot_name = format!("Chain {}", now());
+                self.refresh_chain_snapshots();
+                self.status = format!("Saved chain {name}");
+            }
+            Err(error) => self.status = format!("Could not save chain: {error}"),
+        }
+    }
+
+    fn load_chain_snapshot(&mut self, file_name: &str) {
+        match chain_archive::load_snapshot(&PathBuf::from(CHAIN_ARCHIVE_DIR), file_name) {
+            Ok(snapshot) => {
+                let name = snapshot.name.clone();
+                self.data.systems = snapshot.systems;
+                self.data.connections = snapshot.connections;
+                self.data.signatures = snapshot.signatures;
+                self.data.visits = snapshot.visits;
+                self.data.notes = snapshot.notes;
+                self.selected_system_id = snapshot.selected_system_id;
+                self.clear_account_locations_outside_chain();
+                self.reconcile_selected_system();
+                self.save();
+                self.status = format!("Loaded chain {name}");
+            }
+            Err(error) => self.status = format!("Could not load chain: {error}"),
+        }
+    }
+
+    fn delete_chain_snapshot(&mut self, file_name: &str) {
+        match chain_archive::delete_snapshot(&PathBuf::from(CHAIN_ARCHIVE_DIR), file_name) {
+            Ok(()) => {
+                self.refresh_chain_snapshots();
+                self.status = "Deleted saved chain".to_owned();
+            }
+            Err(error) => self.status = format!("Could not delete saved chain: {error}"),
+        }
+    }
+
+    fn clear_chain(&mut self) {
+        self.data.systems.clear();
+        self.data.connections.clear();
+        self.data.signatures.clear();
+        self.data.visits.clear();
+        self.data.notes.clear();
+        self.selected_system_id.clear();
+        for account in &mut self.data.accounts {
+            account.last_system_id.clear();
+            account.last_system_name.clear();
+        }
+        self.save();
+        self.status = "Cleared current chain".to_owned();
+    }
+
+    fn clear_account_locations_outside_chain(&mut self) {
+        let system_ids = self
+            .data
+            .systems
+            .iter()
+            .map(|system| system.id.clone())
+            .collect::<HashSet<_>>();
+        for account in &mut self.data.accounts {
+            if !account.last_system_id.is_empty() && !system_ids.contains(&account.last_system_id) {
+                account.last_system_id.clear();
+                account.last_system_name.clear();
+            }
+        }
+    }
+
+    fn delete_connection(&mut self, connection_id: &str) {
+        let before = self.data.connections.len();
+        self.data
+            .connections
+            .retain(|connection| connection.id != connection_id);
+        if self.data.connections.len() != before {
+            self.save();
+            self.status = "Deleted connection".to_owned();
+        }
+    }
+
+    fn delete_system(&mut self, system_id: &str) {
+        let Some(system_name) = self
+            .data
+            .systems
+            .iter()
+            .find(|system| system.id == system_id)
+            .map(|system| system.name.clone())
+        else {
+            self.status = "System not found".to_owned();
+            return;
+        };
+
+        self.data.systems.retain(|system| system.id != system_id);
+        self.data.connections.retain(|connection| {
+            connection.from_system != system_id && connection.to_system != system_id
+        });
+        self.data
+            .signatures
+            .retain(|signature| signature.system_id != system_id);
+        self.data
+            .visits
+            .retain(|visit| visit.system_id != system_id);
+        self.data.notes.retain(|note| note.system_id != system_id);
+        for account in &mut self.data.accounts {
+            if account.last_system_id == system_id {
+                account.last_system_id.clear();
+                account.last_system_name.clear();
+            }
+        }
+
+        if self.selected_system_id == system_id {
+            self.selected_system_id.clear();
+            self.reconcile_selected_system();
+        }
+
+        self.save();
+        self.status = format!("Deleted {system_name}");
+    }
+
     fn side_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("dashboard_sidebar")
             .resizable(true)
@@ -749,6 +908,7 @@ impl NomadeerApp {
                 DashboardTab::Connections => self.inferred_connections(ui),
                 DashboardTab::Systems => self.systems_overview(ui),
                 DashboardTab::Intel => self.selected_system_intel(ui),
+                DashboardTab::Chain => self.chain_management(ui),
             });
         });
     }
@@ -1074,6 +1234,10 @@ impl NomadeerApp {
                 ui.separator();
                 ui.label(system_notes);
             }
+            ui.separator();
+            if ui.button("Delete system from chain").clicked() {
+                self.delete_system(&system_id);
+            }
         });
     }
 
@@ -1194,6 +1358,12 @@ impl NomadeerApp {
                 .clicked()
             {
                 self.active_tab = DashboardTab::Intel;
+            }
+            if ui
+                .selectable_label(self.active_tab == DashboardTab::Chain, "Chain")
+                .clicked()
+            {
+                self.active_tab = DashboardTab::Chain;
             }
         });
     }
@@ -1371,14 +1541,16 @@ impl NomadeerApp {
             return;
         }
 
-        for system in &self.data.systems {
+        let mut delete_id = None;
+        let systems = self.data.systems.clone();
+        for system in systems {
             let is_selected = system.id == self.selected_system_id;
             record_frame(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui.selectable_label(is_selected, &system.name).clicked() {
                         self.selected_system_id = system.id.clone();
                     }
-                    pill(ui, &Self::inferred_system_class(system));
+                    pill(ui, &Self::inferred_system_class(&system));
                     pill(ui, &system.status);
                     if !system.region_name.is_empty() {
                         ui.label(&system.region_name);
@@ -1394,7 +1566,91 @@ impl NomadeerApp {
                 if !system.notes.is_empty() {
                     ui.label(&system.notes);
                 }
+                if ui.small_button("Delete system").clicked() {
+                    delete_id = Some(system.id.clone());
+                }
             });
+        }
+
+        if let Some(id) = delete_id {
+            self.delete_system(&id);
+        }
+    }
+
+    fn chain_management(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Chain");
+        ui.label(format!(
+            "Current chain: {} systems · {} connections · {} visits",
+            self.data.systems.len(),
+            self.data.connections.len(),
+            self.data.visits.len()
+        ));
+        ui.label(format!(
+            "Location polling: every {} seconds per active check",
+            AUTO_SYNC_INTERVAL.as_secs()
+        ));
+
+        record_frame(ui, |ui| {
+            ui.heading("Save current chain");
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut self.chain_snapshot_name);
+                if ui.button("Save chain").clicked() {
+                    self.save_chain_snapshot();
+                }
+            });
+            ui.label("Saved chains keep systems, connections, notes, signatures, and movement history. Characters stay separate.");
+        });
+
+        record_frame(ui, |ui| {
+            ui.heading("Current chain controls");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Refresh saved list").clicked() {
+                    self.refresh_chain_snapshots();
+                }
+                if ui.button("Clear current chain").clicked() {
+                    self.clear_chain();
+                }
+            });
+            ui.label("Use clear when a wormhole chain is done or rolled out. Save first if you may want it later.");
+        });
+
+        ui.heading("Saved chains");
+        if self.chain_snapshots.is_empty() {
+            ui.label("No saved chains yet.");
+            return;
+        }
+
+        let snapshots = self.chain_snapshots.clone();
+        let mut load_file = None;
+        let mut delete_file = None;
+        for snapshot in snapshots {
+            record_frame(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(&snapshot.name).color(theme::system_text()));
+                    pill(ui, &format!("{} systems", snapshot.system_count));
+                    pill(ui, &format!("{} connections", snapshot.connection_count));
+                });
+                ui.label(
+                    egui::RichText::new(format!("Saved {}", snapshot.created_at))
+                        .color(theme::muted_text()),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Load chain").clicked() {
+                        load_file = Some(snapshot.file_name.clone());
+                    }
+                    if ui.small_button("Delete saved chain").clicked() {
+                        delete_file = Some(snapshot.file_name.clone());
+                    }
+                });
+            });
+        }
+
+        if let Some(file_name) = load_file {
+            self.load_chain_snapshot(&file_name);
+        }
+        if let Some(file_name) = delete_file {
+            self.delete_chain_snapshot(&file_name);
         }
     }
 
@@ -1425,9 +1681,9 @@ impl NomadeerApp {
         }
     }
 
-    fn inferred_connections(&self, ui: &mut egui::Ui) {
+    fn inferred_connections(&mut self, ui: &mut egui::Ui) {
         ui.heading("Inferred connections");
-        let mut connections: Vec<&Connection> = self.data.connections.iter().collect();
+        let mut connections = self.data.connections.clone();
         connections.sort_by_key(|connection| std::cmp::Reverse(connection.created_at));
 
         if connections.is_empty() {
@@ -1435,7 +1691,8 @@ impl NomadeerApp {
             return;
         }
 
-        for connection in connections.into_iter().take(8) {
+        let mut delete_id = None;
+        for connection in connections.into_iter().take(12) {
             record_frame(ui, |ui| {
                 let from_system = self.system_by_id(&connection.from_system);
                 let to_system = self.system_by_id(&connection.to_system);
@@ -1459,7 +1716,14 @@ impl NomadeerApp {
                 if !connection.notes.is_empty() {
                     ui.label(&connection.notes);
                 }
+                if ui.small_button("Delete connection").clicked() {
+                    delete_id = Some(connection.id.clone());
+                }
             });
+        }
+
+        if let Some(id) = delete_id {
+            self.delete_connection(&id);
         }
     }
 }

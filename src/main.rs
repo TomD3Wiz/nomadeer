@@ -1,4 +1,5 @@
 mod app;
+mod chain_archive;
 mod config;
 mod esi;
 mod forms;
