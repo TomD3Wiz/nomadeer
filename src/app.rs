@@ -32,6 +32,13 @@ struct PortraitTaskResult {
     image: egui::ColorImage,
 }
 
+#[derive(Debug, Clone)]
+enum ChainMapTarget {
+    Map,
+    System(String),
+    Connection(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardTab {
     Movement,
@@ -63,6 +70,7 @@ pub(crate) struct NomadeerApp {
     portrait_requested: HashSet<String>,
     chain_snapshot_name: String,
     chain_snapshots: Vec<ChainSnapshotMeta>,
+    chain_context_target: Option<ChainMapTarget>,
     next_auto_sync: Instant,
     auto_sync_index: usize,
 }
@@ -95,6 +103,7 @@ impl NomadeerApp {
             portrait_requested: HashSet::new(),
             chain_snapshot_name: String::new(),
             chain_snapshots: Vec::new(),
+            chain_context_target: None,
             next_auto_sync: Instant::now() + Duration::from_secs(5),
             auto_sync_index: 0,
         };
@@ -937,6 +946,16 @@ impl NomadeerApp {
         }
 
         let positions = self.chain_positions(rect);
+        let pointer_pos = ui
+            .ctx()
+            .input(|input| input.pointer.hover_pos())
+            .filter(|pos| rect.contains(*pos));
+        let hovered_system_id = pointer_pos.and_then(|pos| self.chain_system_at(&positions, pos));
+        let hovered_connection_id = if hovered_system_id.is_none() {
+            pointer_pos.and_then(|pos| self.chain_connection_at(&positions, pos))
+        } else {
+            None
+        };
 
         for connection in &self.data.connections {
             if let (Some(a), Some(b)) = (
@@ -956,12 +975,20 @@ impl NomadeerApp {
                 } else {
                     [*a, *b]
                 };
-                painter.line_segment(endpoints, Stroke::new(2.0_f32, color));
+                let is_hovered = hovered_connection_id.as_deref() == Some(&connection.id);
+                painter.line_segment(
+                    endpoints,
+                    Stroke::new(
+                        if is_hovered { 4.0_f32 } else { 2.0_f32 },
+                        if is_hovered { Color32::WHITE } else { color },
+                    ),
+                );
             }
         }
 
         for system in &self.data.systems {
             if let Some(pos) = positions.get(&system.id) {
+                let is_hovered = hovered_system_id.as_deref() == Some(&system.id);
                 let fill = match system.status.as_str() {
                     "home" => Color32::from_rgb(20, 89, 82),
                     "hostile" => Color32::from_rgb(92, 31, 43),
@@ -972,6 +999,8 @@ impl NomadeerApp {
                 painter.circle_filled(*pos, 38.0, fill);
                 let stroke = if system.id == self.selected_system_id {
                     Stroke::new(4.0_f32, theme::character_text())
+                } else if is_hovered {
+                    Stroke::new(4.0_f32, Color32::WHITE)
                 } else {
                     Stroke::new(2.0_f32, theme::accent())
                 };
@@ -993,18 +1022,169 @@ impl NomadeerApp {
             }
         }
 
-        if response.clicked()
-            && let Some(pointer_pos) = response.interact_pointer_pos()
-        {
-            for system in &self.data.systems {
-                if let Some(pos) = positions.get(&system.id)
-                    && pos.distance(pointer_pos) <= 38.0
-                {
-                    self.selected_system_id = system.id.clone();
-                    break;
+        if let Some(pos) = pointer_pos {
+            if let Some(system_id) = &hovered_system_id {
+                if let Some(system) = self.system_by_id(system_id) {
+                    painter.text(
+                        pos + Vec2::new(14.0, 14.0),
+                        Align2::LEFT_TOP,
+                        format!("{} · right-click for actions", system.name),
+                        FontId::proportional(13.0),
+                        Color32::WHITE,
+                    );
                 }
+            } else if let Some(connection_id) = &hovered_connection_id
+                && let Some(connection) = self
+                    .data
+                    .connections
+                    .iter()
+                    .find(|connection| connection.id == *connection_id)
+            {
+                painter.text(
+                    pos + Vec2::new(14.0, 14.0),
+                    Align2::LEFT_TOP,
+                    format!(
+                        "{} ↔ {} · right-click for actions",
+                        self.system_name(&connection.from_system),
+                        self.system_name(&connection.to_system)
+                    ),
+                    FontId::proportional(13.0),
+                    Color32::WHITE,
+                );
             }
         }
+
+        if response.clicked()
+            && let Some(pointer_pos) = response.interact_pointer_pos()
+            && let Some(system_id) = self.chain_system_at(&positions, pointer_pos)
+        {
+            self.selected_system_id = system_id;
+        }
+
+        if response.secondary_clicked()
+            && let Some(pointer_pos) = response.interact_pointer_pos()
+        {
+            self.chain_context_target = self
+                .chain_system_at(&positions, pointer_pos)
+                .map(ChainMapTarget::System)
+                .or_else(|| {
+                    self.chain_connection_at(&positions, pointer_pos)
+                        .map(ChainMapTarget::Connection)
+                })
+                .or(Some(ChainMapTarget::Map));
+        }
+
+        let menu_target = self
+            .chain_context_target
+            .clone()
+            .unwrap_or(ChainMapTarget::Map);
+        let mut select_system_id = None;
+        let mut delete_system_id = None;
+        let mut delete_connection_id = None;
+        let mut clear_chain = false;
+        response.context_menu(|ui| match &menu_target {
+            ChainMapTarget::System(system_id) => {
+                let system_name = self.system_name(system_id);
+                ui.label(egui::RichText::new(&system_name).color(theme::system_text()));
+                if ui.button("Select system").clicked() {
+                    select_system_id = Some(system_id.clone());
+                    ui.close();
+                }
+                if ui.button("Delete system").clicked() {
+                    delete_system_id = Some(system_id.clone());
+                    ui.close();
+                }
+            }
+            ChainMapTarget::Connection(connection_id) => {
+                if let Some(connection) = self
+                    .data
+                    .connections
+                    .iter()
+                    .find(|connection| connection.id == *connection_id)
+                {
+                    ui.label(format!(
+                        "{} ↔ {}",
+                        self.system_name(&connection.from_system),
+                        self.system_name(&connection.to_system)
+                    ));
+                    if !connection.notes.is_empty() {
+                        ui.label(egui::RichText::new(&connection.notes).color(theme::muted_text()));
+                    }
+                } else {
+                    ui.label("Connection");
+                }
+                if ui.button("Delete connection").clicked() {
+                    delete_connection_id = Some(connection_id.clone());
+                    ui.close();
+                }
+            }
+            ChainMapTarget::Map => {
+                ui.label("Chain map");
+                if ui.button("Clear current chain").clicked() {
+                    clear_chain = true;
+                    ui.close();
+                }
+            }
+        });
+
+        if let Some(system_id) = select_system_id {
+            self.selected_system_id = system_id;
+        }
+        if let Some(connection_id) = delete_connection_id {
+            self.delete_connection(&connection_id);
+        }
+        if let Some(system_id) = delete_system_id {
+            self.delete_system(&system_id);
+        }
+        if clear_chain {
+            self.clear_chain();
+        }
+    }
+
+    fn chain_system_at(
+        &self,
+        positions: &HashMap<String, Pos2>,
+        pointer_pos: Pos2,
+    ) -> Option<String> {
+        self.data
+            .systems
+            .iter()
+            .find(|system| {
+                positions
+                    .get(&system.id)
+                    .is_some_and(|pos| pos.distance(pointer_pos) <= 38.0)
+            })
+            .map(|system| system.id.clone())
+    }
+
+    fn chain_connection_at(
+        &self,
+        positions: &HashMap<String, Pos2>,
+        pointer_pos: Pos2,
+    ) -> Option<String> {
+        self.data
+            .connections
+            .iter()
+            .filter_map(|connection| {
+                let a = positions.get(&connection.from_system)?;
+                let b = positions.get(&connection.to_system)?;
+                let distance = Self::distance_to_segment(pointer_pos, *a, *b);
+                (distance <= 8.0).then_some((connection.id.clone(), distance))
+            })
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(id, _)| id)
+    }
+
+    fn distance_to_segment(point: Pos2, a: Pos2, b: Pos2) -> f32 {
+        let ab = b - a;
+        let length_squared = ab.length_sq();
+        if length_squared <= f32::EPSILON {
+            return point.distance(a);
+        }
+
+        let ap = point - a;
+        let t = (ap.dot(ab) / length_squared).clamp(0.0, 1.0);
+        point.distance(a + ab * t)
     }
 
     fn chain_positions(&self, rect: egui::Rect) -> HashMap<String, Pos2> {
