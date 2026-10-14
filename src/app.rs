@@ -5,7 +5,7 @@ use crate::forms::*;
 use crate::model::*;
 use crate::portrait;
 use crate::store::Store;
-use crate::util::{clean, now};
+use crate::util::{clean, now, open_url};
 use crate::widgets::{pill, record_frame};
 use crate::zkill::{self, ZkillReport};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
@@ -271,6 +271,13 @@ impl NomadeerApp {
             system.pod_kills_1h,
             system.npc_kills_1h
         )
+    }
+
+    fn open_external_url(&mut self, url: &str) {
+        match open_url(url) {
+            Ok(()) => self.status = "Opened browser".to_owned(),
+            Err(error) => self.status = error,
+        }
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
@@ -1629,14 +1636,15 @@ impl NomadeerApp {
             ui.label(egui::RichText::new(&system.name).color(theme::system_text()));
             pill(ui, &Self::inferred_system_class(&system));
             if system.solar_system_id != 0 {
-                ui.hyperlink_to(
-                    "Open zKillboard",
-                    format!("https://zkillboard.com/system/{}/", system.solar_system_id),
-                );
-                ui.hyperlink_to(
-                    "Open Anoik.is",
-                    format!("https://anoik.is/systems/{}", system.name),
-                );
+                if ui.button("Open zKillboard").clicked() {
+                    self.open_external_url(&format!(
+                        "https://zkillboard.com/system/{}/",
+                        system.solar_system_id
+                    ));
+                }
+                if ui.button("Open Anoik.is").clicked() {
+                    self.open_external_url(&format!("https://anoik.is/systems/{}", system.name));
+                }
             }
             if ui
                 .add_enabled(
@@ -1655,29 +1663,35 @@ impl NomadeerApp {
             );
             return;
         };
+        let recent_kills = report.recent_kills.clone();
+        let total_value = report.total_value;
+        let solo_kills = report.solo_kills;
+        let npc_kills = report.npc_kills;
 
         ui.label(format!(
             "{} recent kills · {} total · {} solo · {} NPC",
-            report.recent_kills.len(),
-            Self::format_isk(report.total_value),
-            report.solo_kills,
-            report.npc_kills
+            recent_kills.len(),
+            Self::format_isk(total_value),
+            solo_kills,
+            npc_kills
         ));
 
-        if report.recent_kills.is_empty() {
+        if recent_kills.is_empty() {
             ui.label("No recent kills returned by zKillboard.");
             return;
         }
 
-        for kill in &report.recent_kills {
+        for kill in &recent_kills {
             record_frame(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     let (relative_time, time_color) = Self::relative_kill_time(&kill.killmail_time);
                     ui.label(egui::RichText::new(relative_time).color(time_color));
-                    ui.hyperlink_to(
-                        format!("Kill {}", kill.killmail_id),
-                        format!("https://zkillboard.com/kill/{}/", kill.killmail_id),
-                    );
+                    if ui.button(format!("Kill {}", kill.killmail_id)).clicked() {
+                        self.open_external_url(&format!(
+                            "https://zkillboard.com/kill/{}/",
+                            kill.killmail_id
+                        ));
+                    }
                     if kill.solo {
                         pill(ui, "solo");
                     }
@@ -1685,14 +1699,34 @@ impl NomadeerApp {
                         pill(ui, "NPC");
                     }
                 });
+                let victim_name = kill
+                    .victim_character_name
+                    .as_deref()
+                    .unwrap_or("Unknown victim");
+                let ship_name = kill
+                    .victim_ship_type_name
+                    .clone()
+                    .or_else(|| kill.victim_ship_type_id.map(|id| format!("Ship type {id}")))
+                    .unwrap_or_else(|| "Unknown ship".to_owned());
                 ui.label(format!(
-                    "Victim ship type {} · {} attackers · {}",
-                    kill.victim_ship_type_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "unknown".to_owned()),
+                    "{victim_name} lost {ship_name} · {} attackers · {}",
                     kill.attacker_count,
                     Self::format_isk(kill.total_value)
                 ));
+                let corporation = kill.victim_corporation_name.as_deref();
+                let alliance = kill.victim_alliance_name.as_deref();
+                match (corporation, alliance) {
+                    (Some(corporation), Some(alliance)) => {
+                        ui.label(format!("{corporation} · {alliance}"));
+                    }
+                    (Some(corporation), None) => {
+                        ui.label(corporation);
+                    }
+                    (None, Some(alliance)) => {
+                        ui.label(alliance);
+                    }
+                    (None, None) => {}
+                }
             });
         }
     }

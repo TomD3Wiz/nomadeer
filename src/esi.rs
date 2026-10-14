@@ -1,11 +1,10 @@
 use crate::model::{Account, EsiSettings};
-use crate::util::now;
+use crate::util::{now, open_url};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::process::Command;
 use std::time::Duration;
 use tiny_http::{Response, Server, StatusCode};
 use url::Url;
@@ -134,7 +133,7 @@ pub(crate) fn authorize_account(
     let server = Server::http(("127.0.0.1", settings.callback_port))
         .map_err(|error| format!("Could not start local OAuth callback server: {error}"))?;
 
-    open_browser(auth_url.as_str())?;
+    open_url(auth_url.as_str())?;
 
     let code = wait_for_code(&server, &state)?;
     let token = exchange_code(&settings, &redirect_uri, &code, &verifier)?;
@@ -239,29 +238,6 @@ fn authorization_url(
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256");
     Ok(url)
-}
-
-fn open_browser(url: &str) -> Result<(), String> {
-    if webbrowser::open(url).is_ok() {
-        return Ok(());
-    }
-
-    let candidates: &[(&str, &[&str])] = &[
-        ("xdg-open", &[url]),
-        ("gio", &["open", url]),
-        ("flatpak-spawn", &["--host", "xdg-open", url]),
-        ("distrobox-host-exec", &["xdg-open", url]),
-    ];
-
-    for (program, args) in candidates {
-        if Command::new(program).args(*args).spawn().is_ok() {
-            return Ok(());
-        }
-    }
-
-    Err(format!(
-        "Could not open browser for ESI login. Open this URL manually: {url}"
-    ))
 }
 
 fn wait_for_code(server: &Server, expected_state: &str) -> Result<String, String> {
