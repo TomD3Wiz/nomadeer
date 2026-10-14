@@ -71,6 +71,7 @@ pub(crate) struct NomadeerApp {
     chain_snapshot_name: String,
     chain_snapshots: Vec<ChainSnapshotMeta>,
     chain_context_target: Option<ChainMapTarget>,
+    chain_drag_start_system_id: Option<String>,
     next_auto_sync: Instant,
     auto_sync_index: usize,
 }
@@ -104,6 +105,7 @@ impl NomadeerApp {
             chain_snapshot_name: String::new(),
             chain_snapshots: Vec::new(),
             chain_context_target: None,
+            chain_drag_start_system_id: None,
             next_auto_sync: Instant::now() + Duration::from_secs(5),
             auto_sync_index: 0,
         };
@@ -742,6 +744,40 @@ impl NomadeerApp {
         });
     }
 
+    fn create_manual_connection(&mut self, from_system: &str, to_system: &str) {
+        if from_system == to_system {
+            self.status = "Drag to a different system to make a connection".to_owned();
+            return;
+        }
+
+        let exists = self.data.connections.iter().any(|connection| {
+            (connection.from_system == from_system && connection.to_system == to_system)
+                || (connection.from_system == to_system && connection.to_system == from_system)
+        });
+        if exists {
+            self.status = "That connection already exists".to_owned();
+            return;
+        }
+
+        let from_name = self.system_name(from_system);
+        let to_name = self.system_name(to_system);
+        let connection_id = self.new_id("conn");
+        self.data.connections.push(Connection {
+            id: connection_id,
+            from_system: from_system.to_owned(),
+            to_system: to_system.to_owned(),
+            signature_from: String::new(),
+            signature_to: String::new(),
+            mass_status: "unknown".to_owned(),
+            life_status: "unknown".to_owned(),
+            ship_size: String::new(),
+            notes: "Linked on chain map".to_owned(),
+            created_at: now(),
+        });
+        self.save();
+        self.status = format!("Linked {from_name} to {to_name}");
+    }
+
     fn save_chain_snapshot(&mut self) {
         let name = clean(&self.chain_snapshot_name);
         if name.is_empty() {
@@ -906,7 +942,7 @@ impl NomadeerApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.heading("Chain map");
-                ui.label("Select a system to inspect it");
+                ui.label("Select, right-click, or drag between systems");
             });
             self.chain_map(ui);
             ui.separator();
@@ -924,7 +960,7 @@ impl NomadeerApp {
 
     fn chain_map(&mut self, ui: &mut egui::Ui) {
         let desired = Vec2::new(ui.available_width(), 360.0);
-        let (rect, response) = ui.allocate_exact_size(desired, Sense::click());
+        let (rect, response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 12.0, theme::panel_background());
         painter.rect_stroke(
@@ -989,6 +1025,7 @@ impl NomadeerApp {
         for system in &self.data.systems {
             if let Some(pos) = positions.get(&system.id) {
                 let is_hovered = hovered_system_id.as_deref() == Some(&system.id);
+                let is_drag_start = self.chain_drag_start_system_id.as_deref() == Some(&system.id);
                 let fill = match system.status.as_str() {
                     "home" => Color32::from_rgb(20, 89, 82),
                     "hostile" => Color32::from_rgb(92, 31, 43),
@@ -999,6 +1036,8 @@ impl NomadeerApp {
                 painter.circle_filled(*pos, 38.0, fill);
                 let stroke = if system.id == self.selected_system_id {
                     Stroke::new(4.0_f32, theme::character_text())
+                } else if is_drag_start {
+                    Stroke::new(4.0_f32, Color32::from_rgb(255, 194, 87))
                 } else if is_hovered {
                     Stroke::new(4.0_f32, Color32::WHITE)
                 } else {
@@ -1020,6 +1059,18 @@ impl NomadeerApp {
                     theme::muted_text(),
                 );
             }
+        }
+
+        if let Some(start_system_id) = &self.chain_drag_start_system_id
+            && let (Some(start_pos), Some(pointer_pos)) = (
+                positions.get(start_system_id),
+                ui.ctx().input(|input| input.pointer.hover_pos()),
+            )
+        {
+            painter.line_segment(
+                [*start_pos, pointer_pos],
+                Stroke::new(3.0_f32, Color32::from_rgb(255, 194, 87)),
+            );
         }
 
         if let Some(pos) = pointer_pos {
@@ -1059,6 +1110,25 @@ impl NomadeerApp {
             && let Some(system_id) = self.chain_system_at(&positions, pointer_pos)
         {
             self.selected_system_id = system_id;
+        }
+
+        if response.drag_started()
+            && let Some(pointer_pos) = response.interact_pointer_pos()
+        {
+            self.chain_drag_start_system_id = self.chain_system_at(&positions, pointer_pos);
+        }
+
+        if response.drag_stopped() {
+            let start_system_id = self.chain_drag_start_system_id.take();
+            if let Some(from_system_id) = start_system_id
+                && let Some(pointer_pos) = response.interact_pointer_pos()
+            {
+                if let Some(to_system_id) = self.chain_system_at(&positions, pointer_pos) {
+                    self.create_manual_connection(&from_system_id, &to_system_id);
+                } else {
+                    self.status = "Drop on another system to make a connection".to_owned();
+                }
+            }
         }
 
         if response.secondary_clicked()
