@@ -1,5 +1,5 @@
-//! Umbra on screen: her voice in the intel panels, and her own tab with a feed of
-//! everything she has briefed.
+//! Umbra on screen: her voice in the intel panels, and her own panel beside the
+//! dashboard tabs with a feed of everything she has briefed.
 
 use super::{NomadeerApp, UmbraTask, WARNING_TEXT};
 use crate::config::theme;
@@ -16,10 +16,15 @@ const AVATAR_PNG: &[u8] = include_bytes!("../../assets/umbra/umbra-avatar.png");
 /// She is never drawn larger than 96 points, so twice that covers high-DPI screens.
 const AVATAR_TEXTURE_SIZE: u32 = 192;
 const HEADER_AVATAR_SIZE: f32 = 96.0;
+/// Her portrait when her panel is narrow or short.
+const COMPACT_HEADER_AVATAR_SIZE: f32 = 72.0;
+/// Below this width or height her panel uses the compact portrait.
+const COMPACT_PANEL_WIDTH: f32 = 420.0;
+const COMPACT_PANEL_HEIGHT: f32 = 360.0;
 const MESSAGE_AVATAR_SIZE: f32 = 30.0;
-/// Room the feed always gets, about two briefings; on a short window her tab scrolls
+/// Room the feed always gets, about one briefing; on a short window her panel scrolls
 /// to reach it instead of squeezing it away.
-const MIN_FEED_HEIGHT: f32 = 240.0;
+const MIN_FEED_HEIGHT: f32 = 120.0;
 /// Briefings kept on screen; the feed itself holds more until they age out.
 pub(super) const FEED_SHOWN: usize = 200;
 const QUIET_NOTE: &str = "Public killmails may be delayed or absent; quiet never means safe.";
@@ -394,16 +399,18 @@ impl NomadeerApp {
         }
     }
 
-    /// Her own tab: who she is, what she is doing, and every briefing she has written.
-    pub(super) fn umbra_tab(&mut self, ui: &mut egui::Ui) {
+    /// Her own panel: who she is, what she is doing, and every briefing she has written.
+    /// It fills `ui`; the feed takes whatever height the header leaves.
+    pub(super) fn umbra_panel(&mut self, ui: &mut egui::Ui) {
         let avatar = self.umbra_avatar(ui.ctx());
         let viewport_height = ui.available_height();
+        let avatar_size = header_avatar_size(ui.available_width(), viewport_height);
         egui::ScrollArea::vertical()
-            .id_salt("umbra_tab")
+            .id_salt("umbra_panel")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let header_top = ui.cursor().top();
-                self.umbra_header(ui, avatar.as_ref());
+                self.umbra_header(ui, avatar.as_ref(), avatar_size);
                 ui.separator();
                 let header_height = ui.cursor().top() - header_top;
                 let feed_height = (viewport_height - header_height).max(MIN_FEED_HEIGHT);
@@ -513,17 +520,20 @@ impl NomadeerApp {
         }
     }
 
-    fn umbra_header(&mut self, ui: &mut egui::Ui, avatar: Option<&egui::TextureHandle>) {
+    fn umbra_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        avatar: Option<&egui::TextureHandle>,
+        avatar_size: f32,
+    ) {
         let core = local_intel::core_status();
         ui.horizontal_top(|ui| {
-            paint_avatar(ui, avatar, HEADER_AVATAR_SIZE);
+            paint_avatar(ui, avatar, avatar_size);
             ui.add_space(8.0);
             ui.vertical(|ui| {
-                ui.heading(egui::RichText::new("Umbra").strong().color(theme::umbra()));
-                ui.label(
-                    egui::RichText::new(local_intel::UMBRA_TAGLINE).color(theme::muted_text()),
-                );
                 ui.horizontal_wrapped(|ui| {
+                    ui.heading(egui::RichText::new("Umbra").strong().color(theme::umbra()));
+                    ui.add_space(4.0);
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let state = self.umbra_state_label(core);
                     let state_color = match state {
@@ -556,6 +566,9 @@ impl NomadeerApp {
                         );
                     }
                 });
+                ui.label(
+                    egui::RichText::new(local_intel::UMBRA_TAGLINE).color(theme::muted_text()),
+                );
                 ui.horizontal_wrapped(|ui| {
                     self.umbra_auto_brief_toggle(ui);
                     if ui.button("Manage Umbra").clicked() {
@@ -596,6 +609,15 @@ impl NomadeerApp {
     }
 }
 
+/// Her portrait's size in a panel of the given size: full when there is room.
+pub(super) fn header_avatar_size(width: f32, height: f32) -> f32 {
+    if width < COMPACT_PANEL_WIDTH || height < COMPACT_PANEL_HEIGHT {
+        COMPACT_HEADER_AVATAR_SIZE
+    } else {
+        HEADER_AVATAR_SIZE
+    }
+}
+
 /// Her words for the sidebar, when she wrote them.
 pub(super) fn sidebar_words(assessment: &SystemAssessment) -> Option<&str> {
     (BriefingVoice::of(assessment) == BriefingVoice::Umbra).then_some(assessment.briefing.as_str())
@@ -604,9 +626,9 @@ pub(super) fn sidebar_words(assessment: &SystemAssessment) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AVATAR_PNG, AVATAR_TEXTURE_SIZE, BriefingVoice, ChainLookup, FEED_SHOWN, avatar_image,
-        evidence_heading, feed_class_label, feed_entry, message_time, push_feed_entry,
-        sidebar_words,
+        AVATAR_PNG, AVATAR_TEXTURE_SIZE, BriefingVoice, COMPACT_HEADER_AVATAR_SIZE, ChainLookup,
+        FEED_SHOWN, HEADER_AVATAR_SIZE, avatar_image, evidence_heading, feed_class_label,
+        feed_entry, header_avatar_size, message_time, push_feed_entry, sidebar_words,
     };
     use crate::model::{SystemAssessment, SystemNode};
     use std::io::Cursor;
@@ -823,5 +845,12 @@ mod tests {
             message_time(NOW, NOW),
             format!("{} EVE · just now", crate::local_intel::eve_clock(NOW))
         );
+    }
+
+    #[test]
+    fn her_portrait_shrinks_only_when_her_panel_is_cramped() {
+        assert_eq!(header_avatar_size(640.0, 480.0), HEADER_AVATAR_SIZE);
+        assert_eq!(header_avatar_size(300.0, 480.0), COMPACT_HEADER_AVATAR_SIZE);
+        assert_eq!(header_avatar_size(640.0, 200.0), COMPACT_HEADER_AVATAR_SIZE);
     }
 }

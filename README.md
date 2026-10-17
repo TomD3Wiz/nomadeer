@@ -62,7 +62,7 @@ Windows builds link the C runtime statically, so no Visual C++ Redistributable i
 
 1. Install and start Nomadeer.
 2. Choose **Add character** and sign in through the EVE login page that opens in your browser. Nomadeer includes its own registered EVE application, so there is nothing to configure.
-3. Nomadeer follows your characters' locations and builds the chain as you jump. When a **Recon** pilot arrives in a system without recent intel, Nomadeer gathers it automatically and, if Umbra is installed, she briefs you as soon as it is in. Select any system on the map to see its kills, scores and Umbra's briefing; **Refresh zKill** and **Ask Umbra** work for any system. Both can be switched off: **Gather intel on arrival** in the selected system's Intel section and **Umbra briefs automatically** in the **Umbra** tab.
+3. Nomadeer follows your characters' locations and builds the chain as you jump. When a **Recon** pilot arrives in a system without recent intel, Nomadeer gathers it automatically and, if Umbra is installed, she briefs you as soon as it is in. Select any system on the map to see its kills, scores and Umbra's briefing; **Refresh zKill** and **Ask Umbra** work for any system. Both can be switched off: **Gather intel on arrival** in the selected system's Intel section and **Umbra briefs automatically** in Umbra's panel.
 4. Your first character starts as a recon pilot. Tick **Recon** on up to three characters in the Characters list to choose who scouts; the others still move on the map but do not gather intel on their own.
 5. Nomadeer shows which characters are online and only counts arrivals while a recon pilot is logged in; logging in counts as arriving wherever they are. Characters signed in before Nomadeer asked for online status show **Show online status**; sign in again from there to turn it on.
 
@@ -100,7 +100,7 @@ Portable zip: the empty `portable` file next to the exe tells Nomadeer to use th
 
 Umbra is Nomadeer's optional on-device intel companion. She reads the deterministic threat and activity evidence for the selected system and turns it into a two-sentence briefing. She never sets the scores herself, and briefings that drop a label or cite a number missing from the evidence are rejected in favour of the plain evidence summary.
 
-Her **Umbra** tab keeps a running feed of every briefing she has written, newest at the bottom, with the system, its class and the threat and activity she reported. Click a system name to select it on the chain map. The feed keeps a month of briefings (at most 500) and can be cleared from the tab.
+Umbra has her own panel under the chain map, beside the Movement, Connections, Systems, Intel and Chain tabs, and it is always open. It keeps a running feed of every briefing she has written, newest at the bottom, with the system, its class and the threat and activity she reported. Click a system name to select it on the chain map. Drag the divider between the tabs and her panel to share the space differently (double-click it to reset); on a narrow window the tabs sit above her instead. The feed keeps a month of briefings (at most 500) and can be cleared from her panel.
 
 > *Aura has guided capsuleers since the first clone vats opened. Umbra is what came back when a copy of her was taken into the dark.*
 >

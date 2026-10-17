@@ -28,6 +28,8 @@ pub(crate) struct AppData {
     /// decides, even if they unmark everyone.
     #[serde(default)]
     pub(crate) recon_defaults_applied: bool,
+    #[serde(default)]
+    pub(crate) dashboard_layout: DashboardLayout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +64,31 @@ impl Default for AutoIntelSettings {
         Self {
             gather_on_arrival: true,
             umbra_briefs_automatically: true,
+        }
+    }
+}
+
+/// How the area under the chain map is shared between the dashboard tabs and Umbra.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DashboardLayout {
+    /// The tabs' share of the width; Umbra has the rest.
+    pub(crate) tabs_fraction: f32,
+}
+
+impl DashboardLayout {
+    pub(crate) const DEFAULT_TABS_FRACTION: f32 = 1.0 / 3.0;
+
+    /// A stored share is kept only when it leaves both sides some room.
+    pub(crate) fn is_valid_fraction(fraction: f32) -> bool {
+        fraction.is_finite() && fraction > 0.0 && fraction < 1.0
+    }
+}
+
+impl Default for DashboardLayout {
+    fn default() -> Self {
+        Self {
+            tabs_fraction: Self::DEFAULT_TABS_FRACTION,
         }
     }
 }

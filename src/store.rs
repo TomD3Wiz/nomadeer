@@ -1,7 +1,8 @@
 use crate::model::{
-    Account, AppData, AutoIntelSettings, CachedKillmail, Connection, EsiSettings, KillCounts,
-    KillboardCoverage, Note, Signature, SystemAssessment, SystemNode, SystemTrafficHistory,
-    TrafficHour, TrafficReading, TrafficRows, TrafficSample, UmbraBriefing, VisitLog,
+    Account, AppData, AutoIntelSettings, CachedKillmail, Connection, DashboardLayout, EsiSettings,
+    KillCounts, KillboardCoverage, Note, Signature, SystemAssessment, SystemNode,
+    SystemTrafficHistory, TrafficHour, TrafficReading, TrafficRows, TrafficSample, UmbraBriefing,
+    VisitLog,
 };
 use crate::paths;
 use crate::util::{DAY_SECS, hour_start, now};
@@ -26,9 +27,19 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const GATHER_ON_ARRIVAL_KEY: &str = "gather_intel_on_arrival";
 const UMBRA_BRIEFS_AUTOMATICALLY_KEY: &str = "umbra_briefs_automatically";
 const RECON_DEFAULTS_APPLIED_KEY: &str = "recon_defaults_applied";
+const DASHBOARD_TABS_FRACTION_KEY: &str = "dashboard_tabs_fraction";
 
 /// Handle to the SQLite database. Clones share schema setup and can be moved to
 /// background threads; each operation opens its own connection.
+/// Everything kept in `app_settings`.
+#[derive(Default)]
+struct Settings {
+    esi_settings: EsiSettings,
+    auto_intel: AutoIntelSettings,
+    recon_defaults_applied: bool,
+    dashboard_layout: DashboardLayout,
+}
+
 #[derive(Clone)]
 pub(crate) struct Store {
     path: PathBuf,
@@ -121,6 +132,14 @@ impl Store {
             )
             .map_err(|error| error.to_string())?;
         }
+        tx.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)",
+            params![
+                DASHBOARD_TABS_FRACTION_KEY,
+                data.dashboard_layout.tabs_fraction.to_string()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
 
         for account in &data.accounts {
             tx.execute(
@@ -1036,11 +1055,17 @@ impl Store {
     }
 
     fn load_all(&self, conn: &SqliteConnection) -> Result<AppData, String> {
-        let (esi_settings, auto_intel, recon_defaults_applied) = self.load_settings(conn)?;
+        let Settings {
+            esi_settings,
+            auto_intel,
+            recon_defaults_applied,
+            dashboard_layout,
+        } = self.load_settings(conn)?;
         Ok(AppData {
             esi_settings,
             auto_intel,
             recon_defaults_applied,
+            dashboard_layout,
             accounts: self.load_accounts(conn)?,
             systems: self.load_systems(conn)?,
             connections: self.load_connections(conn)?,
@@ -1053,13 +1078,8 @@ impl Store {
 
     /// Settings missing from the database, e.g. ones added after it was made, keep
     /// their defaults.
-    fn load_settings(
-        &self,
-        conn: &SqliteConnection,
-    ) -> Result<(EsiSettings, AutoIntelSettings, bool), String> {
-        let mut settings = EsiSettings::default();
-        let mut auto_intel = AutoIntelSettings::default();
-        let mut recon_defaults_applied = false;
+    fn load_settings(&self, conn: &SqliteConnection) -> Result<Settings, String> {
+        let mut loaded = Settings::default();
         let mut stmt = conn
             .prepare("SELECT key, value FROM app_settings")
             .map_err(|error| error.to_string())?;
@@ -1072,21 +1092,29 @@ impl Store {
         for row in rows {
             let (key, value) = row.map_err(|error| error.to_string())?;
             match key.as_str() {
-                "esi_client_id" => settings.client_id = value,
+                "esi_client_id" => loaded.esi_settings.client_id = value,
                 "esi_callback_port" => {
-                    settings.callback_port = value.parse().unwrap_or(settings.callback_port);
+                    loaded.esi_settings.callback_port =
+                        value.parse().unwrap_or(loaded.esi_settings.callback_port);
                 }
-                "esi_scopes" => settings.scopes = value,
-                GATHER_ON_ARRIVAL_KEY => auto_intel.gather_on_arrival = value != "0",
+                "esi_scopes" => loaded.esi_settings.scopes = value,
+                GATHER_ON_ARRIVAL_KEY => loaded.auto_intel.gather_on_arrival = value != "0",
                 UMBRA_BRIEFS_AUTOMATICALLY_KEY => {
-                    auto_intel.umbra_briefs_automatically = value != "0";
+                    loaded.auto_intel.umbra_briefs_automatically = value != "0";
                 }
-                RECON_DEFAULTS_APPLIED_KEY => recon_defaults_applied = value == "1",
+                RECON_DEFAULTS_APPLIED_KEY => loaded.recon_defaults_applied = value == "1",
+                DASHBOARD_TABS_FRACTION_KEY => {
+                    if let Ok(fraction) = value.parse::<f32>()
+                        && DashboardLayout::is_valid_fraction(fraction)
+                    {
+                        loaded.dashboard_layout.tabs_fraction = fraction;
+                    }
+                }
                 _ => {}
             }
         }
 
-        Ok((settings, auto_intel, recon_defaults_applied))
+        Ok(loaded)
     }
 
     fn load_accounts(&self, conn: &SqliteConnection) -> Result<Vec<Account>, String> {
@@ -1349,8 +1377,8 @@ mod tests {
         UMBRA_FEED_RETENTION_SECS,
     };
     use crate::model::{
-        AppData, AutoIntelSettings, CachedKillmail, KillCounts, KillboardCoverage, TrafficHour,
-        TrafficReading, TrafficRows, TrafficSample, UmbraBriefing,
+        AppData, AutoIntelSettings, CachedKillmail, DashboardLayout, KillCounts, KillboardCoverage,
+        TrafficHour, TrafficReading, TrafficRows, TrafficSample, UmbraBriefing,
     };
     use rusqlite::Connection as SqliteConnection;
     use std::path::PathBuf;
@@ -1784,6 +1812,51 @@ mod tests {
         // Legacy JSON without the settings turns both on.
         let legacy: AppData = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.auto_intel, AutoIntelSettings::default());
+    }
+
+    #[test]
+    fn dashboard_layout_defaults_to_a_third_for_tabs_and_persists() {
+        let db = TestDb::new("dashboard-layout");
+        let store = db.store();
+        // A database saved before the split existed has no row for it.
+        store.save(&data_with_client_id("older")).unwrap();
+        {
+            let conn = SqliteConnection::open(&db.path).unwrap();
+            conn.execute(
+                "DELETE FROM app_settings WHERE key = 'dashboard_tabs_fraction'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.load().unwrap().dashboard_layout,
+            DashboardLayout::default()
+        );
+        assert!((DashboardLayout::default().tabs_fraction - 1.0 / 3.0).abs() < f32::EPSILON);
+
+        let mut data = data_with_client_id("older");
+        data.dashboard_layout.tabs_fraction = 0.45;
+        store.save(&data).unwrap();
+        assert_eq!(store.load().unwrap().dashboard_layout.tabs_fraction, 0.45);
+
+        // A stored share that leaves one side no room falls back to the default.
+        for bad in ["0", "1", "-0.2", "NaN", "inf", "wide"] {
+            let conn = SqliteConnection::open(&db.path).unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value = ?1 WHERE key = 'dashboard_tabs_fraction'",
+                [bad],
+            )
+            .unwrap();
+            assert_eq!(
+                store.load().unwrap().dashboard_layout,
+                DashboardLayout::default(),
+                "{bad}"
+            );
+        }
+
+        // Legacy JSON without the split gets the default.
+        let legacy: AppData = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.dashboard_layout, DashboardLayout::default());
     }
 
     #[test]
