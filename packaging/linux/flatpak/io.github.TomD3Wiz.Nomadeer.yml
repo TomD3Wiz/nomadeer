@@ -1,0 +1,58 @@
+# Release bundle manifest: packages the two prebuilt release binaries
+# (make release, or the release workflow's Linux builds) rather than building
+# from source, and lets the launcher pick one for the processor at start-up.
+# Build with packaging/linux/flatpak/build-flatpak.sh (make flatpak).
+id: io.github.TomD3Wiz.Nomadeer
+runtime: org.freedesktop.Platform
+runtime-version: "26.08"
+sdk: org.freedesktop.Sdk
+command: nomadeer
+finish-args:
+  # ESI, killboards, Umbra's core download and the EVE SSO sign-in callback
+  # on 127.0.0.1.
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+
+modules:
+  - name: nomadeer
+    buildsystem: simple
+    build-options:
+      # The release binaries are already stripped.
+      no-debuginfo: true
+      strip: false
+    build-commands:
+      - install -Dm755 nomadeer-launcher.sh /app/bin/nomadeer
+      - install -Dm755 nomadeer-optimized /app/lib/nomadeer/nomadeer-optimized
+      - install -Dm755 nomadeer-compatible /app/lib/nomadeer/nomadeer-compatible
+      - install -Dm644 ${FLATPAK_ID}.desktop /app/share/applications/${FLATPAK_ID}.desktop
+      - install -Dm644 ${FLATPAK_ID}.metainfo.xml /app/share/metainfo/${FLATPAK_ID}.metainfo.xml
+      - |
+        for size in 16 32 48 64 128 256 512; do
+          install -Dm644 icons/nomadeer-${size}.png \
+            /app/share/icons/hicolor/${size}x${size}/apps/${FLATPAK_ID}.png
+        done
+      - install -Dm644 icon.svg /app/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      - install -Dm644 LICENSE /app/share/licenses/${FLATPAK_ID}/LICENSE
+    sources:
+      - type: file
+        path: ../../../target/optimized/release/nomadeer
+        dest-filename: nomadeer-optimized
+      - type: file
+        path: ../../../target/compatible/release/nomadeer
+        dest-filename: nomadeer-compatible
+      - type: file
+        path: ../nomadeer-launcher.sh
+      - type: file
+        path: ../io.github.TomD3Wiz.Nomadeer.desktop
+      - type: file
+        path: ../io.github.TomD3Wiz.Nomadeer.metainfo.xml
+      - type: dir
+        path: ../../../assets/icons
+        dest: icons
+      - type: file
+        path: ../../../assets/icon.svg
+      - type: file
+        path: ../../../LICENSE

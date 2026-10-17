@@ -1,10 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  Nomadeer app icon: a stylised deer head and antlers rising through a wormhole ring.
-  Colours follow src/config.rs (panel background, panel stroke, accent,
-  character text). Regenerate the PNG/ICO renders with packaging/icons/render-icons.sh.
--->
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="512" height="512" viewBox="0 0 512 512">
+  <!--
+    Nomadeer app icon: a stylised deer head and antlers rising through a wormhole ring.
+    Colours follow src/config.rs (panel background, panel stroke, accent,
+    character text). Regenerate the PNG/ICO renders with packaging/icons/render-icons.sh.
+    Keep this comment after the <svg> tag: image loaders that sniff the first
+    256 bytes (gdk-pixbuf, used by appstream compose) do not see it as SVG otherwise.
+  -->
   <defs>
     <radialGradient id="space" cx="50%" cy="58%" r="62%">
       <stop offset="0" stop-color="#0d2c36"/>

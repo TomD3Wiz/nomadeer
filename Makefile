@@ -24,7 +24,14 @@ endif
 WINDOWS_BUILD_DIR := target/windows-cross
 WINDOWS_DIST_DIR := $(DIST_DIR)/windows
 
-.PHONY: build run release release-optimized release-compatible dist windows-installer fmt fmt-check clippy test audit deny coverage qa clean
+# Linux packages. Both bundle the optimized and compatible builds and pick one
+# at launch. The Flatpak builds in the flathub-infra image for its runtime.
+APPIMAGE_DIST_DIR := $(DIST_DIR)/appimage
+FLATPAK_DIST_DIR := $(DIST_DIR)/flatpak
+FLATPAK_BUILD_DIR := target/flatpak
+FLATPAK_IMAGE ?= ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+
+.PHONY: build run release release-optimized release-compatible dist appimage flatpak windows-installer fmt fmt-check clippy test audit deny coverage qa clean
 
 build:
 	$(CARGO) build
@@ -52,6 +59,25 @@ dist: release
 		tar -C $(DIST_DIR) -czf $(DIST_DIR)/$$name.tar.gz $$name; \
 		(cd $(DIST_DIR) && sha256sum $$name.tar.gz > $$name.tar.gz.sha256); \
 	done
+
+# Nomadeer-<version>-x86_64.AppImage. The binaries need the glibc of the
+# machine that built them; the release workflow builds on Ubuntu 22.04.
+appimage: release
+	packaging/linux/appimage/build-appimage.sh $(VERSION) \
+		$(OPTIMIZED_TARGET_DIR)/release/nomadeer \
+		$(COMPATIBLE_TARGET_DIR)/release/nomadeer \
+		$(APPIMAGE_DIST_DIR)
+
+# Nomadeer-<version>-x86_64.flatpak. flatpak-builder sandboxes its build steps
+# with bubblewrap, which needs a privileged container.
+flatpak: release
+	mkdir -p $(FLATPAK_BUILD_DIR) $(FLATPAK_DIST_DIR)
+	$(CONTAINER) run --rm --privileged --security-opt label=disable \
+		-v "$(CURDIR):/src:ro" \
+		-v "$(CURDIR)/$(FLATPAK_BUILD_DIR):/build" \
+		-v "$(CURDIR)/$(FLATPAK_DIST_DIR):/dist" \
+		-e FLATPAK_WORK_DIR=/build \
+		$(FLATPAK_IMAGE) sh /src/packaging/linux/flatpak/build-flatpak.sh $(VERSION) /dist
 
 # Nomadeer-<version>-Setup.exe and the portable zip, cross-built from Linux.
 # Volumes use label=disable instead of :z so your files are never relabelled.
