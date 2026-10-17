@@ -12,6 +12,8 @@ use std::io::{Read, Write};
 use std::ops::RangeInclusive;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::UNIX_EPOCH;
@@ -719,13 +721,17 @@ pub(crate) enum BriefingEvent {
         /// The core itself could not be loaded, so reinstalling is the fix.
         needs_repair: bool,
     },
+    /// She was pulled off the briefing before finishing it.
+    Stopped,
 }
 
 /// A long-lived thread that keeps Umbra's core loaded between briefings, so only the
 /// first one pays for reading and unpacking the gigabyte-sized core. Dropping the
-/// worker ends the thread and frees the core once any briefing in progress finishes.
+/// worker stops any briefing in progress, ends the thread and frees the core.
 pub(crate) struct BriefingWorker {
     jobs: Sender<SystemAssessment>,
+    /// Raised to stop the briefing in progress; each new briefing lowers it again.
+    stop: Arc<AtomicBool>,
 }
 
 impl BriefingWorker {
@@ -735,13 +741,18 @@ impl BriefingWorker {
 
     fn spawn_with<C: 'static>(
         load: impl Fn() -> Result<C, String> + Send + 'static,
-        brief: impl Fn(&mut C, &SystemAssessment) -> Result<String, String> + Send + 'static,
+        brief: impl Fn(&mut C, &SystemAssessment, &AtomicBool) -> Result<String, String>
+        + Send
+        + 'static,
         on_event: impl Fn(BriefingEvent) + Send + 'static,
     ) -> Self {
         let (jobs, requests) = mpsc::channel::<SystemAssessment>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
         thread::spawn(move || {
             let mut core = None;
             while let Ok(source) = requests.recv() {
+                stopped.store(false, Ordering::SeqCst);
                 // The core is taken out while it works, so a panic leaves none behind
                 // and the next request loads it afresh.
                 let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -753,12 +764,13 @@ impl BriefingWorker {
                         }
                     };
                     on_event(BriefingEvent::Writing);
-                    let briefing = brief(&mut loaded, &source);
+                    let briefing = brief(&mut loaded, &source, &stopped);
                     core = Some(loaded);
                     briefing.map_err(|error| (error, false))
                 }));
                 let event = match outcome {
                     Ok(Ok(briefing)) => BriefingEvent::Written { source, briefing },
+                    _ if stopped.load(Ordering::SeqCst) => BriefingEvent::Stopped,
                     Ok(Err((error, needs_repair))) => BriefingEvent::Failed {
                         source,
                         error,
@@ -773,13 +785,25 @@ impl BriefingWorker {
                 on_event(event);
             }
         });
-        Self { jobs }
+        Self { jobs, stop }
     }
 
     pub(crate) fn request(&self, assessment: SystemAssessment) -> Result<(), String> {
         self.jobs
             .send(assessment)
             .map_err(|_| "Umbra stopped unexpectedly. Ask her again.".to_owned())
+    }
+
+    /// Stops the briefing in progress, keeping her core loaded for the next one. It
+    /// ends with `Stopped`, or `Written` when she had just finished.
+    pub(crate) fn stop_current(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for BriefingWorker {
+    fn drop(&mut self) {
+        self.stop_current();
     }
 }
 
@@ -822,7 +846,11 @@ impl LoadedCore {
         })
     }
 
-    fn brief(&mut self, assessment: &SystemAssessment) -> Result<String, String> {
+    fn brief(
+        &mut self,
+        assessment: &SystemAssessment,
+        stop: &AtomicBool,
+    ) -> Result<String, String> {
         // Each briefing starts from an empty context.
         self.model.clear_kv_cache();
         let reply_prefix = format!("Threat is {}", score_label(assessment.threat_score));
@@ -854,6 +882,9 @@ impl LoadedCore {
         let mut generated = Vec::new();
 
         for index in 0..BRIEFING_MAX_TOKENS {
+            if stop.load(Ordering::Relaxed) {
+                return Err("Umbra was pulled off this briefing".to_owned());
+            }
             if self.stop_tokens.contains(&next_token) {
                 break;
             }
@@ -1169,8 +1200,9 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, SystemTime};
 
     struct TempDir {
@@ -1809,7 +1841,7 @@ mod tests {
         let mut failures = 0;
         for assessment in scenarios {
             let started = std::time::Instant::now();
-            match core.brief(&assessment) {
+            match core.brief(&assessment, &AtomicBool::new(false)) {
                 Ok(briefing) => println!("[{:.1}s] {briefing}", started.elapsed().as_secs_f32()),
                 Err(error) => {
                     failures += 1;
@@ -1850,7 +1882,7 @@ mod tests {
             generated_at: 1,
         };
         let briefing = LoadedCore::load()
-            .and_then(|mut core| core.brief(&assessment))
+            .and_then(|mut core| core.brief(&assessment, &AtomicBool::new(false)))
             .expect("model should generate");
         println!("{briefing}");
         assert!(!briefing.trim().is_empty());
@@ -1980,7 +2012,7 @@ mod tests {
                     _ => Ok(0_usize),
                 }
             },
-            |briefings: &mut usize, assessment: &SystemAssessment| {
+            |briefings: &mut usize, assessment: &SystemAssessment, _: &AtomicBool| {
                 *briefings += 1;
                 if assessment.threat_score == 99 {
                     panic!("model fell over");
@@ -2038,6 +2070,40 @@ mod tests {
         };
         assert_eq!(briefing, "briefing 1 for 40");
         assert_eq!(loads.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn briefing_worker_can_be_pulled_off_a_briefing() {
+        let (tx, events) = mpsc::channel();
+        let worker = BriefingWorker::spawn_with(
+            || Ok(()),
+            |_: &mut (), assessment: &SystemAssessment, stop: &AtomicBool| {
+                // Threat 1 runs until she is told to stop.
+                if assessment.threat_score == 1 {
+                    while !stop.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    return Err("stopped".to_owned());
+                }
+                Ok(format!("briefing for {}", assessment.threat_score))
+            },
+            move |event| {
+                let _ = tx.send(event);
+            },
+        );
+
+        worker.request(test_assessment(1, 0, "Low", &[])).unwrap();
+        assert!(matches!(next_event(&events), BriefingEvent::Waking));
+        assert!(matches!(next_event(&events), BriefingEvent::Writing));
+        worker.stop_current();
+        worker.request(test_assessment(2, 0, "Low", &[])).unwrap();
+        assert!(matches!(outcome(&events), BriefingEvent::Stopped));
+        // The next briefing runs to the end on the core she already loaded.
+        assert!(matches!(next_event(&events), BriefingEvent::Writing));
+        let BriefingEvent::Written { briefing, .. } = outcome(&events) else {
+            panic!("the next briefing should be written");
+        };
+        assert_eq!(briefing, "briefing for 2");
     }
 
     #[test]

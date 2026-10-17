@@ -656,7 +656,8 @@ impl NomadeerApp {
                 ui.add_space(8.0);
 
                 let core = local_intel::core_status();
-                let idle = self.umbra_task.is_none();
+                // Briefings she writes on her own never keep the player from her controls.
+                let idle = self.umbra_free_for_player();
                 ui.horizontal_wrapped(|ui| {
                     pill(ui, self.umbra_state_label(core));
                     let button = |ui: &mut egui::Ui, text: &str| {
@@ -706,6 +707,10 @@ impl NomadeerApp {
                     .changed()
                 {
                     self.data.auto_intel.umbra_briefs_automatically = auto_brief;
+                    if !auto_brief {
+                        self.auto_briefings.clear();
+                        self.interrupt_auto_briefing();
+                    }
                     self.save();
                 }
 
@@ -841,8 +846,44 @@ impl NomadeerApp {
         self.local_intel_progress = None;
     }
 
+    /// Whether the player can give Umbra something to do: she is idle, or only busy
+    /// with a briefing she started on her own.
+    fn umbra_free_for_player(&self) -> bool {
+        self.umbra_task.as_ref().is_none_or(UmbraTask::is_auto)
+    }
+
+    /// Pulls Umbra off a briefing she started on her own so the player's request can
+    /// go first. She picks it up again later, while she still briefs on her own.
+    fn interrupt_auto_briefing(&mut self) {
+        let Some(UmbraTask::Briefing {
+            system_id,
+            auto: true,
+            ..
+        }) = &self.umbra_task
+        else {
+            return;
+        };
+        if let Some(worker) = &self.umbra_worker {
+            worker.stop_current();
+        }
+        if let Some(assessment) = self.system_assessments.get(system_id).cloned() {
+            self.queue_auto_briefing(&assessment);
+        }
+        self.umbra_task = None;
+    }
+
+    /// Clears the way for the player's request: false while Umbra is busy with
+    /// something the player asked for.
+    fn make_umbra_free_for_player(&mut self) -> bool {
+        if !self.umbra_free_for_player() {
+            return false;
+        }
+        self.interrupt_auto_briefing();
+        true
+    }
+
     fn start_local_model_install(&mut self) {
-        if self.umbra_task.is_some() {
+        if !self.make_umbra_free_for_player() {
             return;
         }
         // Her files may be replaced, so the loaded core must go.
@@ -860,7 +901,7 @@ impl NomadeerApp {
     }
 
     fn start_local_model_import(&mut self) {
-        if self.umbra_task.is_some() {
+        if !self.umbra_free_for_player() {
             return;
         }
         let path = local_intel::import_source_path(&self.local_model_import_path);
@@ -872,6 +913,7 @@ impl NomadeerApp {
             );
             return;
         }
+        self.interrupt_auto_briefing();
 
         self.umbra_worker = None;
         self.start_umbra_task(UmbraTask::Importing);
@@ -898,7 +940,7 @@ impl NomadeerApp {
     }
 
     fn start_umbra_core_check(&mut self) {
-        if self.umbra_task.is_some() {
+        if !self.make_umbra_free_for_player() {
             return;
         }
         self.umbra_check_attempted = true;
@@ -911,7 +953,7 @@ impl NomadeerApp {
     }
 
     fn remove_local_model(&mut self) {
-        if self.umbra_task.is_some() {
+        if !self.make_umbra_free_for_player() {
             return;
         }
         // Drop the loaded core first so its memory is freed with the files.
@@ -1248,6 +1290,10 @@ impl NomadeerApp {
                         if let Err(error) = self.store.save(&self.data) {
                             save_error.get_or_insert(error);
                         }
+                    } else {
+                        // The system left the map meanwhile; arriving there again
+                        // should gather its intel afresh.
+                        self.intel_queue.forget_refresh(report.solar_system_id);
                     }
                     let status = match (save_error, &report.interrupted) {
                         (Some(error), _) => {
@@ -1348,7 +1394,27 @@ impl NomadeerApp {
     }
 
     fn start_local_briefing(&mut self, system_id: &str) {
-        if self.umbra_task.is_some() {
+        // Already briefing this system on her own: the briefing becomes the player's.
+        if let Some(UmbraTask::Briefing {
+            system_id: briefing,
+            auto,
+            ..
+        }) = &mut self.umbra_task
+            && *auto
+            && briefing == system_id
+            && self
+                .system_assessments
+                .get(system_id)
+                .is_some_and(|assessment| !assessment.model_generated)
+        {
+            *auto = false;
+            if let Some(task) = &self.umbra_task {
+                self.status = task.label().to_owned();
+            }
+            self.umbra_notice = None;
+            return;
+        }
+        if !self.make_umbra_free_for_player() {
             self.status = "Umbra is already working".to_owned();
             return;
         }
@@ -1513,7 +1579,10 @@ impl NomadeerApp {
                 }
             }
             BriefingEvent::Written { source, briefing } => {
-                let auto = self.umbra_task.take().is_some_and(|task| task.is_auto());
+                // One she was pulled off may finish anyway; it is kept quietly.
+                let auto = self
+                    .end_briefing_task(&source.system_id)
+                    .is_none_or(|auto| auto);
                 let briefed = self
                     .system_assessments
                     .get(&source.system_id)
@@ -1523,11 +1592,19 @@ impl NomadeerApp {
                     if auto {
                         return;
                     }
-                    self.set_umbra_notice(
-                        Some(source.system_id),
-                        "The intel changed while Umbra was writing, so she set her briefing aside. Ask her again for the latest picture.".to_owned(),
-                        true,
-                    );
+                    if self.auto_briefings.is_pending(&source.system_id) {
+                        self.set_umbra_notice(
+                            Some(source.system_id),
+                            "The intel changed while Umbra was writing, so she is briefing the newer intel instead.".to_owned(),
+                            false,
+                        );
+                    } else {
+                        self.set_umbra_notice(
+                            Some(source.system_id),
+                            "The intel changed while Umbra was writing, so she set her briefing aside. Ask her again for the latest picture.".to_owned(),
+                            true,
+                        );
+                    }
                     return;
                 };
                 self.system_assessments
@@ -1548,7 +1625,10 @@ impl NomadeerApp {
                 error,
                 needs_repair,
             } => {
-                let auto = self.umbra_task.take().is_some_and(|task| task.is_auto());
+                // A briefing she was pulled off has nothing more to say.
+                let Some(auto) = self.end_briefing_task(&source.system_id) else {
+                    return;
+                };
                 if needs_repair {
                     self.umbra_needs_repair = true;
                     self.umbra_worker = None;
@@ -1559,7 +1639,23 @@ impl NomadeerApp {
                     self.set_umbra_notice(Some(source.system_id), error, true);
                 }
             }
+            // Only a briefing she was pulled off stops, and she has already moved on.
+            BriefingEvent::Stopped => {}
         }
+    }
+
+    /// Ends her briefing task when the event reports on it, returning whether she
+    /// was briefing on her own. None when it is about a briefing she was pulled off.
+    fn end_briefing_task(&mut self, system_id: &str) -> Option<bool> {
+        if self
+            .umbra_task
+            .as_ref()
+            .and_then(UmbraTask::briefing_system)
+            != Some(system_id)
+        {
+            return None;
+        }
+        self.umbra_task.take().map(|task| task.is_auto())
     }
 
     fn poll_esi_tasks(&mut self) {
@@ -1669,17 +1765,22 @@ impl NomadeerApp {
             self.ensure_connection(&previous_system_id, &system_id, &character_name);
         }
 
+        if self.selected_system_id.is_empty() {
+            self.selected_system_id = system_id.clone();
+        }
         let first_fix = self
             .located_this_session
             .insert(location.account_id.clone());
         if self.data.auto_intel.gather_on_arrival
-            && auto_intel::is_arrival(&previous_system_id, &system_id, first_fix, node_created)
+            && auto_intel::is_arrival(
+                &previous_system_id,
+                &system_id,
+                first_fix,
+                node_created,
+                system_id == self.selected_system_id,
+            )
         {
             self.queue_arrival_intel(&system_id);
-        }
-
-        if self.selected_system_id.is_empty() {
-            self.selected_system_id = system_id;
         }
         if moved || !self.background_esi_task {
             self.status = format!("{character_name} is in {}", location.system.name);
@@ -2926,7 +3027,7 @@ impl NomadeerApp {
             theme::accent()
         };
         let core = local_intel::core_status();
-        let umbra_idle = self.umbra_task.is_none();
+        let umbra_idle = self.umbra_free_for_player();
         record_frame(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("System assessment");
