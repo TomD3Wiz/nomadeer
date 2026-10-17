@@ -6,7 +6,7 @@ uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-10-17
+## [0.1.0] - 2026-10-18
 
 The first release of Nomadeer, a companion that rides alongside your EVE
 Online session, maps your wormhole chain as you jump and briefs you on the
