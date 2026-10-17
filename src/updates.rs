@@ -10,7 +10,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::util::{DAY_SECS, HOUR_SECS};
@@ -403,12 +403,29 @@ pub(crate) struct InstallInputs<'a> {
     pub(crate) exe: Option<&'a Path>,
     pub(crate) env: &'a dyn Fn(&str) -> Option<OsString>,
     pub(crate) is_file: &'a dyn Fn(&Path) -> bool,
+    /// The path with links resolved, when it exists.
+    pub(crate) canonicalize: &'a dyn Fn(&Path) -> Option<PathBuf>,
+    /// The folder Setup registered Nomadeer in for that scope, on Windows.
+    pub(crate) setup_dir: &'a dyn Fn(SetupScope) -> Option<OsString>,
     /// Built without optimisations (`debug_assertions`).
     pub(crate) debug_build: bool,
 }
 
+/// Who Setup installed Nomadeer for, as Windows records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SetupScope {
+    /// Registered under HKEY_CURRENT_USER: installed for this player only.
+    CurrentUser,
+    /// Registered under HKEY_LOCAL_MACHINE: installed for everyone.
+    AllUsers,
+}
+
 /// Inno Setup's uninstaller, which it puts next to what it installed.
 const WINDOWS_UNINSTALLER: &str = "unins000.exe";
+
+/// nomadeer.iss's AppId, which names Setup's uninstall registration.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_APP_ID: &str = "{AD0924E7-1EB6-4693-84CD-96670577BFB9}";
 
 pub(crate) fn current_install_kind() -> InstallKind {
     let exe = std::env::current_exe().ok();
@@ -417,13 +434,100 @@ pub(crate) fn current_install_kind() -> InstallKind {
         exe: exe.as_deref(),
         env: &|name| std::env::var_os(name),
         is_file: &|path| path.is_file(),
+        canonicalize: &|path| std::fs::canonicalize(path).ok(),
+        setup_dir: &registered_setup_dir,
         debug_build: cfg!(debug_assertions),
     })
+}
+
+/// Where Setup says it installed Nomadeer for `scope`: the "Inno Setup: App
+/// Path" value of the uninstall entry it registers under the AppId.
+#[cfg(windows)]
+fn registered_setup_dir(scope: SetupScope) -> Option<OsString> {
+    use std::ffi::{OsStr, c_void};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const HKEY_CURRENT_USER: isize = 0x8000_0001_u32 as i32 as isize;
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
+    const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+    const ERROR_SUCCESS: i32 = 0;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegGetValueW(
+            key: *mut c_void,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut c_void,
+            data_bytes: *mut u32,
+        ) -> i32;
+    }
+
+    let wide = |text: &str| {
+        OsStr::new(text)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<u16>>()
+    };
+    let root = match scope {
+        SetupScope::CurrentUser => HKEY_CURRENT_USER,
+        SetupScope::AllUsers => HKEY_LOCAL_MACHINE,
+    } as *mut c_void;
+    let subkey = wide(&format!(
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{WINDOWS_APP_ID}_is1"
+    ));
+    let value = wide("Inno Setup: App Path");
+    let read = |data: *mut c_void, bytes: &mut u32| {
+        // SAFETY: the key and value names are NUL-terminated UTF-16 that
+        // outlive the call, and `data` is null or holds `bytes` bytes.
+        unsafe {
+            RegGetValueW(
+                root,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                data,
+                bytes,
+            )
+        }
+    };
+    let mut bytes = 0_u32;
+    if read(std::ptr::null_mut(), &mut bytes) != ERROR_SUCCESS || bytes == 0 {
+        return None;
+    }
+    let mut buffer = vec![0_u16; (bytes as usize).div_ceil(2)];
+    bytes = (buffer.len() * 2) as u32;
+    if read(buffer.as_mut_ptr().cast(), &mut bytes) != ERROR_SUCCESS {
+        return None;
+    }
+    let text = &buffer[..(bytes as usize / 2).min(buffer.len())];
+    let end = text
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(text.len());
+    Some(OsString::from_wide(&text[..end])).filter(|dir| !dir.is_empty())
+}
+
+#[cfg(not(windows))]
+fn registered_setup_dir(_scope: SetupScope) -> Option<OsString> {
+    None
 }
 
 pub(crate) fn detect_install_kind(inputs: &InstallInputs<'_>) -> InstallKind {
     let var = |name: &str| (inputs.env)(name).filter(|value| !value.is_empty());
     let exe_dir = inputs.exe.and_then(Path::parent);
+    // The executable's path has its links resolved, but APPDIR keeps any link
+    // on the way to TMPDIR, so compare them resolved when they differ.
+    let inside = |path: &Path, dir: &OsString| {
+        let dir = Path::new(dir);
+        path.starts_with(dir)
+            || (inputs.canonicalize)(path)
+                .zip((inputs.canonicalize)(dir))
+                .is_some_and(|(path, dir)| path.starts_with(dir))
+    };
 
     if inputs.os == "linux"
         && (var("FLATPAK_ID").is_some() || (inputs.is_file)(Path::new("/.flatpak-info")))
@@ -434,7 +538,7 @@ pub(crate) fn detect_install_kind(inputs: &InstallInputs<'_>) -> InstallKind {
     // executable must also be inside the mounted image when APPDIR says where.
     if inputs.os == "linux"
         && var("APPIMAGE").is_some()
-        && var("APPDIR").is_none_or(|appdir| inputs.exe.is_some_and(|exe| exe.starts_with(appdir)))
+        && var("APPDIR").is_none_or(|appdir| inputs.exe.is_some_and(|exe| inside(exe, &appdir)))
     {
         return InstallKind::AppImage;
     }
@@ -447,9 +551,23 @@ pub(crate) fn detect_install_kind(inputs: &InstallInputs<'_>) -> InstallKind {
                 return InstallKind::WindowsPortable;
             };
             if (inputs.is_file)(&exe_dir.join(WINDOWS_UNINSTALLER)) {
-                let per_user = var("LOCALAPPDATA").is_some_and(|local| {
-                    windows_path_starts_with(&exe_dir.to_string_lossy(), &local.to_string_lossy())
-                });
+                // Setup lets a player install for themselves into any folder
+                // they can write to, so trust its registration over the path.
+                let exe_dir = exe_dir.to_string_lossy();
+                let registered_here = |scope| {
+                    (inputs.setup_dir)(scope)
+                        .is_some_and(|dir| windows_same_path(&exe_dir, &dir.to_string_lossy()))
+                };
+                let per_user = if registered_here(SetupScope::CurrentUser) {
+                    true
+                } else if registered_here(SetupScope::AllUsers) {
+                    false
+                } else {
+                    // Setup's own default folder for a per-user install.
+                    var("LOCALAPPDATA").is_some_and(|local| {
+                        windows_path_starts_with(&exe_dir, &local.to_string_lossy())
+                    })
+                };
                 InstallKind::WindowsInstaller { per_user }
             } else {
                 // The portable marker, a data folder beside the exe, or a copy
@@ -472,14 +590,22 @@ fn in_cargo_target_dir(exe_dir: &Path, is_file: &dyn Fn(&Path) -> bool) -> bool 
     })
 }
 
+/// A Windows path as Windows compares it: case-insensitive, indifferent to
+/// `/` or `\` and to a trailing separator.
+fn windows_normalise(path: &str) -> String {
+    path.replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+fn windows_same_path(a: &str, b: &str) -> bool {
+    let (a, b) = (windows_normalise(a), windows_normalise(b));
+    !a.is_empty() && a == b
+}
+
 /// Case-insensitive and indifferent to `/` or `\`, as Windows paths are.
 fn windows_path_starts_with(path: &str, prefix: &str) -> bool {
-    let normalise = |text: &str| {
-        text.replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
-    };
-    let (path, prefix) = (normalise(path), normalise(prefix));
+    let (path, prefix) = (windows_normalise(path), windows_normalise(prefix));
     !prefix.is_empty()
         && path
             .strip_prefix(&prefix)
@@ -605,14 +731,18 @@ impl Default for UpdateState {
 impl UpdateState {
     /// Whether an automatic check should run now.
     pub(crate) fn automatic_check_due(&self, now: u64) -> bool {
+        // A clock that went backwards must not stop checks until it catches
+        // up, and neither must a wait worked out while it was running ahead,
+        // which is also when checks fail. No wait is ever set longer than
+        // these, so anything further off came from a different clock.
         self.check_automatically
             && self.rate_limit_wait(now).is_none()
-            && self.retry_at.is_none_or(|at| now >= at)
-            && self.last_checked_at.is_none_or(|last| {
-                // A clock that went backwards must not stop checks until it
-                // catches up.
-                last > now || now - last >= CHECK_INTERVAL_SECS
-            })
+            && self
+                .retry_at
+                .is_none_or(|at| now >= at || at - now > RETRY_AFTER_FAILURE_SECS)
+            && self
+                .last_checked_at
+                .is_none_or(|last| last > now || now - last >= CHECK_INTERVAL_SECS)
     }
 
     /// Seconds until GitHub accepts checks again, while it is turning them away.
@@ -620,6 +750,8 @@ impl UpdateState {
         self.rate_limited_until
             .filter(|&until| until > now)
             .map(|until| until - now)
+            // Never more than a day, unless the clock has since gone back.
+            .filter(|&wait| wait <= CHECK_INTERVAL_SECS)
     }
 
     /// The ETag to send, only while the release it stands for is still known.
@@ -1081,6 +1213,10 @@ mod tests {
         exe: PathBuf,
         env: HashMap<&'static str, &'static str>,
         files: HashSet<PathBuf>,
+        /// Folders that are links, and where they lead.
+        links: HashMap<PathBuf, PathBuf>,
+        /// Setup's registration for each scope.
+        setup: HashMap<SetupScope, &'static str>,
         debug_build: bool,
     }
 
@@ -1091,6 +1227,8 @@ mod tests {
                 exe: PathBuf::from(exe),
                 env: HashMap::from([("HOME", "/home/pilot")]),
                 files: HashSet::new(),
+                links: HashMap::new(),
+                setup: HashMap::new(),
                 debug_build: false,
             }
         }
@@ -1101,6 +1239,8 @@ mod tests {
                 exe: Path::new(exe_dir).join("Nomadeer.exe"),
                 env: HashMap::from([("LOCALAPPDATA", r"C:\Users\pilot\AppData\Local")]),
                 files: HashSet::new(),
+                links: HashMap::new(),
+                setup: HashMap::new(),
                 debug_build: false,
             }
         }
@@ -1121,14 +1261,36 @@ mod tests {
             self
         }
 
+        fn link(mut self, link: &str, target: &str) -> Self {
+            self.links
+                .insert(PathBuf::from(link), PathBuf::from(target));
+            self
+        }
+
+        fn registered(mut self, scope: SetupScope, dir: &'static str) -> Self {
+            self.setup.insert(scope, dir);
+            self
+        }
+
         fn detect(&self) -> InstallKind {
             let env = |name: &str| self.env.get(name).map(OsString::from);
             let is_file = |path: &Path| self.files.contains(path);
+            let canonicalize = |path: &Path| {
+                Some(
+                    self.links
+                        .iter()
+                        .find_map(|(link, target)| Some(target.join(path.strip_prefix(link).ok()?)))
+                        .unwrap_or_else(|| path.to_path_buf()),
+                )
+            };
+            let setup_dir = |scope| self.setup.get(&scope).map(OsString::from);
             detect_install_kind(&InstallInputs {
                 os: self.os,
                 exe: Some(&self.exe),
                 env: &env,
                 is_file: &is_file,
+                canonicalize: &canonicalize,
+                setup_dir: &setup_dir,
                 debug_build: self.debug_build,
             })
         }
@@ -1165,6 +1327,43 @@ mod tests {
             InstallKind::WindowsInstaller { per_user: false }
         );
 
+        // Setup's registration says who it was installed for, wherever it went.
+        let mine_elsewhere = Machine::windows(r"D:\Games\Nomadeer")
+            .beside_exe(WINDOWS_UNINSTALLER)
+            .registered(SetupScope::CurrentUser, r"d:\games\nomadeer\");
+        assert_eq!(
+            mine_elsewhere.detect(),
+            InstallKind::WindowsInstaller { per_user: true }
+        );
+        let everyones_in_local = Machine::windows(r"C:\Users\pilot\AppData\Local\Nomadeer")
+            .beside_exe(WINDOWS_UNINSTALLER)
+            .registered(
+                SetupScope::AllUsers,
+                r"C:\Users\pilot\AppData\Local\Nomadeer",
+            );
+        assert_eq!(
+            everyones_in_local.detect(),
+            InstallKind::WindowsInstaller { per_user: false }
+        );
+        // A registration for another copy says nothing about this one.
+        let other_copy = Machine::windows(r"C:\Program Files\Nomadeer")
+            .beside_exe(WINDOWS_UNINSTALLER)
+            .registered(SetupScope::CurrentUser, r"D:\Games\Nomadeer");
+        assert_eq!(
+            other_copy.detect(),
+            InstallKind::WindowsInstaller { per_user: false }
+        );
+        // Registered both ways in one folder: updating for this player needs
+        // no administrator.
+        let both = Machine::windows(r"D:\Games\Nomadeer")
+            .beside_exe(WINDOWS_UNINSTALLER)
+            .registered(SetupScope::AllUsers, r"D:\Games\Nomadeer")
+            .registered(SetupScope::CurrentUser, r"D:\Games\Nomadeer");
+        assert_eq!(
+            both.detect(),
+            InstallKind::WindowsInstaller { per_user: true }
+        );
+
         let portable = Machine::windows(r"D:\Games\Nomadeer").beside_exe(PORTABLE_MARKER);
         assert_eq!(portable.detect(), InstallKind::WindowsPortable);
         // Without the uninstaller even a copy in Program Files is updated by hand.
@@ -1172,6 +1371,13 @@ mod tests {
             Machine::windows(r"C:\Program Files\Nomadeer").detect(),
             InstallKind::WindowsPortable
         );
+    }
+
+    #[test]
+    fn setup_registration_follows_the_installer_scripts_app_id() {
+        // Inno writes "{{" for a literal "{" and registers "<AppId>_is1".
+        let script = include_str!("../packaging/windows/nomadeer.iss");
+        assert!(script.contains(&format!("\nAppId={{{WINDOWS_APP_ID}\n")));
     }
 
     #[test]
@@ -1199,6 +1405,17 @@ mod tests {
             )
             .var("APPDIR", "/tmp/.mount_NomadXY");
         assert_eq!(appimage.detect(), InstallKind::AppImage);
+        // APPDIR keeps a link on the way to TMPDIR; the executable's path does not.
+        let linked_tmp = Machine::linux(
+            "/var/home/pilot/tmp/appimage_extracted_ab12/usr/lib/nomadeer/nomadeer-optimized",
+        )
+        .var(
+            "APPIMAGE",
+            "/home/pilot/Apps/Nomadeer-0.1.0-x86_64.AppImage",
+        )
+        .var("APPDIR", "/home/pilot/tmp/appimage_extracted_ab12")
+        .link("/home", "/var/home");
+        assert_eq!(linked_tmp.detect(), InstallKind::AppImage);
         // Started from a terminal that itself runs inside some other AppImage.
         let inherited = Machine::linux("/home/pilot/nomadeer/nomadeer")
             .var("APPIMAGE", "/home/pilot/Apps/Terminal.AppImage")
@@ -1293,6 +1510,34 @@ mod tests {
         assert_eq!(state.retry_at, None);
         assert_eq!(state.rate_limited_until, None);
         assert_eq!(state.last_checked_at, Some(until));
+    }
+
+    #[test]
+    fn waits_set_while_the_clock_ran_ahead_do_not_stop_checks() {
+        // A failure and a rate limit while the clock read a year ahead...
+        let ahead = NOW + 365 * DAY_SECS;
+        let mut state = UpdateState::default();
+        state.apply(
+            CheckOutcome::Failed {
+                error: "certificate not valid yet".to_owned(),
+            },
+            ahead,
+        );
+        state.apply(
+            CheckOutcome::RateLimited {
+                until: ahead + CHECK_INTERVAL_SECS,
+            },
+            ahead,
+        );
+        // ...are ignored once it is set right.
+        assert_eq!(state.rate_limit_wait(NOW), None);
+        assert!(state.automatic_check_due(NOW));
+        // Waits of the longest kind Nomadeer sets still hold.
+        state.retry_at = Some(NOW + RETRY_AFTER_FAILURE_SECS);
+        state.rate_limited_until = Some(NOW + CHECK_INTERVAL_SECS);
+        assert_eq!(state.rate_limit_wait(NOW), Some(CHECK_INTERVAL_SECS));
+        state.rate_limited_until = None;
+        assert!(!state.automatic_check_due(NOW));
     }
 
     #[test]

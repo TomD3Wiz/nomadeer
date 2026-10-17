@@ -5,9 +5,11 @@
         Moves CHANGELOG.md's "## [Unreleased]" notes into a dated
         "## [VERSION]" section (leaving an empty Unreleased section above it),
         sets the version in Cargo.toml and Cargo.lock and adds a <release> to
-        the top of the AppStream metainfo. Refuses a version that is not
-        semver, not newer than the current one, already present anywhere, or
-        that has no Unreleased notes to release.
+        the top of the AppStream metainfo (a pre-release as a development
+        release, which the final release then replaces there). Refuses a
+        version that is not semver, not newer than the current one, already
+        present anywhere, or that has no Unreleased notes to release. If
+        anything fails, every file is left as it was.
 
     release.py notes [VERSION] [--downloads]
         Prints VERSION's changelog section (default: Cargo.toml's version).
@@ -60,6 +62,9 @@ CARGO_VERSION = re.compile(r'^(\[package\]\n(?:(?!\[)[^\n]*\n)*?version = ")([^"
 LOCK_VERSION = re.compile(r'^(\[\[package\]\]\nname = "nomadeer"\nversion = ")([^"]+)(")', re.M)
 METAINFO_RELEASES = re.compile(r"^([ \t]*)<releases>[ \t]*\n", re.M)
 METAINFO_RELEASE = re.compile(r'<release\s+version="([^"]+)"(?:\s+date="([^"]*)")?')
+METAINFO_RELEASE_ELEMENT = re.compile(
+    r'^[ \t]*<release\s+version="([^"]+)"[^>]*?(?:/>|>.*?</release>)[ \t]*\n', re.M | re.S
+)
 
 
 class ReleaseError(Exception):
@@ -257,14 +262,29 @@ def metainfo_releases(text: str) -> list[tuple[str, str | None]]:
 
 
 def bump_metainfo(text: str, version: str, date: str, notes: str) -> str:
+    """Adds `version` as the newest <release>. A pre-release is marked as a
+    development release, and the final release replaces its pre-releases, so
+    software centres never list one as stable or above the final version."""
     if any(v == version for v, _ in metainfo_releases(text)):
         raise ReleaseError(f"the metainfo already has a <release> for {version}")
+    parsed = parse_version(version)
+    if parsed[3] is None:
+
+        def drop_own_prerelease(match: re.Match) -> str:
+            try:
+                other = parse_version(match.group(1))
+            except ReleaseError:
+                return match.group(0)
+            return "" if other[:3] == parsed[:3] and other[3] is not None else match.group(0)
+
+        text = METAINFO_RELEASE_ELEMENT.sub(drop_own_prerelease, text)
     match = METAINFO_RELEASES.search(text)
     if not match:
         raise ReleaseError("the metainfo has no <releases> element")
     indent = match.group(1) + "  "
+    kind = ' type="development"' if parsed[3] is not None else ""
     release = (
-        f'{indent}<release version="{version}" date="{date}">\n'
+        f'{indent}<release version="{version}" date="{date}"{kind}>\n'
         f'{indent}  <url type="details">{REPO_URL}/releases/tag/v{version}</url>\n'
         f"{appstream_description(notes, indent + '  ')}\n"
         f"{indent}</release>\n"
@@ -296,33 +316,64 @@ def bump(version: str, date: str) -> None:
     new_toml = CARGO_VERSION.sub(lambda m: m.group(1) + version + m.group(3), cargo_toml, 1)
     new_lock = LOCK_VERSION.sub(lambda m: m.group(1) + version + m.group(3), cargo_lock, 1)
 
-    CHANGELOG.write_text(new_changelog)
-    METAINFO.write_text(new_metainfo)
-    CARGO_TOML.write_text(new_toml)
-    CARGO_LOCK.write_text(new_lock)
-    check(version, None)
-
-    # Cargo would rewrite Cargo.lock if the edit above left it inconsistent.
-    cargo = os.environ.get("CARGO", "cargo")
+    originals = {
+        CHANGELOG: changelog,
+        METAINFO: metainfo,
+        CARGO_TOML: cargo_toml,
+        CARGO_LOCK: cargo_lock,
+    }
+    updated = {
+        CHANGELOG: new_changelog,
+        METAINFO: new_metainfo,
+        CARGO_TOML: new_toml,
+        CARGO_LOCK: new_lock,
+    }
     try:
-        result = subprocess.run(
-            [cargo, "metadata", "--format-version", "1", "--offline", "--locked"],
-            cwd=ROOT,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except FileNotFoundError:
-        print("note: cargo not found, Cargo.lock was not checked by cargo", file=sys.stderr)
-    else:
-        if result.returncode != 0:
-            raise ReleaseError(f"cargo does not accept the updated Cargo.lock:\n{result.stderr}")
+        for path, text in updated.items():
+            path.write_text(text)
+        check(version, None)
+        check_lockfile()
+    except BaseException:
+        # Put every file back so the bump can simply be run again.
+        for path, text in originals.items():
+            path.write_text(text)
+        raise
 
     print(f"Bumped Nomadeer {old} -> {version} ({date}).")
     files = " ".join(str(p.relative_to(ROOT)) for p in (CHANGELOG, CARGO_TOML, CARGO_LOCK, METAINFO))
     print("Review the changes, commit them, then tag the commit:")
     print(f'  git commit -m "Release {version}" {files}')
     print(f'  git tag -a v{version} -m "Nomadeer {version}"')
+
+
+def check_lockfile() -> None:
+    """Fails if cargo would rewrite Cargo.lock, which `--locked` refuses.
+    Offline first, from the local registry cache; cargo needs the registry
+    only to resolve, so a cache without it is retried online, and a cargo that
+    cannot resolve at all is only noted."""
+    cargo = os.environ.get("CARGO", "cargo")
+    stderr = ""
+    for offline in (["--offline"], []):
+        try:
+            result = subprocess.run(
+                [cargo, "metadata", "--format-version", "1", "--locked", *offline],
+                cwd=ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            print("note: cargo not found, Cargo.lock was not checked by cargo", file=sys.stderr)
+            return
+        if result.returncode == 0:
+            return
+        stderr = result.stderr
+        if "--locked" in stderr:
+            raise ReleaseError(f"cargo does not accept the updated Cargo.lock:\n{stderr}")
+    print(
+        f"note: cargo could not resolve the dependencies, so it did not check Cargo.lock:\n{stderr}",
+        file=sys.stderr,
+    )
 
 
 def notes(version: str, downloads: bool) -> None:

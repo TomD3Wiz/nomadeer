@@ -748,18 +748,7 @@ pub(crate) fn relaunch_appimage(path: &Path) -> Result<(), String> {
     // stays mounted (and its replaced file on disk) while the new one runs.
     #[cfg(target_os = "linux")]
     keep_descriptors_from_children();
-    let mut command = std::process::Command::new(path);
-    // The AppImage runtime sets these for what it starts; the new one sets its own.
-    for name in ["APPIMAGE", "APPDIR", "ARGV0", "OWD"] {
-        command.env_remove(name);
-    }
-    // Where the player first started Nomadeer from.
-    if let Some(dir) = std::env::var_os("OWD")
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_dir())
-    {
-        command.current_dir(dir);
-    }
+    let mut command = appimage_command(path, &|name| std::env::var_os(name));
     command.stdin(std::process::Stdio::null());
     #[cfg(unix)]
     {
@@ -768,6 +757,37 @@ pub(crate) fn relaunch_appimage(path: &Path) -> Result<(), String> {
         command.process_group(0);
     }
     command.spawn().map(drop).map_err(|error| error.to_string())
+}
+
+/// The command that starts the new AppImage, given this copy's environment.
+fn appimage_command(
+    path: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(path);
+    // The AppImage runtime sets these for what it starts; the new one sets its own.
+    for name in ["APPIMAGE", "APPDIR", "ARGV0", "OWD"] {
+        command.env_remove(name);
+    }
+    // A copy started with --appimage-extract-and-run, where FUSE is missing,
+    // would leave the new one unable to start: the runtime keeps the flag to
+    // itself, so pass it on the way the runtime also reads it.
+    if runs_extracted(env("APPDIR").as_deref()) {
+        command.env("APPIMAGE_EXTRACT_AND_RUN", "1");
+    }
+    // Where the player first started Nomadeer from.
+    if let Some(dir) = env("OWD").map(PathBuf::from).filter(|dir| dir.is_dir()) {
+        command.current_dir(dir);
+    }
+    command
+}
+
+/// Whether this copy runs from the folder the AppImage runtime extracts to
+/// instead of mounting the image.
+fn runs_extracted(appdir: Option<&std::ffi::OsStr>) -> bool {
+    appdir
+        .and_then(|dir| Path::new(dir).file_name())
+        .is_some_and(|name| name.to_string_lossy().starts_with("appimage_extracted_"))
 }
 
 /// The AppImage runtime leaves two descriptors open for everything the app
@@ -1230,6 +1250,51 @@ mod tests {
             let mode = fs::metadata(&appimage).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o750);
         }
+    }
+
+    #[test]
+    fn the_new_appimage_runs_the_way_this_copy_did() {
+        use std::collections::HashMap;
+        use std::ffi::{OsStr, OsString};
+
+        let started = |vars: &[(&str, &str)]| {
+            let vars: HashMap<String, OsString> = vars
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
+                .collect();
+            let command = appimage_command(
+                Path::new("/home/pilot/Apps/Nomadeer-0.1.0-x86_64.AppImage"),
+                &|name| vars.get(name).cloned(),
+            );
+            command
+                .get_envs()
+                .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+                .collect::<HashMap<OsString, Option<OsString>>>()
+        };
+        let extract = OsString::from("APPIMAGE_EXTRACT_AND_RUN");
+
+        // Started with --appimage-extract-and-run: the runtime extracted it.
+        let extracted = started(&[
+            (
+                "APPIMAGE",
+                "/home/pilot/Apps/Nomadeer-0.1.0-x86_64.AppImage",
+            ),
+            ("APPDIR", "/tmp/appimage_extracted_0123456789abcdef"),
+        ]);
+        assert_eq!(extracted.get(&extract), Some(&Some(OsString::from("1"))));
+        for name in ["APPIMAGE", "APPDIR", "ARGV0", "OWD"] {
+            assert_eq!(extracted.get(OsStr::new(name)), Some(&None), "{name}");
+        }
+
+        // Mounted with FUSE: the new copy mounts too.
+        let mounted = started(&[
+            (
+                "APPIMAGE",
+                "/home/pilot/Apps/Nomadeer-0.1.0-x86_64.AppImage",
+            ),
+            ("APPDIR", "/tmp/.mount_NomadeXY"),
+        ]);
+        assert_eq!(mounted.get(&extract), None);
     }
 
     #[cfg(target_os = "linux")]
