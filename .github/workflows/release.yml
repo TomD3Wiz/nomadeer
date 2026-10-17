@@ -77,9 +77,89 @@ jobs:
             dist/${{ steps.package.outputs.name }}.tar.gz
             dist/${{ steps.package.outputs.name }}.tar.gz.sha256
 
+  windows-build:
+    name: Build Windows ${{ matrix.variant }}
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          # AVX2/FMA build: Umbra briefings run about 3x faster.
+          - variant: optimized
+            rustflags: "-C target-cpu=x86-64-v3"
+          # Baseline x86-64 build for CPUs without AVX2.
+          - variant: compatible
+            rustflags: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.variant }}
+          workspaces: ". -> target/${{ matrix.variant }}"
+
+      - name: Build release binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --target-dir target/${{ matrix.variant }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe-${{ matrix.variant }}
+          path: target/${{ matrix.variant }}/release/nomadeer.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-package:
+    name: Package Windows installer
+    needs: windows-build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-exe-*
+          path: target/windows
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = @("$env:ProgramFiles\Inno Setup 6\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and -not ($iscc | Where-Object { Test-Path $_ })) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build installer and portable zip
+        id: package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          ./packaging/windows/package.ps1 -Version $version `
+            -OptimizedExe target/windows/windows-exe-optimized/nomadeer.exe `
+            -CompatibleExe target/windows/windows-exe-compatible/nomadeer.exe `
+            -OutDir dist
+          "name=nomadeer-$version-windows-x86_64" >> $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub release
-    needs: build
+    needs: [build, windows-package]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -90,6 +170,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          # Release files only, not the intermediate Windows binaries.
+          pattern: nomadeer-*
           merge-multiple: true
 
       - name: Create release
