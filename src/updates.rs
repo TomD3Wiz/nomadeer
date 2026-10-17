@@ -682,12 +682,16 @@ pub(crate) enum CheckOutcome {
 /// The latest-release URL: GitHub's, unless NOMADEER_UPDATE_API names another
 /// server for testing.
 pub(crate) fn latest_release_url() -> String {
-    let base = std::env::var(API_OVERRIDE_VAR)
+    let base = test_server().unwrap_or_else(|| GITHUB_API.to_owned());
+    format!("{base}{LATEST_RELEASE_PATH}")
+}
+
+/// The stand-in server NOMADEER_UPDATE_API names, without a trailing `/`.
+pub(crate) fn test_server() -> Option<String> {
+    std::env::var(API_OVERRIDE_VAR)
         .ok()
         .map(|base| base.trim().trim_end_matches('/').to_owned())
         .filter(|base| base.starts_with("http://") || base.starts_with("https://"))
-        .unwrap_or_else(|| GITHUB_API.to_owned());
-    format!("{base}{LATEST_RELEASE_PATH}")
 }
 
 /// Asks `url` for the latest release. Never panics; every problem is an outcome.

@@ -54,7 +54,9 @@ systems you pass through.
   right one for you.
 - Update checks: Nomadeer looks on GitHub once a day for a new release and
   tells you when one is out. Nothing is installed until you press **Update**,
-  and the check can be turned off in settings.
+  and the check can be turned off in settings. The Windows installer and the
+  AppImage then update themselves: the download is checked against its
+  published checksum, installed and Nomadeer restarts, keeping your data.
 
 [Unreleased]: https://github.com/TomD3Wiz/nomadeer/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/TomD3Wiz/nomadeer/releases/tag/v0.1.0

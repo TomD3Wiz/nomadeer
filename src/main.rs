@@ -17,6 +17,7 @@ mod paths;
 mod portrait;
 mod probe_scan;
 mod recon;
+mod self_update;
 mod signatures;
 mod store;
 mod updates;

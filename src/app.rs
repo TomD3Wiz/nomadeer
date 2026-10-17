@@ -3571,6 +3571,7 @@ impl eframe::App for NomadeerApp {
         self.maybe_expire_live_intel();
         self.maybe_start_auto_briefing();
         self.poll_update_check();
+        self.poll_update_install(ctx);
         self.maybe_check_for_updates();
         self.handle_paste(ctx);
         self.top_bar(ctx);
