@@ -45,7 +45,7 @@ run:
 
 release: release-optimized release-compatible
 
-# AVX2/FMA build (x86-64-v3). Umbra briefings run about 3x faster than the
+# AVX2/FMA build (x86-64-v3). Umbra briefings run 2-3x faster than the
 # compatible build, but the binary will not start on CPUs without AVX2.
 release-optimized:
 	RUSTFLAGS="-C target-cpu=x86-64-v3" $(CARGO) build --release --target-dir $(OPTIMIZED_TARGET_DIR)

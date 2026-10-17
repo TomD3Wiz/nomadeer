@@ -8,7 +8,7 @@ Which one to run
 ----------------
 
   Nomadeer.exe              Optimized edition for processors with AVX2 (most
-                            PCs from 2015 onwards). Umbra briefings run about
+                            PCs from 2015 onwards). Umbra briefings run two to
                             three times faster.
 
   Nomadeer-compatible.exe   Compatible edition for older processors. Use this
