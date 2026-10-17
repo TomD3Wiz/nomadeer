@@ -12,8 +12,11 @@ use std::time::{Duration, Instant};
 /// the system as it is now.
 pub(crate) const ASSESSMENT_STALE_SECS: u64 = HOUR_SECS;
 /// Systems waiting for a refresh; beyond this the oldest arrivals are dropped, as the
-/// characters have long moved on from them.
+/// characters have long moved on from them. The player's own requests are never dropped.
 const MAX_WAITING: usize = 8;
+/// Briefings Umbra still owes; beyond this the oldest requests are dropped, so she does
+/// not spend long after a roam briefing systems the characters left behind.
+const MAX_PENDING_BRIEFINGS: usize = 8;
 /// Pause between queued refreshes, on top of the killboard's own paging delay.
 const QUEUE_GAP: Duration = Duration::from_secs(2);
 /// An arrival this soon after a refresh finished does not fetch the system again.
@@ -23,15 +26,18 @@ pub(crate) fn assessment_is_stale(generated_at: u64, current_time: u64) -> bool 
     current_time.saturating_sub(generated_at) > ASSESSMENT_STALE_SECS
 }
 
-/// Whether a location update brings a character into a system: a jump, the first fix
-/// on the character this session, or a system that was not on the map before.
+/// Whether a location update brings a character into a system: a jump (including one
+/// made while Nomadeer was closed) or a system that was not on the map before. A
+/// character found this session where they were last seen has not arrived anywhere,
+/// unless that is the system on screen, as the player opens Nomadeer to see it.
 pub(crate) fn is_arrival(
     previous_system_id: &str,
     system_id: &str,
     first_fix_this_session: bool,
     node_created: bool,
+    on_screen: bool,
 ) -> bool {
-    node_created || first_fix_this_session || previous_system_id != system_id
+    node_created || previous_system_id != system_id || (first_fix_this_session && on_screen)
 }
 
 /// Whether an arrival should gather intel: the system has never been assessed, or
@@ -107,7 +113,16 @@ impl IntelQueue {
                 .count(),
         };
         self.waiting.insert(position, (solar_system_id, request));
-        self.waiting.truncate(MAX_WAITING);
+        while self.waiting.len() > MAX_WAITING {
+            let Some(oldest_arrival) = self
+                .waiting
+                .iter()
+                .rposition(|(_, request)| *request == IntelRequest::Arrival)
+            else {
+                break;
+            };
+            self.waiting.remove(oldest_arrival);
+        }
         self.place(solar_system_id).is_some()
     }
 
@@ -142,6 +157,12 @@ impl IntelQueue {
         done
     }
 
+    /// Lets the next arrival in the system gather intel again, e.g. when the last
+    /// refresh found the system gone from the map and could not be kept.
+    pub(crate) fn forget_refresh(&mut self, solar_system_id: u64) {
+        self.finished_at.remove(&solar_system_id);
+    }
+
     /// Forgets waiting arrivals, e.g. once the player stops intel on arrival. The
     /// player's own requests stay.
     pub(crate) fn drop_arrivals(&mut self) {
@@ -165,7 +186,8 @@ impl IntelQueue {
     }
 }
 
-/// Briefings Umbra writes on her own once fresh intel is in, at most one per system.
+/// Briefings Umbra writes on her own once fresh intel is in, at most one per system
+/// and only the newest few.
 #[derive(Debug, Default)]
 pub(crate) struct AutoBriefings {
     pending: Vec<PendingBriefing>,
@@ -189,6 +211,16 @@ impl AutoBriefings {
             source,
             order: self.requests,
         });
+        if self.pending.len() > MAX_PENDING_BRIEFINGS
+            && let Some(oldest) = self
+                .pending
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, pending)| pending.order)
+                .map(|(index, _)| index)
+        {
+            self.pending.swap_remove(oldest);
+        }
     }
 
     /// The assessment to brief next: the selected system first, then the newest
@@ -264,13 +296,17 @@ mod tests {
     }
 
     #[test]
-    fn arrivals_are_jumps_first_fixes_and_new_systems() {
-        assert!(is_arrival("", "sys_a", false, false));
-        assert!(is_arrival("sys_a", "sys_b", false, false));
-        assert!(is_arrival("sys_a", "sys_a", true, false));
-        assert!(is_arrival("sys_a", "sys_a", false, true));
+    fn arrivals_are_jumps_and_new_systems() {
+        assert!(is_arrival("", "sys_a", false, false, false));
+        assert!(is_arrival("sys_a", "sys_b", false, false, false));
+        // A jump made while Nomadeer was closed counts on the first fix.
+        assert!(is_arrival("sys_a", "sys_b", true, false, false));
+        assert!(is_arrival("sys_a", "sys_a", false, true, false));
+        // On launch, only the system on screen counts for a character still there.
+        assert!(is_arrival("sys_a", "sys_a", true, false, true));
+        assert!(!is_arrival("sys_a", "sys_a", true, false, false));
         // Sitting in the same system between location polls is not an arrival.
-        assert!(!is_arrival("sys_a", "sys_a", false, false));
+        assert!(!is_arrival("sys_a", "sys_a", false, false, true));
     }
 
     #[test]
@@ -368,6 +404,31 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_that_was_not_kept_does_not_hold_back_the_next_arrival() {
+        let start = Instant::now();
+        let mut queue = IntelQueue::default();
+        queue.push(1, IntelRequest::Arrival, start);
+        queue.start_next(start, mapped);
+        queue.finish(start);
+        queue.forget_refresh(1);
+        assert!(queue.push(1, IntelRequest::Arrival, start + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_full_queue_never_drops_the_players_requests() {
+        let start = Instant::now();
+        let mut queue = IntelQueue::default();
+        queue.push(100, IntelRequest::Arrival, start);
+        for solar_system_id in 1..=9 {
+            assert!(queue.push(solar_system_id, IntelRequest::Player, start));
+        }
+        assert_eq!(queue.place(100), None);
+        assert_eq!(queue.place(1), Some(8));
+        assert!(!queue.push(101, IntelRequest::Arrival, start));
+        assert_eq!(drain(&mut queue, start), (1..=9).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
     fn queue_skips_systems_no_longer_mapped_and_drops_old_arrivals() {
         let start = Instant::now();
         let mut queue = IntelQueue::default();
@@ -441,6 +502,26 @@ mod tests {
         assert_eq!((first.system_id.as_str(), first.threat_score), ("a", 40));
         assert_eq!(briefings.next(&current, "").unwrap().system_id, "b");
         assert_eq!(briefings.next(&current, ""), None);
+    }
+
+    #[test]
+    fn auto_briefings_keep_only_the_newest_requests() {
+        let mut briefings = AutoBriefings::default();
+        let assessments: Vec<_> = (0..10)
+            .map(|index| assessment(&format!("sys_{index}"), index))
+            .collect();
+        for assessment in &assessments {
+            briefings.request(assessment.clone());
+        }
+        assert!(!briefings.is_pending("sys_0"));
+        assert!(!briefings.is_pending("sys_1"));
+        assert!((2..10).all(|index| briefings.is_pending(&format!("sys_{index}"))));
+        let current = current(&assessments);
+        let mut briefed = 0;
+        while briefings.next(&current, "").is_some() {
+            briefed += 1;
+        }
+        assert_eq!(briefed, 8);
     }
 
     #[test]
