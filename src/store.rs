@@ -4,7 +4,10 @@ use crate::model::{
     TrafficRows, TrafficSample, VisitLog,
 };
 use crate::util::{DAY_SECS, hour_start, now};
-use rusqlite::{Connection as SqliteConnection, OptionalExtension, Row, params, types::Type};
+use rusqlite::{
+    Connection as SqliteConnection, OptionalExtension, Row, TransactionBehavior, params,
+    types::Type,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,7 +59,7 @@ impl Store {
     /// stored through their own methods and are left untouched.
     pub(crate) fn save(&self, data: &AppData) -> Result<(), String> {
         let mut conn = self.open()?;
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         tx.execute_batch(
             "DELETE FROM app_settings;
@@ -327,7 +330,7 @@ impl Store {
         current_time: u64,
     ) -> Result<(), String> {
         let mut conn = self.open()?;
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let tx = Self::write_transaction(&mut conn)?;
         {
             let mut stmt = tx
                 .prepare_cached(
@@ -381,7 +384,7 @@ impl Store {
         current_time: u64,
     ) -> Result<(), String> {
         let mut conn = self.open()?;
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let tx = Self::write_transaction(&mut conn)?;
         let (time_column, reset_sql) = match traffic.rows {
             TrafficRows::Jumps(_) => (
                 "jumps_data_time",
@@ -592,6 +595,13 @@ impl Store {
         )
         .map(|_| ())
         .map_err(|error| error.to_string())
+    }
+
+    /// Takes the write lock up front, where the busy timeout applies. A deferred
+    /// transaction that reads first cannot wait for another writer when it upgrades.
+    fn write_transaction(conn: &mut SqliteConnection) -> Result<rusqlite::Transaction<'_>, String> {
+        conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())
     }
 
     fn open(&self) -> Result<SqliteConnection, String> {
@@ -1316,6 +1326,41 @@ mod tests {
         assert_eq!(one.samples[0].jumps, Some(15));
         assert_eq!(two.samples[0].jumps, Some(0));
         assert_eq!(one.latest_jumps.unwrap().data_time, newer.data_time);
+    }
+
+    #[test]
+    fn traffic_capture_waits_for_another_writer() {
+        let db = TestDb::new("traffic-busy");
+        let store = db.store();
+        let hour = NOW / HOUR * HOUR;
+        store
+            .record_traffic_hour(&jumps(hour, &[(1, 10)]), NOW)
+            .unwrap();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let path = db.path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut conn = SqliteConnection::open(path).unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE traffic_hours SET jumps_data_time = jumps_data_time",
+                [],
+            )
+            .unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            tx.commit().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        store
+            .record_traffic_hour(&kills(hour, &[(1, 2)]), NOW)
+            .unwrap();
+        writer.join().unwrap();
+
+        let history = store.system_traffic(1, hour).unwrap();
+        assert_eq!(history.samples[0].kills.unwrap().ship_kills, 2);
     }
 
     #[test]
