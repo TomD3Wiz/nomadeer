@@ -8,14 +8,18 @@ use crate::model::{SystemAssessment, SystemNode, UmbraBriefing};
 use crate::util::now;
 use crate::widgets::pill;
 use eframe::egui::{self, Sense, Stroke, Vec2};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-/// Her portrait, square, at least 128 px a side. Larger art is scaled down on load.
+/// Her portrait: Aura's hologram half taken by Sleeper circuitry, rendered by
+/// assets/umbra/render_avatar.py. Square; larger art is scaled down on load.
 const AVATAR_PNG: &[u8] = include_bytes!("../../assets/umbra/umbra-avatar.png");
 /// She is never drawn larger than 96 points, so twice that covers high-DPI screens.
 const AVATAR_TEXTURE_SIZE: u32 = 192;
 const HEADER_AVATAR_SIZE: f32 = 96.0;
 const MESSAGE_AVATAR_SIZE: f32 = 30.0;
+/// Room the feed always gets, about two briefings; on a short window her tab scrolls
+/// to reach it instead of squeezing it away.
+const MIN_FEED_HEIGHT: f32 = 240.0;
 /// Briefings kept on screen; the feed itself holds more until they age out.
 pub(super) const FEED_SHOWN: usize = 200;
 const QUIET_NOTE: &str = "Public killmails may be delayed or absent; quiet never means safe.";
@@ -128,6 +132,38 @@ pub(super) fn push_feed_entry(feed: &mut Vec<UmbraBriefing>, entry: UmbraBriefin
         feed.drain(..excess);
     }
     true
+}
+
+/// Finds where a feed entry's system sits on the chain map now.
+pub(super) struct ChainLookup<'a> {
+    by_solar_system: HashMap<u64, &'a str>,
+    by_id: HashSet<&'a str>,
+}
+
+impl<'a> ChainLookup<'a> {
+    pub(super) fn new(systems: &'a [SystemNode]) -> Self {
+        let mut by_solar_system = HashMap::new();
+        for system in systems.iter().filter(|system| system.solar_system_id != 0) {
+            by_solar_system
+                .entry(system.solar_system_id)
+                .or_insert(system.id.as_str());
+        }
+        Self {
+            by_solar_system,
+            by_id: systems.iter().map(|system| system.id.as_str()).collect(),
+        }
+    }
+
+    /// The map node for the entry's solar system, wherever it sits on the map now; the
+    /// node she briefed when the solar system is not known.
+    pub(super) fn target(&self, entry: &UmbraBriefing) -> Option<&'a str> {
+        if entry.solar_system_id != 0
+            && let Some(id) = self.by_solar_system.get(&entry.solar_system_id)
+        {
+            return Some(id);
+        }
+        self.by_id.get(entry.system_id.as_str()).copied()
+    }
 }
 
 /// "14:32 EVE · 5m ago".
@@ -340,7 +376,11 @@ impl NomadeerApp {
     pub(super) fn load_umbra_feed(&mut self) {
         match self.store.umbra_briefings(FEED_SHOWN) {
             Ok(feed) => self.umbra_feed = feed,
-            Err(error) => self.status = format!("Could not load Umbra's briefings: {error}"),
+            Err(error) => {
+                let message = format!("Umbra's earlier briefings could not be recalled: {error}");
+                self.status = message.clone();
+                self.note_umbra(None, message, true);
+            }
         }
     }
 
@@ -357,15 +397,28 @@ impl NomadeerApp {
     /// Her own tab: who she is, what she is doing, and every briefing she has written.
     pub(super) fn umbra_tab(&mut self, ui: &mut egui::Ui) {
         let avatar = self.umbra_avatar(ui.ctx());
-        self.umbra_header(ui, avatar.as_ref());
-        ui.separator();
+        let viewport_height = ui.available_height();
+        egui::ScrollArea::vertical()
+            .id_salt("umbra_tab")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let header_top = ui.cursor().top();
+                self.umbra_header(ui, avatar.as_ref());
+                ui.separator();
+                let header_height = ui.cursor().top() - header_top;
+                let feed_height = (viewport_height - header_height).max(MIN_FEED_HEIGHT);
+                self.umbra_feed_view(ui, avatar.as_ref(), feed_height);
+            });
+    }
 
-        let mapped = self
-            .data
-            .systems
-            .iter()
-            .map(|system| system.id.as_str())
-            .collect::<HashSet<_>>();
+    /// Her briefings as a chat, newest at the bottom, in exactly `height` points.
+    fn umbra_feed_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        avatar: Option<&egui::TextureHandle>,
+        height: f32,
+    ) {
+        let chain = ChainLookup::new(&self.data.systems);
         let current_time = now();
         let mut clicked_system = None;
         let writing = match &self.umbra_task {
@@ -378,32 +431,34 @@ impl NomadeerApp {
         egui::ScrollArea::vertical()
             .id_salt("umbra_feed")
             .auto_shrink([false, false])
+            .max_height(height)
+            .min_scrolled_height(height)
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 if self.umbra_feed.is_empty() && writing.is_none() {
                     ui.horizontal_top(|ui| {
-                        paint_avatar(ui, avatar.as_ref(), MESSAGE_AVATAR_SIZE);
+                        paint_avatar(ui, avatar, MESSAGE_AVATAR_SIZE);
                         ui.add_space(4.0);
                         ui.vertical(|ui| umbra_quote(ui, EMPTY_FEED_LINE));
                     });
                 }
                 for entry in &self.umbra_feed {
                     ui.horizontal_top(|ui| {
-                        paint_avatar(ui, avatar.as_ref(), MESSAGE_AVATAR_SIZE);
+                        paint_avatar(ui, avatar, MESSAGE_AVATAR_SIZE);
                         ui.add_space(4.0);
                         ui.vertical(|ui| {
                             ui.horizontal_wrapped(|ui| {
                                 let name = egui::RichText::new(&entry.system_name)
                                     .strong()
                                     .color(theme::system_text());
-                                if mapped.contains(entry.system_id.as_str()) {
+                                if let Some(target) = chain.target(entry) {
                                     if ui
                                         .add(egui::Label::new(name).sense(Sense::click()))
                                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                                         .on_hover_text("Select on the chain map")
                                         .clicked()
                                     {
-                                        clicked_system = Some(entry.system_id.clone());
+                                        clicked_system = Some(target.to_owned());
                                     }
                                 } else {
                                     ui.label(name).on_hover_text("No longer on the chain map");
@@ -424,7 +479,7 @@ impl NomadeerApp {
                 }
                 if let Some((system_name, waking)) = &writing {
                     ui.horizontal_top(|ui| {
-                        paint_avatar(ui, avatar.as_ref(), MESSAGE_AVATAR_SIZE);
+                        paint_avatar(ui, avatar, MESSAGE_AVATAR_SIZE);
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -516,11 +571,8 @@ impl NomadeerApp {
                 if self.umbra_confirm_clear {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "Forget all {} of Umbra's briefings?",
-                                self.umbra_feed.len()
-                            ))
-                            .color(WARNING_TEXT),
+                            egui::RichText::new("Forget every briefing Umbra has written?")
+                                .color(WARNING_TEXT),
                         );
                         if ui.button("Forget them").clicked() {
                             self.clear_umbra_feed();
@@ -544,7 +596,7 @@ impl NomadeerApp {
     }
 }
 
-/// A compact copy of her words for the sidebar.
+/// Her words for the sidebar, when she wrote them.
 pub(super) fn sidebar_words(assessment: &SystemAssessment) -> Option<&str> {
     (BriefingVoice::of(assessment) == BriefingVoice::Umbra).then_some(assessment.briefing.as_str())
 }
@@ -552,8 +604,9 @@ pub(super) fn sidebar_words(assessment: &SystemAssessment) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AVATAR_PNG, AVATAR_TEXTURE_SIZE, BriefingVoice, FEED_SHOWN, avatar_image, evidence_heading,
-        feed_class_label, feed_entry, message_time, push_feed_entry, sidebar_words,
+        AVATAR_PNG, AVATAR_TEXTURE_SIZE, BriefingVoice, ChainLookup, FEED_SHOWN, avatar_image,
+        evidence_heading, feed_class_label, feed_entry, message_time, push_feed_entry,
+        sidebar_words,
     };
     use crate::model::{SystemAssessment, SystemNode};
     use std::io::Cursor;
@@ -650,6 +703,18 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_avatar_is_her_own_portrait() {
+        let art = image::load_from_memory(AVATAR_PNG).expect("avatar should decode");
+        assert_eq!(art.width(), art.height());
+        assert!(art.width() >= 512);
+        // Not the app icon standing in for her.
+        assert_ne!(
+            AVATAR_PNG,
+            include_bytes!("../../assets/icons/nomadeer-256.png").as_slice()
+        );
+    }
+
+    #[test]
     fn avatars_are_cropped_square_and_scaled_down() {
         assert_eq!(avatar_image(&png(300, 200), 192).unwrap().size, [192, 192]);
         assert_eq!(
@@ -677,6 +742,42 @@ mod tests {
         let missing = feed_entry(None, &briefed, NOW, false);
         assert_eq!(missing.system_name, "Unknown");
         assert!(missing.system_class.is_empty());
+    }
+
+    #[test]
+    fn feed_links_follow_the_solar_system_to_its_current_node() {
+        let briefed = assessment(true, "Threat is Elevated after 3 kills.");
+        let mut legacy = node(31_002_238, "J123456", -1.0);
+        legacy.id = "sys_1700000000_3".to_owned();
+        let entry = feed_entry(Some(&legacy), &briefed, NOW, true);
+
+        // Still on the map under the id she briefed.
+        let systems = vec![legacy.clone()];
+        assert_eq!(
+            ChainLookup::new(&systems).target(&entry),
+            Some("sys_1700000000_3")
+        );
+
+        // Cleared from the chain and flown back into: the same system, a new node.
+        let mut readded = node(31_002_238, "J123456", -1.0);
+        readded.id = "esi_sys_31002238".to_owned();
+        let systems = vec![readded];
+        assert_eq!(
+            ChainLookup::new(&systems).target(&entry),
+            Some("esi_sys_31002238")
+        );
+
+        // Gone from the map altogether.
+        assert_eq!(ChainLookup::new(&[]).target(&entry), None);
+
+        // A system whose solar system she never knew is found by the node she briefed.
+        let unknown = feed_entry(None, &briefed, NOW, false);
+        let mut manual = node(0, "Home", -1.0);
+        manual.id = "sys_a".to_owned();
+        let mut other = node(0, "Static", -1.0);
+        other.id = "sys_b".to_owned();
+        let systems = vec![other, manual];
+        assert_eq!(ChainLookup::new(&systems).target(&unknown), Some("sys_a"));
     }
 
     #[test]
