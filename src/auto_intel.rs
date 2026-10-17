@@ -39,7 +39,7 @@ pub(crate) enum Presence {
 pub(crate) struct LocationFix<'a> {
     pub(crate) previous_system_id: &'a str,
     pub(crate) system_id: &'a str,
-    /// The character's first location since Nomadeer started.
+    /// The character's first location since Nomadeer started, or since they logged in.
     pub(crate) first_fix_this_session: bool,
     /// The system was not on the map before.
     pub(crate) node_created: bool,
@@ -51,9 +51,10 @@ pub(crate) struct LocationFix<'a> {
 /// never arrive anywhere as far as intel goes, and an offline pilot cannot move.
 ///
 /// A jump (including one made while Nomadeer was closed) or a system new to the map is
-/// an arrival. So is an online pilot's system when Nomadeer starts, as that is where
-/// they are flying now. Without online status, a pilot found where they were last seen
-/// only counts for the system on screen, as the player opens Nomadeer to see it.
+/// an arrival. So is an online pilot's system when Nomadeer starts or they log in, as
+/// that is where they are flying now. Without online status, a pilot found where they
+/// were last seen only counts for the system on screen, as the player opens Nomadeer to
+/// see it.
 pub(crate) fn is_arrival(recon: bool, presence: Presence, fix: &LocationFix<'_>) -> bool {
     let moved = fix.node_created || fix.previous_system_id != fix.system_id;
     recon
@@ -64,9 +65,10 @@ pub(crate) fn is_arrival(recon: bool, presence: Presence, fix: &LocationFix<'_>)
         }
 }
 
-/// Whether a recon pilot logging in arrives in the system they logged off in.
-pub(crate) fn is_login_arrival(recon: bool, was_online: Option<bool>, online: bool) -> bool {
-    recon && online && was_online == Some(false)
+/// Whether a character has just logged in. The first answer of the session is judged
+/// by the launch rule instead.
+pub(crate) fn logged_in(was_online: Option<bool>, online: bool) -> bool {
+    online && was_online == Some(false)
 }
 
 /// Whether an arrival should gather intel: the system has never been assessed, or
@@ -301,7 +303,7 @@ impl AutoBriefings {
 mod tests {
     use super::{
         ASSESSMENT_STALE_SECS, AutoBriefings, IntelQueue, IntelRequest, LocationFix, Presence,
-        is_arrival, is_login_arrival, wants_intel_on_arrival,
+        is_arrival, logged_in, wants_intel_on_arrival,
     };
     use crate::model::SystemAssessment;
     use std::collections::HashMap;
@@ -396,13 +398,13 @@ mod tests {
     }
 
     #[test]
-    fn recon_pilots_logging_in_arrive() {
-        assert!(is_login_arrival(true, Some(false), true));
-        assert!(!is_login_arrival(false, Some(false), true));
+    fn logging_in_needs_a_known_logoff() {
+        assert!(logged_in(Some(false), true));
         // The first answer of the session is judged by the launch rule instead.
-        assert!(!is_login_arrival(true, None, true));
-        assert!(!is_login_arrival(true, Some(true), true));
-        assert!(!is_login_arrival(true, Some(true), false));
+        assert!(!logged_in(None, true));
+        assert!(!logged_in(Some(true), true));
+        assert!(!logged_in(Some(true), false));
+        assert!(!logged_in(Some(false), false));
     }
 
     #[test]

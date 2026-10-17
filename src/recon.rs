@@ -133,12 +133,10 @@ impl OnlinePolls {
         &mut self,
         account_id: &str,
         online: bool,
-        expires_at: u64,
-        current_time: u64,
+        cache_lifetime: Duration,
         at: Instant,
     ) -> Option<bool> {
-        let wait =
-            Duration::from_secs(expires_at.saturating_sub(current_time)).max(MIN_ONLINE_POLL);
+        let wait = cache_lifetime.max(MIN_ONLINE_POLL);
         self.characters
             .insert(
                 account_id.to_owned(),
@@ -181,23 +179,12 @@ impl OnlinePolls {
         }
     }
 
-    /// Whether to poll the character's location. A logged-off character cannot move,
-    /// so after one fix this session they wait until they log in. Until ESI first says
-    /// whether they are logged in, their location waits too, so that fix is judged
-    /// knowing it. Characters without online status are always polled.
-    pub(crate) fn wants_location_poll(
-        &self,
-        account_id: &str,
-        status_available: bool,
-        located_this_session: bool,
-    ) -> bool {
-        if !status_available {
-            return true;
-        }
-        match self.characters.get(account_id) {
-            None => false,
-            Some(state) => !(located_this_session && state.online == Some(false)),
-        }
+    /// Whether to poll the character's location. Until ESI first says whether they are
+    /// logged in, their location waits, so the first fix is judged knowing it. After
+    /// that they are polled whether logged in or not: the status can lag a login by a
+    /// minute or two, and every jump in that time belongs on the map.
+    pub(crate) fn wants_location_poll(&self, account_id: &str, status_available: bool) -> bool {
+        !status_available || self.characters.contains_key(account_id)
     }
 
     /// Starts over for a character, e.g. after they sign in again or are removed.
@@ -219,7 +206,9 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use std::time::{Duration, Instant};
 
-    const NOW: u64 = 1_760_000_000;
+    fn secs(secs: u64) -> Duration {
+        Duration::from_secs(secs)
+    }
 
     fn account(id: &str, last_system_id: &str) -> Account {
         Account {
@@ -359,10 +348,10 @@ mod tests {
         let mut polls = OnlinePolls::default();
         let ids = ["acct_a", "acct_b"];
         assert_eq!(polls.next_due(ids, start), Some("acct_a"));
-        assert_eq!(polls.record("acct_a", true, NOW + 30, NOW, start), None);
+        assert_eq!(polls.record("acct_a", true, secs(30), start), None);
         // Never asked before beats everything else.
         assert_eq!(polls.next_due(ids, start), Some("acct_b"));
-        assert_eq!(polls.record("acct_b", false, NOW + 120, NOW, start), None);
+        assert_eq!(polls.record("acct_b", false, secs(120), start), None);
         assert_eq!(polls.next_due(ids, start), None);
         // ESI's cache lasts 30 s, but polls are at least a minute apart.
         assert_eq!(polls.next_due(ids, start + Duration::from_secs(30)), None);
@@ -379,10 +368,7 @@ mod tests {
             polls.next_due(ids, start + Duration::from_secs(200)),
             Some("acct_a")
         );
-        assert_eq!(
-            polls.record("acct_b", true, NOW + 60, NOW, start),
-            Some(false)
-        );
+        assert_eq!(polls.record("acct_b", true, secs(60), start), Some(false));
         assert_eq!(polls.online("acct_b"), Some(true));
         // Characters whose status is unavailable are never asked about.
         assert_eq!(polls.next_due([], start), None);
@@ -392,7 +378,7 @@ mod tests {
     fn failed_online_polls_back_off_and_leave_status_unknown() {
         let start = Instant::now();
         let mut polls = OnlinePolls::default();
-        polls.record("acct_a", false, NOW, NOW, start);
+        polls.record("acct_a", false, secs(0), start);
         polls.record_failure("acct_a", start);
         assert_eq!(polls.online("acct_a"), None);
         assert_eq!(polls.presence("acct_a", true), Presence::Unknown);
@@ -425,7 +411,7 @@ mod tests {
                 .is_some()
         );
         // Once known again, the status is followed as before.
-        polls.record("acct_a", true, NOW, NOW, start);
+        polls.record("acct_a", true, secs(0), start);
         assert_eq!(polls.presence("acct_a", true), Presence::Online);
     }
 
@@ -434,35 +420,35 @@ mod tests {
         let start = Instant::now();
         let mut polls = OnlinePolls::default();
         assert_eq!(polls.presence("acct_a", true), Presence::Unknown);
-        polls.record("acct_a", true, NOW, NOW, start);
+        polls.record("acct_a", true, secs(0), start);
         assert_eq!(polls.presence("acct_a", true), Presence::Online);
         assert_eq!(polls.presence("acct_a", false), Presence::Unknown);
-        polls.record("acct_a", false, NOW, NOW, start);
+        polls.record("acct_a", false, secs(0), start);
         assert_eq!(polls.presence("acct_a", true), Presence::Offline);
         polls.forget("acct_a");
         assert_eq!(polls.presence("acct_a", true), Presence::Unknown);
     }
 
     #[test]
-    fn offline_characters_are_located_once_then_wait_to_log_in() {
+    fn locations_wait_for_the_first_online_status_only() {
         let start = Instant::now();
         let mut polls = OnlinePolls::default();
         // Without online status, locations are polled as always.
-        assert!(polls.wants_location_poll("acct_a", false, false));
-        assert!(polls.wants_location_poll("acct_a", false, true));
+        assert!(polls.wants_location_poll("acct_a", false));
         // The first location waits for ESI to say whether they are logged in.
-        assert!(!polls.wants_location_poll("acct_a", true, false));
+        assert!(!polls.wants_location_poll("acct_a", true));
 
-        polls.record("acct_a", false, NOW, NOW, start);
-        // One fix at startup, then nothing while logged off.
-        assert!(polls.wants_location_poll("acct_a", true, false));
-        assert!(!polls.wants_location_poll("acct_a", true, true));
+        // Logged off or not, they are polled from then on.
+        polls.record("acct_a", false, secs(0), start);
+        assert!(polls.wants_location_poll("acct_a", true));
+        polls.record("acct_a", true, secs(0), start);
+        assert!(polls.wants_location_poll("acct_a", true));
 
-        polls.record("acct_a", true, NOW, NOW, start);
-        assert!(polls.wants_location_poll("acct_a", true, true));
-
-        // A failed status check falls back to polling.
+        // A failed status check keeps polling too.
         polls.record_failure("acct_a", start);
-        assert!(polls.wants_location_poll("acct_a", true, true));
+        assert!(polls.wants_location_poll("acct_a", true));
+        // Starting over waits for the status again.
+        polls.forget("acct_a");
+        assert!(!polls.wants_location_poll("acct_a", true));
     }
 }
