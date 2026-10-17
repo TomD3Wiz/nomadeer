@@ -379,8 +379,9 @@ impl NomadeerApp {
         .to_owned()
     }
 
-    /// W-space regions and constellations are named by class letter, e.g. "C-R00023"
-    /// for a C3 region; G is Thera and H the C13 shattered systems.
+    /// W-space regions and constellations are named by class letter, e.g. "B-R00008"
+    /// for a C2 region; G is Thera, H the C13 shattered systems and K the Drifter
+    /// systems, which each have their own class.
     fn wormhole_class(system: &SystemNode) -> Option<&'static str> {
         let entered = system.class.trim().to_ascii_uppercase();
         let entered = match entered.as_str() {
@@ -391,10 +392,24 @@ impl NomadeerApp {
             "C5" => Some("C5"),
             "C6" => Some("C6"),
             "C13" => Some("C13"),
+            "C14" => Some("C14"),
+            "C15" => Some("C15"),
+            "C16" => Some("C16"),
+            "C17" => Some("C17"),
+            "C18" => Some("C18"),
             "THERA" => Some("Thera"),
             _ => None,
         };
-        entered.or_else(|| {
+        let by_id = match system.solar_system_id {
+            31_000_001 => Some("C14"),
+            31_000_002 => Some("C15"),
+            31_000_003 => Some("C16"),
+            31_000_004 => Some("C17"),
+            31_000_005 => Some("Thera"),
+            31_000_006 => Some("C18"),
+            _ => None,
+        };
+        entered.or(by_id).or_else(|| {
             [&system.region_name, &system.constellation_name]
                 .into_iter()
                 .find_map(|name| {
@@ -410,6 +425,7 @@ impl NomadeerApp {
                         "F" => "C6",
                         "G" => "Thera",
                         "H" => "C13",
+                        "K" => "Drifter",
                         _ => return None,
                     })
                 })
@@ -3397,11 +3413,33 @@ mod tests {
             "C3"
         );
         assert_eq!(class(&located(31_002_238, "J123456", -0.99, "")), "WH");
+        // J135422 as ESI reports it: region B-R00008, constellation B-C00064.
+        assert_eq!(
+            class(&located(31_000_792, "J135422", -0.99, "B-R00008")),
+            "C2"
+        );
+        let mut constellation_only = located(31_000_792, "J135422", -0.99, "");
+        constellation_only.constellation_name = "B-C00064".to_owned();
+        assert_eq!(class(&constellation_only), "C2");
+        assert_eq!(
+            class(&located(31_000_001, "Sentinel MZ", -0.99, "K-R00033")),
+            "C14"
+        );
+        assert_eq!(
+            class(&located(31_000_006, "Azdaja Redoubt", -0.99, "")),
+            "C18"
+        );
+        assert_eq!(
+            class(&located(31_000_009, "Unlisted", -0.99, "K-R00033")),
+            "Drifter"
+        );
 
         let mut manual = node();
         assert_eq!(class(&manual), "Unknown");
         manual.class = "c5".to_owned();
         assert_eq!(class(&manual), "C5");
+        manual.class = "C16".to_owned();
+        assert_eq!(class(&manual), "C16");
     }
 
     #[test]
