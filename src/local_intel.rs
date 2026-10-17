@@ -307,15 +307,22 @@ fn remove_directory_in(root: &Path, name: &str) -> Result<(), String> {
 /// W-space solar system IDs, Thera included.
 const WORMHOLE_SYSTEM_IDS: RangeInclusive<u64> = 31_000_000..=31_999_999;
 const WORMHOLE_REGION_IDS: RangeInclusive<u64> = 11_000_000..=11_999_999;
-/// ESI publishes traffic hourly; anything older no longer describes the system now.
+/// ESI publishes traffic hourly, for the hour up to its data time. A reading is used for
+/// up to two hours after that, so one missed capture does not blank the assessment, and
+/// its evidence names the hour it covers.
 const TRAFFIC_FRESH_SECS: u64 = 2 * HOUR_SECS;
+/// Readings this close together are described as one hour of traffic.
+const TRAFFIC_SAME_HOUR_SECS: u64 = 10 * 60;
 /// Pads the jump count so a single kill in a quiet system does not read as a gate camp.
 const KILL_RATE_JUMP_PADDING: f32 = 50.0;
 
 struct TrafficBaseline {
     usual_jumps: f32,
+    /// Hours the average was taken over.
     samples: usize,
     same_hour: bool,
+    /// Every earlier hour captured in the window, whichever pool the average used.
+    earlier_samples: usize,
 }
 
 pub(crate) fn assess_system(
@@ -331,16 +338,39 @@ pub(crate) fn assess_system(
     let jumps = traffic
         .latest_jumps
         .filter(|reading| !is_wormhole && is_fresh(reading.data_time));
-    let esi_kills = traffic
+    let esi_kills_reading = traffic
         .latest_kills
-        .filter(|reading| !is_wormhole && is_fresh(reading.data_time))
-        .map(|reading| reading.value);
-    let esi_player_kills =
-        esi_kills.map_or(0, |kills| (kills.ship_kills + kills.pod_kills) as usize);
-    // ESI's ship and pod kills are the same losses zKill reports, so the larger count wins.
-    let kills_1h = history.kills_1h.max(esi_player_kills);
+        .filter(|reading| !is_wormhole && is_fresh(reading.data_time));
+    let esi_kills = esi_kills_reading.map(|reading| reading.value);
+    // ESI counts every ship and pod lost in its hour, to players and NPCs alike. Losses
+    // the killboard lists for that hour are already scored or are NPC kills, so only
+    // the rest are added, at the age of the middle of ESI's hour.
+    let (unlisted_kills, unlisted_in_last_hour) = esi_kills_reading.map_or((0, false), |reading| {
+        let window = reading.data_time.saturating_sub(HOUR_SECS)..=reading.data_time;
+        let listed = history
+            .kill_times_4h
+            .iter()
+            .chain(&history.npc_kill_times_4h)
+            .filter(|time| window.contains(time))
+            .count();
+        let reported = (reading.value.ship_kills + reading.value.pod_kills) as usize;
+        let middle = reading.data_time.saturating_sub(HOUR_SECS / 2);
+        (
+            reported.saturating_sub(listed),
+            current_time.saturating_sub(middle) <= HOUR_SECS,
+        )
+    });
+    let kills_1h = history.kills_1h
+        + if unlisted_in_last_hour {
+            unlisted_kills
+        } else {
+            0
+        };
+    let kills_4h = history.kills_4h + unlisted_kills;
+    let kills_24h = history.kills_24h + unlisted_kills;
+    let kills_7d = history.kills_7d + unlisted_kills;
 
-    let kills_1_to_4 = history.kills_4h.saturating_sub(history.kills_1h);
+    let kills_1_to_4 = kills_4h.saturating_sub(kills_1h);
     let kills_4_to_8 = history.kills_8h.saturating_sub(history.kills_4h);
     let kills_8_to_24 = history.kills_24h.saturating_sub(history.kills_8h);
     let mut threat = kills_1h as f32 * 20.0
@@ -372,8 +402,8 @@ pub(crate) fn assess_system(
         }
         // Without current traffic the killboard is the only sign of pilots in the system.
         None => {
-            history.kills_24h.max(kills_1h) as f32 * 12.0
-                + history.kills_7d as f32 * 1.5
+            kills_24h as f32 * 12.0
+                + kills_7d as f32 * 1.5
                 + history.npc_kills_24h as f32 * 6.0
                 + history.npc_kills_7d as f32 * 0.75
         }
@@ -407,7 +437,7 @@ pub(crate) fn assess_system(
             {
                 "High"
             }
-            (Some(_), Some(baseline)) if baseline.samples >= 4 => "Medium",
+            (Some(_), Some(baseline)) if baseline.earlier_samples >= 4 => "Medium",
             _ => "Low",
         }
     };
@@ -425,24 +455,30 @@ pub(crate) fn assess_system(
     let at_least = |partial: bool| if partial { "At least " } else { "" };
 
     let mut evidence = Vec::new();
-    evidence.push(if history.kills_24h == 0 {
+    evidence.push(if kills_24h == 0 {
         "No kills in the last 24 hours".to_owned()
     } else {
         format!(
             "{}{} in the last hour, {} in the last 4 hours and {} in the last 24 hours",
             at_least(killboard_hours.is_some_and(|hours| hours < 24)),
-            count_label(history.kills_1h, "kill"),
-            history.kills_4h,
-            history.kills_24h
+            count_label(kills_1h, "kill"),
+            kills_4h,
+            kills_24h
         )
     });
-    evidence.push(if history.kills_7d == 0 {
+    if unlisted_kills > 0 {
+        evidence.push(format!(
+            "{} not on the killboard yet",
+            count_label(unlisted_kills, "kill")
+        ));
+    }
+    evidence.push(if kills_7d == 0 {
         "No kills in the last 7 days".to_owned()
     } else {
         format!(
             "{}{} in the last 7 days",
             at_least(killboard_hours.is_some()),
-            count_label(history.kills_7d, "kill")
+            count_label(kills_7d, "kill")
         )
     });
     if let Some(hours) = killboard_hours {
@@ -483,16 +519,35 @@ pub(crate) fn assess_system(
         ));
     }
     if !is_wormhole {
-        let mut traffic_facts = Vec::new();
+        // Each reading is named by the hour it covers, which can end a while back.
+        let mut traffic_hours = Vec::<(u64, Vec<String>)>::new();
         if let Some(jumps) = jumps {
-            traffic_facts.push(count_label(jumps.value as usize, "jump"));
+            traffic_hours.push((
+                jumps.data_time,
+                vec![count_label(jumps.value as usize, "jump")],
+            ));
         }
-        if let Some(kills) = esi_kills {
-            traffic_facts.push(count_label(kills.ship_kills as usize, "ship kill"));
-            traffic_facts.push(count_label(kills.pod_kills as usize, "pod kill"));
+        if let Some(kills) = esi_kills_reading {
+            let facts = [
+                count_label(kills.value.ship_kills as usize, "ship kill"),
+                count_label(kills.value.pod_kills as usize, "pod kill"),
+            ];
+            match traffic_hours.first_mut() {
+                Some((data_time, traffic_facts))
+                    if data_time.abs_diff(kills.data_time) <= TRAFFIC_SAME_HOUR_SECS =>
+                {
+                    *data_time = (*data_time).max(kills.data_time);
+                    traffic_facts.extend(facts);
+                }
+                _ => traffic_hours.push((kills.data_time, facts.to_vec())),
+            }
         }
-        if !traffic_facts.is_empty() {
-            evidence.push(format!("{} in the last hour", join_phrases(&traffic_facts)));
+        for (data_time, traffic_facts) in traffic_hours {
+            evidence.push(format!(
+                "{} in the hour to {} EVE time",
+                join_phrases(&traffic_facts),
+                eve_clock(data_time)
+            ));
         }
         if jumps.is_none() {
             evidence.push("Traffic data for this system is not available yet".to_owned());
@@ -558,6 +613,7 @@ fn traffic_baseline(samples: &[TrafficSample], latest_hour: u64) -> Option<Traff
         .copied()
         .filter(|(hour, _)| hour / HOUR_SECS % 24 == hour_of_day)
         .collect::<Vec<_>>();
+    let earlier_samples = earlier.len();
     let (source, same_hour) = if same_hour.len() >= 2 {
         (same_hour, true)
     } else {
@@ -571,7 +627,14 @@ fn traffic_baseline(samples: &[TrafficSample], latest_hour: u64) -> Option<Traff
             / source.len() as f32,
         samples: source.len(),
         same_hour,
+        earlier_samples,
     })
+}
+
+/// EVE time of day, which is UTC, as "HH:MM".
+fn eve_clock(timestamp: u64) -> String {
+    let seconds = timestamp % DAY_SECS;
+    format!("{:02}:{:02}", seconds / HOUR_SECS, seconds % HOUR_SECS / 60)
 }
 
 fn join_phrases(phrases: &[String]) -> String {
@@ -1122,7 +1185,7 @@ mod tests {
             solar_system_id: 0,
             recent_kills: Vec::new(),
             history,
-            cached_killmails: Vec::new(),
+            fetched_killmails: Vec::new(),
             coverage: KillboardCoverage {
                 solar_system_id: 0,
                 since: 0,
@@ -1135,6 +1198,7 @@ mod tests {
         }
     }
 
+    /// Player kills twenty minutes ago, inside the hour a fresh ESI reading covers.
     fn kills_in_last_hour(kills: usize) -> ZkillHistory {
         ZkillHistory {
             kills_1h: kills,
@@ -1142,6 +1206,7 @@ mod tests {
             kills_8h: kills,
             kills_24h: kills,
             kills_7d: kills,
+            kill_times_4h: vec![NOW - 1_200; kills],
             ..ZkillHistory::default()
         }
     }
@@ -1217,11 +1282,9 @@ mod tests {
             &traffic(2_000, player_kills(0, 0), 600),
             NOW,
         );
-        assert!(
-            assessment
-                .evidence
-                .contains(&"2000 jumps, 0 ship kills and 0 pod kills in the last hour".to_owned())
-        );
+        assert!(assessment.evidence.contains(
+            &"2000 jumps, 0 ship kills and 0 pod kills in the hour to 08:10 EVE time".to_owned()
+        ));
         assert!(assessment.activity_score >= 80);
     }
 
@@ -1251,6 +1314,85 @@ mod tests {
             NOW,
         );
         assert_eq!(unreported.threat_score, 65);
+    }
+
+    #[test]
+    fn esi_kills_the_killboard_places_hours_ago_count_once() {
+        // One kill 80 minutes ago, inside ESI's hour that ended 50 minutes ago.
+        let history = ZkillHistory {
+            kills_4h: 1,
+            kills_8h: 1,
+            kills_24h: 1,
+            kills_7d: 1,
+            kill_times_4h: vec![NOW - 80 * 60],
+            ..ZkillHistory::default()
+        };
+        let assessment = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(history),
+            &traffic(60, player_kills(1, 0), 50 * 60),
+            NOW,
+        );
+        assert_eq!(assessment.threat_score, 12);
+        assert_eq!(
+            assessment.evidence[0],
+            "0 kills in the last hour, 1 in the last 4 hours and 1 in the last 24 hours"
+        );
+        assert!(assessment.evidence.contains(
+            &"60 jumps, 1 ship kill and 0 pod kills in the hour to 07:30 EVE time".to_owned()
+        ));
+    }
+
+    #[test]
+    fn unlisted_esi_kills_are_scored_at_the_age_of_their_hour() {
+        // ESI's hour ended 90 minutes ago, so its kills are not from the last hour.
+        let assessment = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(ZkillHistory::default()),
+            &traffic(40, player_kills(2, 0), 90 * 60),
+            NOW,
+        );
+        assert_eq!(assessment.threat_score, 24);
+        assert_eq!(
+            assessment.evidence[0],
+            "0 kills in the last hour, 2 in the last 4 hours and 2 in the last 24 hours"
+        );
+    }
+
+    #[test]
+    fn kills_only_esi_reports_lead_the_evidence() {
+        let assessment = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(ZkillHistory::default()),
+            &traffic(10, player_kills(2, 1), 600),
+            NOW,
+        );
+        assert_eq!(
+            assessment.evidence[0],
+            "3 kills in the last hour, 3 in the last 4 hours and 3 in the last 24 hours"
+        );
+        assert_eq!(assessment.evidence[1], "3 kills not on the killboard yet");
+        assert!(!assessment.briefing.contains("No kills"));
+        assert!(assessment.briefing.contains("3 kills in the last hour"));
+    }
+
+    #[test]
+    fn npc_losses_in_esi_kills_are_not_threat() {
+        let history = ZkillHistory {
+            npc_kills_24h: 3,
+            npc_kills_7d: 3,
+            npc_kill_times_4h: vec![NOW - 1_200; 3],
+            ..ZkillHistory::default()
+        };
+        let assessment = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(history),
+            &traffic(20, player_kills(3, 0), 600),
+            NOW,
+        );
+        assert_eq!(assessment.threat_score, 0);
+        assert!(assessment.activity_score > 0);
+        assert_eq!(assessment.evidence[0], "No kills in the last 24 hours");
     }
 
     #[test]
@@ -1349,6 +1491,46 @@ mod tests {
             &"Usual traffic is based on 3 earlier samples at this time of day".to_owned()
         ));
         assert_eq!(assessment.confidence, "High");
+    }
+
+    #[test]
+    fn two_same_hour_samples_keep_confidence_from_earlier_hours() {
+        let mut history = traffic(200, player_kills(0, 0), 600);
+        let latest_hour = history.samples[0].hour;
+        // Fifty earlier hours, two of them at this time of day.
+        let mut samples = (1..=50)
+            .map(|hours| TrafficSample {
+                hour: latest_hour - hours * HOUR_SECS,
+                jumps: Some(100),
+                kills: Some(KillCounts::default()),
+            })
+            .rev()
+            .collect::<Vec<_>>();
+        samples.extend(history.samples);
+        history.samples = samples;
+        let assessment = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(ZkillHistory::default()),
+            &history,
+            NOW,
+        );
+        assert_eq!(assessment.confidence, "Medium");
+
+        // Three same-hour samples without fresh kills are still backed by four hours.
+        let assessment = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(ZkillHistory::default()),
+            &traffic_with_same_hour_baseline_without_kills(),
+            NOW,
+        );
+        assert_eq!(assessment.confidence, "Medium");
+    }
+
+    fn traffic_with_same_hour_baseline_without_kills() -> SystemTrafficHistory {
+        SystemTrafficHistory {
+            latest_kills: None,
+            ..traffic_with_same_hour_baseline()
+        }
     }
 
     #[test]

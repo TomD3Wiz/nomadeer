@@ -24,8 +24,10 @@ pub(crate) struct ZkillReport {
     pub(crate) solar_system_id: u64,
     pub(crate) recent_kills: Vec<ZkillKill>,
     pub(crate) history: ZkillHistory,
-    pub(crate) cached_killmails: Vec<CachedKillmail>,
-    /// How far back `cached_killmails` is complete after this refresh.
+    /// The kills this refresh read from zKillboard, for the cache. Kills the cache
+    /// already held are left out, so storing them costs only what was fetched.
+    pub(crate) fetched_killmails: Vec<CachedKillmail>,
+    /// How far back the cache plus `fetched_killmails` is complete after this refresh.
     pub(crate) coverage: KillboardCoverage,
     /// Set when zKillboard stopped answering partway through the refresh.
     pub(crate) interrupted: Option<String>,
@@ -52,6 +54,10 @@ pub(crate) struct ZkillHistory {
     pub(crate) unique_attackers_24h: usize,
     pub(crate) busiest_attacker_24h: usize,
     pub(crate) busiest_corporation_24h: usize,
+    /// Times of the last 4 hours' player kills and NPC-only losses, so counts from
+    /// other sources can be lined up against the same span.
+    pub(crate) kill_times_4h: Vec<u64>,
+    pub(crate) npc_kill_times_4h: Vec<u64>,
     /// Set when the history is only complete from this time on, because zKillboard
     /// has not been read back through the whole week yet. Counts are then minimums.
     pub(crate) partial_since: Option<u64>,
@@ -178,7 +184,8 @@ struct ApiName {
 }
 
 /// Refreshes a system's killboard. `cached_killmails` and `coverage` are what the cache
-/// already holds for the system; the report carries the merged cache and its new coverage.
+/// already holds for the system; the report summarises both together and carries the
+/// newly fetched kills and the new coverage to store.
 pub(crate) fn fetch_system_report(
     solar_system_id: u64,
     cached_killmails: Vec<CachedKillmail>,
@@ -203,13 +210,14 @@ pub(crate) fn fetch_system_report(
         current_time,
     )?;
 
-    let cached_killmails = merge_cached_killmails(
+    let fetched_killmails = cached_from_fetched(solar_system_id, &paged.kills);
+    let merged = merge_cached_killmails(
         solar_system_id,
         cached_killmails,
-        &paged.kills,
+        &fetched_killmails,
         current_time,
     );
-    let mut history = summarize_history(&cached_killmails, current_time);
+    let mut history = summarize_history(&merged, current_time);
     history.partial_since = partial_since(paged.complete_since, current_time);
     let coverage = KillboardCoverage {
         solar_system_id,
@@ -290,7 +298,7 @@ pub(crate) fn fetch_system_report(
         solar_system_id,
         recent_kills,
         history,
-        cached_killmails,
+        fetched_killmails,
         coverage,
         interrupted,
         total_value,
@@ -444,45 +452,32 @@ fn fetch_kill_page(
         .map_err(|error| format!("Could not read zKillboard kills: {error}"))
 }
 
-fn merge_cached_killmails(
-    solar_system_id: u64,
-    cached_killmails: Vec<CachedKillmail>,
-    fetched_kills: &[ApiKillmail],
-    current_time: u64,
-) -> Vec<CachedKillmail> {
-    let cutoff = current_time.saturating_sub(KILL_WINDOW_SECS);
-    let mut merged = cached_killmails
-        .into_iter()
-        .filter(|kill| kill.solar_system_id == solar_system_id && kill.killmail_time >= cutoff)
-        .map(|kill| (kill.killmail_id, kill))
-        .collect::<HashMap<_, _>>();
-
-    for kill in fetched_kills {
-        let Some(killmail_time) = parse_killmail_time(&kill.killmail_time) else {
-            continue;
-        };
-        let attacker_ids = kill
-            .attackers
-            .iter()
-            .filter_map(|attacker| attacker.character_id)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let corporation_ids = kill
-            .attackers
-            .iter()
-            .filter_map(|attacker| attacker.corporation_id)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let (total_value, solo, npc) = kill
-            .zkb
-            .as_ref()
-            .map(|zkb| (zkb.total_value, zkb.solo, zkb.npc))
-            .unwrap_or_default();
-        merged.insert(
-            kill.killmail_id,
-            CachedKillmail {
+/// The fetched kills in the form the cache keeps them.
+fn cached_from_fetched(solar_system_id: u64, fetched_kills: &[ApiKillmail]) -> Vec<CachedKillmail> {
+    fetched_kills
+        .iter()
+        .filter_map(|kill| {
+            let killmail_time = parse_killmail_time(&kill.killmail_time)?;
+            let attacker_ids = kill
+                .attackers
+                .iter()
+                .filter_map(|attacker| attacker.character_id)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let corporation_ids = kill
+                .attackers
+                .iter()
+                .filter_map(|attacker| attacker.corporation_id)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let (total_value, solo, npc) = kill
+                .zkb
+                .as_ref()
+                .map(|zkb| (zkb.total_value, zkb.solo, zkb.npc))
+                .unwrap_or_default();
+            Some(CachedKillmail {
                 killmail_id: kill.killmail_id,
                 solar_system_id,
                 killmail_time,
@@ -491,8 +486,26 @@ fn merge_cached_killmails(
                 npc,
                 attacker_ids,
                 corporation_ids,
-            },
-        );
+            })
+        })
+        .collect()
+}
+
+/// The system's week of kills, newest first, with fetched kills replacing cached copies.
+fn merge_cached_killmails(
+    solar_system_id: u64,
+    cached_killmails: Vec<CachedKillmail>,
+    fetched_killmails: &[CachedKillmail],
+    current_time: u64,
+) -> Vec<CachedKillmail> {
+    let cutoff = current_time.saturating_sub(KILL_WINDOW_SECS);
+    let mut merged = cached_killmails
+        .into_iter()
+        .filter(|kill| kill.solar_system_id == solar_system_id && kill.killmail_time >= cutoff)
+        .map(|kill| (kill.killmail_id, kill))
+        .collect::<HashMap<_, _>>();
+    for kill in fetched_killmails {
+        merged.insert(kill.killmail_id, kill.clone());
     }
 
     let mut kills = merged.into_values().collect::<Vec<_>>();
@@ -515,6 +528,9 @@ fn summarize_history(kills: &[CachedKillmail], current_time: u64) -> ZkillHistor
             // Sleepers, rats and CONCORD are activity, not hostile pilots.
             history.npc_kills_7d += usize::from(age <= 7 * DAY_SECS);
             history.npc_kills_24h += usize::from(age <= DAY_SECS);
+            if age <= 4 * HOUR_SECS {
+                history.npc_kill_times_4h.push(kill.killmail_time);
+            }
             continue;
         }
         if age <= 7 * DAY_SECS {
@@ -543,6 +559,7 @@ fn summarize_history(kills: &[CachedKillmail], current_time: u64) -> ZkillHistor
         }
         if age <= 4 * HOUR_SECS {
             history.kills_4h += 1;
+            history.kill_times_4h.push(kill.killmail_time);
         }
         if age <= HOUR_SECS {
             history.kills_1h += 1;
@@ -698,8 +715,8 @@ fn parse_killmail_time(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiKillmail, KILL_WINDOW_SECS, MAX_ZKILL_PAGES, ZKILL_PAGE_SIZE, page_kills,
-        parse_killmail_time, partial_since, summarize_history,
+        ApiKillmail, KILL_WINDOW_SECS, MAX_ZKILL_PAGES, ZKILL_PAGE_SIZE, cached_from_fetched,
+        merge_cached_killmails, page_kills, parse_killmail_time, partial_since, summarize_history,
     };
     use crate::model::{CachedKillmail, KillboardCoverage};
     use crate::util::{DAY_SECS, HOUR_SECS};
@@ -754,6 +771,55 @@ mod tests {
         );
         assert_eq!(history.kills_1h, 1);
         assert_eq!(history.kills_current_hour_7d, 2);
+    }
+
+    #[test]
+    fn recent_kill_times_are_kept_for_lining_up_with_traffic() {
+        let history = summarize_history(
+            &[
+                killmail(1, NOW - 600, false),
+                killmail(2, NOW - 3 * HOUR_SECS, true),
+                killmail(3, NOW - 5 * HOUR_SECS, false),
+            ],
+            NOW,
+        );
+        assert_eq!(history.kill_times_4h, vec![NOW - 600]);
+        assert_eq!(history.npc_kill_times_4h, vec![NOW - 3 * HOUR_SECS]);
+    }
+
+    #[test]
+    fn only_fetched_kills_are_handed_back_for_storing() {
+        let fetched = cached_from_fetched(
+            31_002_238,
+            &[ApiKillmail {
+                killmail_id: 2,
+                killmail_time: zkill_time(NOW - 60),
+                victim: None,
+                attackers: Vec::new(),
+                zkb: None,
+            }],
+        );
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].killmail_time, NOW - 60);
+
+        let merged = merge_cached_killmails(
+            31_002_238,
+            vec![
+                killmail(1, NOW - DAY_SECS, false),
+                killmail(2, NOW - 60, true),
+            ],
+            &fetched,
+            NOW,
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .map(|kill| kill.killmail_id)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        // The fetched copy replaces the cached one.
+        assert!(!merged[0].npc);
     }
 
     /// Formats Unix seconds the way zKillboard writes killmail times.
