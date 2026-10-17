@@ -906,14 +906,14 @@ impl NomadeerApp {
         let mut report =
             zkill::fetch_system_report(solar_system_id, cached_killmails, coverage, current_time)?;
         if let Err(error) = store.store_killmails(
-            &report.cached_killmails,
+            &report.fetched_killmails,
             Some(&report.coverage),
             current_time,
         ) {
             save_error.get_or_insert(error);
         }
-        // The merged killmails now live in the database; the report keeps its summary.
-        report.cached_killmails = Vec::new();
+        // The fetched killmails now live in the database; the report keeps its summary.
+        report.fetched_killmails = Vec::new();
         let traffic = store
             .system_traffic(
                 solar_system_id,
