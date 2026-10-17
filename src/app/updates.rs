@@ -1,14 +1,18 @@
 //! New releases on screen: the pill in the top bar, the panel it opens, the
-//! update settings and the one-time note that Nomadeer checks for updates.
+//! update settings, the one-time note that Nomadeer checks for updates, and
+//! the download and hand-over once the player presses Update.
 
 use super::NomadeerApp;
 use crate::config::theme;
+use crate::self_update::{self, Prepared, Sources, Stage, UpdateError};
 use crate::updates::{
     self, CURRENT_VERSION, CheckOutcome, Edition, InstallKind, NoteBlock, Release, UpdateRoute,
     UpdateState,
 };
 use crate::util::now;
 use eframe::egui::{self, RichText};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +23,8 @@ const STARTUP_DELAY: Duration = Duration::from_secs(5);
 const NOTICE_TEXT: &str =
     "Nomadeer checks GitHub once a day for updates. You can turn this off in Settings.";
 const NOTES_HEIGHT: f32 = 280.0;
+/// How often the panel redraws while an update downloads.
+const PROGRESS_REPAINT: Duration = Duration::from_millis(100);
 
 pub(super) struct UpdateUi {
     pub(super) state: UpdateState,
@@ -36,6 +42,24 @@ pub(super) struct UpdateUi {
     show_notice: bool,
     /// How the last check the player asked for went, and whether it failed.
     message: Option<(String, bool)>,
+    /// The update the player started, while it downloads and installs.
+    install: Option<InstallJob>,
+    /// Why the last update the player started did not finish.
+    install_error: Option<UpdateError>,
+    /// A new AppImage is in place but this copy could not start it.
+    installed_version: Option<String>,
+}
+
+struct InstallJob {
+    version: String,
+    stage: Stage,
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<InstallEvent>,
+}
+
+enum InstallEvent {
+    Stage(Stage),
+    Finished(Result<Prepared, UpdateError>),
 }
 
 impl UpdateUi {
@@ -53,6 +77,9 @@ impl UpdateUi {
             later: false,
             show_notice: false,
             message: None,
+            install: None,
+            install_error: None,
+            installed_version: None,
         }
     }
 
@@ -63,6 +90,7 @@ impl UpdateUi {
 
 impl NomadeerApp {
     pub(super) fn load_update_state(&mut self) {
+        self_update::clean_up_after_updates(self.updates.install_kind);
         match self.store.load_update_state() {
             Ok(state) => self.updates.state = state,
             Err(error) => {
@@ -317,8 +345,12 @@ impl NomadeerApp {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let skipped = self.updates.state.skipped_version == release.version;
+            let installing = self.updates.install.is_some();
             if ui
-                .add_enabled(!skipped, egui::Button::new("Skip this version"))
+                .add_enabled(
+                    !skipped && !installing,
+                    egui::Button::new("Skip this version"),
+                )
                 .on_hover_text("No reminders until the next release")
                 .clicked()
             {
@@ -350,24 +382,7 @@ impl NomadeerApp {
         };
 
         match (route, file) {
-            (UpdateRoute::InApp, Some(file)) => {
-                ui.horizontal_wrapped(|ui| {
-                    let update = egui::Button::new(RichText::new("Update").strong())
-                        .stroke(egui::Stroke::new(1.0_f32, theme::accent()));
-                    if ui.add(update).clicked() {
-                        self.start_update(release);
-                    }
-                    if ui.button("Open download page").clicked() {
-                        self.open_external_url(release.download_page());
-                    }
-                });
-                ui.label(
-                    RichText::new(format!(
-                        "Gets {file}. Your characters, chains and Umbra are kept."
-                    ))
-                    .color(theme::muted_text()),
-                );
-            }
+            (UpdateRoute::InApp, Some(file)) => self.in_app_update(ui, release, &file),
             (UpdateRoute::FlatpakBundle, Some(file)) => {
                 ui.label(format!("Download {file}, then install it with:"));
                 let command = updates::flatpak_install_command(&file);
@@ -431,29 +446,227 @@ impl NomadeerApp {
         }
     }
 
-    /// The player pressed Update.
-    // TODO(stage 3): download, verify against the .sha256 and install in place
-    // for the Windows installer and AppImage. Until then the file is fetched
-    // through the browser.
+    /// Update, its progress, or what went wrong, for copies that update
+    /// themselves.
+    fn in_app_update(&mut self, ui: &mut egui::Ui, release: &Release, file: &str) {
+        if let Some(version) = &self.updates.installed_version {
+            ui.label(format!(
+                "Nomadeer {version} is installed. Close Nomadeer and start it again to use it."
+            ));
+            return;
+        }
+        if let Some(job) = &self.updates.install {
+            let (fraction, text) = match job.stage {
+                Stage::Downloading { done, total } => {
+                    let fraction = if total == 0 {
+                        0.0
+                    } else {
+                        done as f32 / total as f32
+                    };
+                    (
+                        fraction,
+                        format!("Downloading {file} · {:.0}%", fraction * 100.0),
+                    )
+                }
+                Stage::Installing => (
+                    1.0,
+                    match self.updates.install_kind {
+                        InstallKind::AppImage => "Putting the new AppImage in place...".to_owned(),
+                        _ => "Starting the installer...".to_owned(),
+                    },
+                ),
+            };
+            ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).text(text));
+            // Once the download checks out it is put in place without stopping.
+            let downloading = matches!(job.stage, Stage::Downloading { .. });
+            if ui
+                .add_enabled(downloading, egui::Button::new("Cancel"))
+                .clicked()
+            {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            let update = egui::Button::new(RichText::new("Update").strong())
+                .stroke(egui::Stroke::new(1.0_f32, theme::accent()));
+            if ui.add(update).clicked() {
+                self.start_update(release);
+            }
+            if ui.button("Open download page").clicked() {
+                self.open_external_url(release.download_page());
+            }
+        });
+        ui.label(RichText::new(self.update_explainer(file)).color(theme::muted_text()));
+        if let Some(error) = &self.updates.install_error {
+            let color = if error.is_failure() {
+                super::WARNING_TEXT
+            } else {
+                theme::muted_text()
+            };
+            ui.label(RichText::new(error.message()).color(color));
+        }
+    }
+
+    /// What pressing Update will do.
+    fn update_explainer(&self, file: &str) -> String {
+        let kept = "Your characters, chains and Umbra are kept.";
+        match self.updates.install_kind {
+            InstallKind::WindowsInstaller { per_user } => {
+                let permission = if per_user {
+                    ""
+                } else {
+                    " Windows asks for permission first, as Nomadeer is installed for all users."
+                };
+                format!(
+                    "Downloads {file}, checks it and installs it. Nomadeer closes while it installs and opens again when it is done.{permission} {kept}"
+                )
+            }
+            InstallKind::AppImage => format!(
+                "Downloads {file}, checks it and puts it in place of this AppImage under the same name, then restarts Nomadeer. {kept}"
+            ),
+            _ => format!("Gets {file}. {kept}"),
+        }
+    }
+
+    /// The player pressed Update: download and check the file in the background.
     fn start_update(&mut self, release: &Release) {
-        let Some(choice) =
-            updates::pick_asset(release, self.updates.install_kind, self.updates.edition)
-        else {
-            self.open_external_url(release.download_page());
+        if self.updates.install.is_some() {
+            return;
+        }
+        self.updates.install_error = None;
+        let exe = std::env::current_exe().ok();
+        let appimage = self_update::current_appimage();
+        let sources = Sources::current();
+        let plan = match self_update::plan_update(
+            release,
+            self.updates.install_kind,
+            self.updates.edition,
+            exe.as_deref(),
+            appimage.as_deref(),
+            &sources,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.updates.install_error = Some(error);
+                return;
+            }
+        };
+        let total = plan.file.size;
+        let downloads = self_update::downloads_dir();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let spawned = thread::Builder::new()
+            .name("update-install".to_owned())
+            .spawn(move || {
+                let progress = tx.clone();
+                let result = self_update::prepare_update(
+                    &plan,
+                    &downloads,
+                    &sources,
+                    &worker_cancel,
+                    &mut |stage| {
+                        let _ = progress.send(InstallEvent::Stage(stage));
+                    },
+                );
+                let _ = tx.send(InstallEvent::Finished(result));
+            });
+        match spawned {
+            Ok(_) => {
+                self.updates.install = Some(InstallJob {
+                    version: release.version.clone(),
+                    stage: Stage::Downloading { done: 0, total },
+                    cancel,
+                    rx,
+                });
+            }
+            Err(error) => {
+                self.updates.install_error = Some(UpdateError::Launch(error.to_string()));
+            }
+        }
+    }
+
+    /// Follows the update the player started, and hands over to the new
+    /// version once it is ready.
+    pub(super) fn poll_update_install(&mut self, ctx: &egui::Context) {
+        let Some(job) = &mut self.updates.install else {
             return;
         };
-        let file = choice.file.name.clone();
-        match crate::util::open_url(&choice.file.download_url) {
-            Ok(()) => {
-                self.status = match self.updates.install_kind {
-                    InstallKind::AppImage => {
-                        format!("Downloading {file}. Use it in place of your current AppImage.")
-                    }
-                    _ => format!("Downloading {file}. Run it to update Nomadeer."),
-                };
-                self.updates.show_panel = false;
+        let finished = loop {
+            match job.rx.try_recv() {
+                Ok(InstallEvent::Stage(stage)) => job.stage = stage,
+                Ok(InstallEvent::Finished(result)) => break Some(result),
+                Err(TryRecvError::Empty) => break None,
+                Err(TryRecvError::Disconnected) => {
+                    break Some(Err(UpdateError::Launch(
+                        "the download stopped unexpectedly".to_owned(),
+                    )));
+                }
             }
-            Err(error) => self.status = error,
+        };
+        let Some(result) = finished else {
+            ctx.request_repaint_after(PROGRESS_REPAINT);
+            return;
+        };
+        let version = job.version.clone();
+        self.updates.install = None;
+        match result {
+            Ok(prepared) => self.hand_over(ctx, &version, prepared),
+            Err(error) => {
+                self.updates.install_error = Some(error);
+                self.updates.show_panel = true;
+            }
+        }
+    }
+
+    /// Saves everything, starts the new version and closes this one.
+    fn hand_over(&mut self, ctx: &egui::Context, version: &str, prepared: Prepared) {
+        let saved = self.store.save(&self.data);
+        self.save_update_state();
+        match prepared {
+            Prepared::Installer {
+                path,
+                sha256,
+                arguments,
+                elevate,
+            } => {
+                if let Err(error) = saved {
+                    self.updates.install_error = Some(UpdateError::Launch(format!(
+                        "Nomadeer could not save first: {error}"
+                    )));
+                    self.updates.show_panel = true;
+                    return;
+                }
+                match self_update::launch_installer(&path, &sha256, &arguments, elevate) {
+                    Ok(()) => {
+                        self.status = format!("Installing Nomadeer {version}...");
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(error) => {
+                        self.updates.install_error = Some(error);
+                        self.updates.show_panel = true;
+                    }
+                }
+            }
+            Prepared::AppImage { path } => {
+                self.updates.installed_version = Some(version.to_owned());
+                if let Err(error) = saved {
+                    // The new AppImage is already in place; restarting now
+                    // would lose what could not be saved.
+                    self.status = format!("Save failed: {error}");
+                    self.updates.show_panel = true;
+                    return;
+                }
+                match self_update::relaunch_appimage(&path) {
+                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(error) => {
+                        self.status = format!("Could not restart Nomadeer: {error}");
+                        self.updates.show_panel = true;
+                    }
+                }
+            }
         }
     }
 }
