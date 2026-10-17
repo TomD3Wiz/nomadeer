@@ -1,8 +1,9 @@
 //! The chain map on screen: a view the player pans and zooms, systems they can drag
 //! into place, and connections drawn by dragging from one system to another.
 
+use super::chain_art::{self, ConnectionStyle, Detail, Legend, NodeLook};
 use super::chain_view::{self, CONNECTION_PICK_DISTANCE, Camera, HANDLE_RADIUS, NODE_RADIUS};
-use super::{ChainMapTarget, NomadeerApp};
+use super::{ChainMapTarget, NomadeerApp, umbra};
 use crate::config::theme;
 use eframe::egui::{
     self, Align, Align2, Color32, CursorIcon, FontId, Layout, PointerButton, Pos2, Rect, Sense,
@@ -37,6 +38,7 @@ enum MapControl {
     AskResetLayout,
     ResetLayout,
     KeepLayout,
+    ToggleLegend,
 }
 
 impl NomadeerApp {
@@ -179,6 +181,21 @@ impl NomadeerApp {
         let bounds = chain_view::chain_bounds(positions.values()).unwrap_or(bounds);
         camera = camera.kept_in_view(rect, bounds);
         self.paint_chain(ui, &painter, rect, camera, &positions, pointer);
+        if self.chain_show_legend {
+            let legend = Legend::fit(rect.height() - 16.0);
+            let legend_rect = Rect::from_min_size(
+                pos2(rect.left() + 8.0, rect.bottom() - 8.0 - legend.size.y),
+                legend.size,
+            )
+            .intersect(rect.shrink(8.0));
+            // Clicks, drags and scrolling on the legend stay off the map beneath it.
+            ui.interact(
+                legend_rect,
+                ui.id().with("chain_map_legend"),
+                Sense::click_and_drag(),
+            );
+            legend.paint(&painter, legend_rect);
+        }
 
         let mut refit = false;
         match self.chain_map_controls(ui, rect, camera.zoom) {
@@ -191,6 +208,7 @@ impl NomadeerApp {
             Some(MapControl::Fit) => camera = Camera::fit(rect, bounds),
             Some(MapControl::AskResetLayout) => self.chain_confirm_reset_layout = true,
             Some(MapControl::KeepLayout) => self.chain_confirm_reset_layout = false,
+            Some(MapControl::ToggleLegend) => self.chain_show_legend = !self.chain_show_legend,
             Some(MapControl::ResetLayout) => {
                 self.chain_confirm_reset_layout = false;
                 for system in &mut self.data.systems {
@@ -290,16 +308,13 @@ impl NomadeerApp {
             _ => (None, None),
         };
 
+        let name_alpha = chain_view::name_opacity(zoom);
+        let detail_alpha = chain_view::detail_opacity(zoom);
         for connection in &self.data.connections {
             if let (Some(a), Some(b)) = (
                 positions.get(&connection.from_system),
                 positions.get(&connection.to_system),
             ) {
-                let color = match connection.mass_status.as_str() {
-                    "critical" => Color32::from_rgb(255, 91, 112),
-                    "destab" => Color32::from_rgb(255, 194, 87),
-                    _ => Color32::from_rgb(93, 242, 255),
-                };
                 let delta = *b - *a;
                 let distance = delta.length();
                 let endpoints = if distance > 2.0 * NODE_RADIUS {
@@ -308,61 +323,124 @@ impl NomadeerApp {
                 } else {
                     [screen(a), screen(b)]
                 };
-                let is_hovered = hovered_connection_id.as_deref() == Some(&connection.id);
-                painter.line_segment(
+                chain_art::paint_connection(
+                    painter,
                     endpoints,
-                    Stroke::new(
-                        if is_hovered { 4.0 } else { 2.0 } * line_scale,
-                        if is_hovered { Color32::WHITE } else { color },
-                    ),
+                    &ConnectionStyle::of(connection),
+                    line_scale,
+                    zoom,
+                    hovered_connection_id.as_deref() == Some(&connection.id),
+                    detail_alpha,
                 );
             }
         }
 
-        let name_alpha = chain_view::name_opacity(zoom);
-        let detail_alpha = chain_view::detail_opacity(zoom);
         let radius = NODE_RADIUS * zoom;
+        let detail = chain_art::detail_for_radius(radius);
+        // Wormholes turn only while the player is looking at them, and not at all
+        // when animations are switched off.
+        let still = ui.style().animation_time <= 0.0 || detail == Detail::Minimal;
+        let time = ui.input(|input| input.time);
+        let mut turning = false;
+        let mut characters: HashMap<&str, usize> = HashMap::new();
+        for account in &self.data.accounts {
+            if !account.last_system_id.is_empty() {
+                *characters
+                    .entry(account.last_system_id.as_str())
+                    .or_default() += 1;
+            }
+        }
+        let visible = rect.expand(radius * 1.5 + 60.0);
         for system in &self.data.systems {
             let Some(pos) = positions.get(&system.id).map(screen) else {
                 continue;
             };
+            if !visible.contains(pos) {
+                continue;
+            }
             let is_hovered = hovered_system_id.as_deref() == Some(&system.id);
-            let fill = match system.status.as_str() {
-                "home" => Color32::from_rgb(20, 89, 82),
-                "hostile" => Color32::from_rgb(92, 31, 43),
-                "farmable" => Color32::from_rgb(37, 75, 42),
-                "rolled" => Color32::from_rgb(45, 48, 56),
-                _ => Color32::from_rgb(16, 41, 50),
-            };
-            painter.circle_filled(pos, radius, fill);
-            let stroke = if system.id == self.selected_system_id {
-                Stroke::new(4.0 * line_scale, theme::character_text())
-            } else if linking_id == Some(&system.id) {
-                Stroke::new(4.0 * line_scale, LINK_COLOR)
+            let is_selected = system.id == self.selected_system_id;
+            let look = chain_art::node_look(system);
+            let opacity = chain_art::status_opacity(&system.status);
+            let mut phase = chain_art::resting_phase(&system.id);
+            if !still && (is_hovered || is_selected) && matches!(look, NodeLook::Wormhole(_)) {
+                phase += chain_art::spin(time);
+                turning = true;
+            }
+
+            if is_selected {
+                chain_art::paint_glow_ring(painter, pos, radius, theme::accent(), 3.0 * line_scale);
+            }
+            chain_art::paint_node(painter, pos, radius, look, phase, detail, opacity);
+            let ring = if linking_id == Some(&system.id) {
+                Some(LINK_COLOR)
             } else if is_hovered || moving_id == Some(&system.id) {
-                Stroke::new(4.0 * line_scale, Color32::WHITE)
+                Some(Color32::WHITE)
             } else {
-                Stroke::new(2.0 * line_scale, theme::accent())
+                None
             };
-            painter.circle_stroke(pos, radius, stroke);
-            if name_alpha > 0.0 {
-                painter.text(
-                    pos + vec2(0.0, -6.0) * zoom,
-                    Align2::CENTER_CENTER,
-                    &system.name,
-                    FontId::proportional(14.0 * zoom),
-                    Color32::WHITE.gamma_multiply(name_alpha),
+            if let Some(color) = ring {
+                painter.circle_stroke(pos, radius * 1.1, Stroke::new(2.5 * line_scale, color));
+            }
+
+            if detail != Detail::Minimal {
+                let badge = (radius * 0.3).max(5.0);
+                if let NodeLook::KnownSpace {
+                    faction: Some(faction),
+                    ..
+                } = look
+                {
+                    chain_art::paint_faction_badge(
+                        painter,
+                        chain_art::rim_point(pos, radius, 45.0),
+                        badge,
+                        faction,
+                        detail,
+                        opacity,
+                    );
+                }
+                if let Some(color) = chain_art::status_color(&system.status) {
+                    let pip = chain_art::rim_point(pos, radius, 135.0);
+                    painter.circle_filled(pip, badge * 0.5, color);
+                    painter.circle_stroke(
+                        pip,
+                        badge * 0.5,
+                        Stroke::new(1.0_f32, theme::panel_background()),
+                    );
+                }
+            }
+            if let Some(&count) = characters.get(system.id.as_str()) {
+                chain_art::paint_count_badge(
+                    painter,
+                    chain_art::rim_point(pos, radius, 225.0),
+                    (radius * 0.27).max(6.0),
+                    count,
                 );
             }
+
             if detail_alpha > 0.0 {
-                painter.text(
-                    pos + vec2(0.0, 12.0) * zoom,
+                chain_art::shadowed_text(
+                    painter,
+                    pos,
                     Align2::CENTER_CENTER,
-                    Self::inferred_system_class(system),
+                    &umbra::feed_class_label(system),
                     FontId::proportional(12.0 * zoom),
-                    theme::muted_text().gamma_multiply(detail_alpha),
+                    Color32::WHITE.gamma_multiply(detail_alpha * opacity),
                 );
             }
+            if name_alpha > 0.0 {
+                chain_art::shadowed_text(
+                    painter,
+                    pos + vec2(0.0, radius + 6.0 * zoom),
+                    Align2::CENTER_TOP,
+                    &system.name,
+                    FontId::proportional(13.0 * zoom),
+                    theme::system_text().gamma_multiply(name_alpha),
+                );
+            }
+        }
+        if turning {
+            ui.ctx().request_repaint_after(chain_art::ANIMATION_FRAME);
         }
 
         if !dragging
@@ -429,10 +507,26 @@ impl NomadeerApp {
                 "Drag to another system to link {}",
                 self.system_name(system_id)
             )),
-            (None, Some(system_id), _) => Some(format!(
-                "{} · right-click for actions",
-                self.system_name(system_id)
-            )),
+            (None, Some(system_id), _) => {
+                // Name who holds the space the badge stands for.
+                let held_by = self
+                    .data
+                    .systems
+                    .iter()
+                    .find(|system| system.id == *system_id)
+                    .and_then(|system| match chain_art::node_look(system) {
+                        NodeLook::KnownSpace {
+                            faction: Some(faction),
+                            ..
+                        } => Some(format!(" · {}", faction.display_name())),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Some(format!(
+                    "{}{held_by} · right-click for actions",
+                    self.system_name(system_id)
+                ))
+            }
             (None, None, Some(connection_id)) => self
                 .data
                 .connections
@@ -533,6 +627,18 @@ impl NomadeerApp {
                 );
                 if ui.small_button("−").on_hover_text("Zoom out").clicked() {
                     control = Some(MapControl::ZoomOut);
+                }
+                ui.separator();
+                if ui
+                    .add(
+                        egui::Button::new("Legend")
+                            .small()
+                            .selected(self.chain_show_legend),
+                    )
+                    .on_hover_text("What the systems, badges and connections on the map mean")
+                    .clicked()
+                {
+                    control = Some(MapControl::ToggleLegend);
                 }
             });
         control

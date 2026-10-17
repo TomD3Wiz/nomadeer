@@ -2,7 +2,7 @@
 //! The table is generated from ESI by tools/data/gen_wormhole_types.py; rerun it
 //! after a patch adds or changes holes rather than editing it.
 
-// Not shown on signatures or connections yet.
+// Only the chain map's connection labels use it so far.
 #![allow(dead_code)]
 
 /// The kind of space a wormhole leads to, from its type's target system class.

@@ -17,8 +17,9 @@ const MAX_FIT_ZOOM: f32 = 1.0;
 const FIT_MARGIN: f32 = 24.0;
 /// Pixels of the chain that panning always leaves on screen.
 const KEEP_VISIBLE: f32 = 48.0;
-/// Room around each system's centre for its circle and name, in map units.
-const NODE_EXTENT: f32 = NODE_RADIUS + 14.0;
+/// Room around each system's centre for its art, its glow and the name beneath it,
+/// in map units.
+const NODE_EXTENT: f32 = NODE_RADIUS + 30.0;
 /// Distance between hops, and between systems the same hop out, in map units.
 const COLUMN_SPACING: f32 = 190.0;
 const ROW_SPACING: f32 = 110.0;

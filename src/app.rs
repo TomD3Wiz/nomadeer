@@ -18,6 +18,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod chain_art;
 mod chain_map;
 mod chain_view;
 mod layout;
@@ -228,6 +229,8 @@ pub(crate) struct NomadeerApp {
     chain_drag: Option<chain_map::ChainDrag>,
     /// The player pressed Reset layout and has not yet confirmed.
     chain_confirm_reset_layout: bool,
+    /// The key to the chain map's artwork is open.
+    chain_show_legend: bool,
     next_auto_sync: Instant,
     auto_sync_index: usize,
 }
@@ -299,6 +302,7 @@ impl NomadeerApp {
             chain_camera: None,
             chain_drag: None,
             chain_confirm_reset_layout: false,
+            chain_show_legend: false,
             next_auto_sync: Instant::now() + Duration::from_secs(5),
             auto_sync_index: 0,
         };
