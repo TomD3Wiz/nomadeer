@@ -29,7 +29,7 @@ Every release on the [Releases page](https://github.com/TomD3Wiz/nomadeer/releas
 | Linux | `Nomadeer-<version>-x86_64.flatpak` | Sandboxed. `flatpak install --user Nomadeer-<version>-x86_64.flatpak`. Picks the right edition at launch. |
 | Linux | `nomadeer-<version>-linux-x86_64-optimized.tar.gz` / `-compatible.tar.gz` | Plain binaries for people who manage their own installs. |
 
-Each file has a matching `.sha256`.
+Each file has a matching `.sha256`. The AppImage also has a `.zsync` file, so AppImage updaters such as AppImageUpdate or Gear Lever can update it in place. [CHANGELOG.md](CHANGELOG.md) lists what changed in each release.
 
 ### Editions
 
@@ -147,7 +147,18 @@ Notes:
 - `make flatpak` runs `flatpak-builder` in `ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08` with `--privileged` (bubblewrap needs it). `make windows-installer` cross-compiles with mingw and runs Inno Setup under Wine. Both mount the repository read-only with `--security-opt label=disable`.
 - On Windows itself, build both editions with `-C target-feature=+crt-static` in `RUSTFLAGS` (plus `-C target-cpu=x86-64-v3` for the optimized one, using `--target-dir target/optimized` and `target/compatible`), then run `./packaging/windows/package.ps1 -Version <version>`. This needs Inno Setup 6.3 or later.
 
-Pushing a `v*` tag runs the Release workflow, which builds every package above and attaches them to a GitHub release. CI also builds and tests on Windows for every pull request.
+### Making a release
+
+```sh
+make bump VERSION=x.y.z            # CHANGELOG.md, Cargo.toml, Cargo.lock and the metainfo
+make release-notes VERSION=x.y.z   # print that version's changelog section
+```
+
+1. Write what changed for players under `## [Unreleased]` in `CHANGELOG.md` as you go.
+2. Run `make bump VERSION=x.y.z`. It moves those notes into a dated `## [x.y.z]` section, sets the version in `Cargo.toml` and `Cargo.lock`, and adds a `<release>` to the metainfo. It refuses a version that is not newer, already exists or has no notes.
+3. Commit, then tag the commit `vx.y.z` and push the tag.
+
+Pushing a `v*` tag runs the Release workflow. It first checks that the tag matches `Cargo.toml` and that the metainfo and `CHANGELOG.md` have the version, builds every package above, then creates a **draft** GitHub release titled `Nomadeer vx.y.z` with the changelog section and a downloads table as its notes. Nothing is public until you publish the draft; a version with a pre-release suffix (`1.2.0-rc.1`) is marked as a pre-release. Release file names are fixed (`python3 tools/release.py assets x.y.z` lists them) because update checks and AppImage updaters look for them by name. CI also builds and tests on Windows for every pull request.
 
 Flathub publication would additionally need a build-from-source manifest (vendored crates via `flatpak-cargo-generator.py`), screenshots in the metainfo, and a pull request to `flathub/flathub`.
 
