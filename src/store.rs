@@ -1,7 +1,7 @@
 use crate::model::{
     Account, AppData, AutoIntelSettings, CachedKillmail, Connection, EsiSettings, KillCounts,
     KillboardCoverage, Note, Signature, SystemAssessment, SystemNode, SystemTrafficHistory,
-    TrafficHour, TrafficReading, TrafficRows, TrafficSample, VisitLog,
+    TrafficHour, TrafficReading, TrafficRows, TrafficSample, UmbraBriefing, VisitLog,
 };
 use crate::paths;
 use crate::util::{DAY_SECS, hour_start, now};
@@ -19,6 +19,9 @@ use std::time::Duration;
 pub(crate) const KILLMAIL_RETENTION_SECS: u64 = 7 * DAY_SECS;
 /// A week of hourly traffic for baselines plus the current day.
 pub(crate) const TRAFFIC_RETENTION_SECS: u64 = 8 * DAY_SECS;
+/// Umbra's feed keeps a month of briefings, and never more than this many.
+pub(crate) const UMBRA_FEED_RETENTION_SECS: u64 = 30 * DAY_SECS;
+pub(crate) const UMBRA_FEED_MAX_KEPT: usize = 500;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const GATHER_ON_ARRIVAL_KEY: &str = "gather_intel_on_arrival";
 const UMBRA_BRIEFS_AUTOMATICALLY_KEY: &str = "umbra_briefs_automatically";
@@ -586,13 +589,115 @@ impl Store {
         })
     }
 
+    /// Adds an accepted briefing to Umbra's feed and prunes the feed. Returns the entry
+    /// with its id, or None when the feed already holds a briefing of that assessment.
+    pub(crate) fn record_umbra_briefing(
+        &self,
+        entry: &UmbraBriefing,
+        current_time: u64,
+    ) -> Result<Option<UmbraBriefing>, String> {
+        let mut conn = self.open()?;
+        let tx = Self::write_transaction(&mut conn)?;
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO umbra_briefings (
+                    solar_system_id, system_id, system_name, system_class, threat_score,
+                    activity_score, confidence, briefing, assessed_at, briefed_at, auto
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    entry.solar_system_id as i64,
+                    entry.system_id,
+                    entry.system_name,
+                    entry.system_class,
+                    i64::from(entry.threat_score),
+                    i64::from(entry.activity_score),
+                    entry.confidence,
+                    entry.briefing,
+                    entry.assessed_at as i64,
+                    entry.briefed_at as i64,
+                    i64::from(entry.auto),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let saved = (inserted > 0).then(|| UmbraBriefing {
+            id: tx.last_insert_rowid(),
+            ..entry.clone()
+        });
+        Self::prune_umbra_briefings(&tx, current_time)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(saved)
+    }
+
+    /// The newest `limit` briefings in Umbra's feed, oldest first.
+    pub(crate) fn umbra_briefings(&self, limit: usize) -> Result<Vec<UmbraBriefing>, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, solar_system_id, system_id, system_name, system_class, threat_score,
+                        activity_score, confidence, briefing, assessed_at, briefed_at, auto
+                 FROM umbra_briefings
+                 ORDER BY briefed_at DESC, id DESC
+                 LIMIT ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(UmbraBriefing {
+                    id: row.get(0)?,
+                    solar_system_id: row.get::<_, i64>(1)? as u64,
+                    system_id: row.get(2)?,
+                    system_name: row.get(3)?,
+                    system_class: row.get(4)?,
+                    threat_score: row.get::<_, i64>(5)?.clamp(0, 100) as u8,
+                    activity_score: row.get::<_, i64>(6)?.clamp(0, 100) as u8,
+                    confidence: row.get(7)?,
+                    briefing: row.get(8)?,
+                    assessed_at: row.get::<_, i64>(9)? as u64,
+                    briefed_at: row.get::<_, i64>(10)? as u64,
+                    auto: row.get::<_, i64>(11)? != 0,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        let mut feed = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        feed.reverse();
+        Ok(feed)
+    }
+
+    /// Forgets every briefing in Umbra's feed.
+    pub(crate) fn clear_umbra_briefings(&self) -> Result<(), String> {
+        let conn = self.open()?;
+        conn.execute("DELETE FROM umbra_briefings", [])
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn prune_umbra_briefings(conn: &SqliteConnection, current_time: u64) -> Result<(), String> {
+        let cutoff = current_time.saturating_sub(UMBRA_FEED_RETENTION_SECS);
+        conn.execute(
+            "DELETE FROM umbra_briefings WHERE briefed_at < ?1",
+            params![cutoff as i64],
+        )
+        .map_err(|error| error.to_string())?;
+        conn.execute(
+            "DELETE FROM umbra_briefings WHERE id NOT IN (
+                SELECT id FROM umbra_briefings ORDER BY briefed_at DESC, id DESC LIMIT ?1
+             )",
+            params![UMBRA_FEED_MAX_KEPT as i64],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
     fn prune_expired_intel(
         &self,
         conn: &SqliteConnection,
         current_time: u64,
     ) -> Result<(), String> {
         Self::prune_killmails(conn, current_time)?;
-        Self::prune_traffic(conn, current_time)
+        Self::prune_traffic(conn, current_time)?;
+        Self::prune_umbra_briefings(conn, current_time)
     }
 
     fn prune_killmails(conn: &SqliteConnection, current_time: u64) -> Result<(), String> {
@@ -802,6 +907,23 @@ impl Store {
                  model_generated INTEGER NOT NULL DEFAULT 0,
                  generated_at INTEGER NOT NULL
               );
+              CREATE TABLE IF NOT EXISTS umbra_briefings (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 solar_system_id INTEGER NOT NULL DEFAULT 0,
+                 system_id TEXT NOT NULL,
+                 system_name TEXT NOT NULL DEFAULT '',
+                 system_class TEXT NOT NULL DEFAULT '',
+                 threat_score INTEGER NOT NULL,
+                 activity_score INTEGER NOT NULL,
+                 confidence TEXT NOT NULL DEFAULT '',
+                 briefing TEXT NOT NULL,
+                 assessed_at INTEGER NOT NULL,
+                 briefed_at INTEGER NOT NULL,
+                 auto INTEGER NOT NULL DEFAULT 0,
+                 UNIQUE (system_id, assessed_at)
+              );
+              CREATE INDEX IF NOT EXISTS idx_umbra_briefings_briefed_at
+                 ON umbra_briefings(briefed_at);
               CREATE INDEX IF NOT EXISTS idx_signatures_system_id ON signatures(system_id);
               CREATE INDEX IF NOT EXISTS idx_visits_system_id ON visits(system_id);
               CREATE INDEX IF NOT EXISTS idx_notes_system_id ON notes(system_id);
@@ -1222,10 +1344,13 @@ fn traffic_kills(row: &Row<'_>, first_column: usize) -> rusqlite::Result<KillCou
 
 #[cfg(test)]
 mod tests {
-    use super::{KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS};
+    use super::{
+        KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS, UMBRA_FEED_MAX_KEPT,
+        UMBRA_FEED_RETENTION_SECS,
+    };
     use crate::model::{
         AppData, AutoIntelSettings, CachedKillmail, KillCounts, KillboardCoverage, TrafficHour,
-        TrafficReading, TrafficRows, TrafficSample,
+        TrafficReading, TrafficRows, TrafficSample, UmbraBriefing,
     };
     use rusqlite::Connection as SqliteConnection;
     use std::path::PathBuf;
@@ -1725,6 +1850,117 @@ mod tests {
         .unwrap();
         assert!(!legacy.accounts[0].recon);
         assert!(!legacy.recon_defaults_applied);
+    }
+
+    fn umbra_entry(system_id: &str, assessed_at: u64, briefed_at: u64) -> UmbraBriefing {
+        UmbraBriefing {
+            id: 0,
+            solar_system_id: 31_002_238,
+            system_id: system_id.to_owned(),
+            system_name: "J123456".to_owned(),
+            system_class: "C3".to_owned(),
+            threat_score: 64,
+            activity_score: 22,
+            confidence: "Medium".to_owned(),
+            briefing: "Threat is Elevated after 3 kills. Activity is Low.".to_owned(),
+            assessed_at,
+            briefed_at,
+            auto: true,
+        }
+    }
+
+    #[test]
+    fn umbra_feed_appends_and_loads_oldest_first() {
+        let db = TestDb::new("umbra-feed");
+        let store = db.store();
+        assert!(store.umbra_briefings(200).unwrap().is_empty());
+
+        let first = store
+            .record_umbra_briefing(&umbra_entry("sys_a", NOW - 600, NOW - 500), NOW)
+            .unwrap()
+            .expect("a new briefing is recorded");
+        assert!(first.id > 0);
+        let mut asked = umbra_entry("sys_b", NOW - 300, NOW - 200);
+        asked.auto = false;
+        asked.system_class = "LS 0.3".to_owned();
+        store.record_umbra_briefing(&asked, NOW).unwrap();
+
+        let feed = store.umbra_briefings(200).unwrap();
+        let systems = feed
+            .iter()
+            .map(|entry| entry.system_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(systems, vec!["sys_a", "sys_b"]);
+        assert_eq!(feed[0], first);
+        assert_eq!(
+            feed[1],
+            UmbraBriefing {
+                id: feed[1].id,
+                ..asked
+            }
+        );
+
+        // Only the newest are loaded, still oldest first.
+        let newest = store.umbra_briefings(1).unwrap();
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].system_id, "sys_b");
+
+        // Saving the map leaves the feed alone.
+        store.save(&AppData::default()).unwrap();
+        assert_eq!(store.umbra_briefings(200).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn briefing_the_same_assessment_again_adds_nothing() {
+        let db = TestDb::new("umbra-dedupe");
+        let store = db.store();
+        let entry = umbra_entry("sys_a", NOW - 600, NOW - 500);
+        assert!(store.record_umbra_briefing(&entry, NOW).unwrap().is_some());
+        let again = UmbraBriefing {
+            briefed_at: NOW - 100,
+            auto: false,
+            ..entry.clone()
+        };
+        assert_eq!(store.record_umbra_briefing(&again, NOW).unwrap(), None);
+        // A newer assessment of the same system is a new entry.
+        assert!(
+            store
+                .record_umbra_briefing(&umbra_entry("sys_a", NOW - 60, NOW - 30), NOW)
+                .unwrap()
+                .is_some()
+        );
+        let feed = store.umbra_briefings(200).unwrap();
+        assert_eq!(feed.len(), 2);
+        assert!(feed[0].auto);
+        assert_eq!(feed[0].briefed_at, NOW - 500);
+    }
+
+    #[test]
+    fn umbra_feed_is_pruned_by_age_and_count() {
+        let db = TestDb::new("umbra-prune");
+        let store = db.store();
+        let expired = NOW - UMBRA_FEED_RETENTION_SECS - 1;
+        store
+            .record_umbra_briefing(&umbra_entry("sys_old", expired, expired), NOW)
+            .unwrap();
+        for index in 0..UMBRA_FEED_MAX_KEPT as u64 + 5 {
+            let at = NOW - 10_000 + index;
+            store
+                .record_umbra_briefing(&umbra_entry(&format!("sys_{index}"), at, at), NOW)
+                .unwrap();
+        }
+        let feed = store.umbra_briefings(10_000).unwrap();
+        assert_eq!(feed.len(), UMBRA_FEED_MAX_KEPT);
+        assert!(feed.iter().all(|entry| entry.system_id != "sys_old"));
+        // The oldest beyond the cap went first.
+        assert_eq!(feed[0].system_id, "sys_5");
+        assert_eq!(
+            feed.last().unwrap().system_id,
+            format!("sys_{}", UMBRA_FEED_MAX_KEPT + 4)
+        );
+
+        store.clear_umbra_briefings().unwrap();
+        assert!(store.umbra_briefings(200).unwrap().is_empty());
     }
 
     #[test]

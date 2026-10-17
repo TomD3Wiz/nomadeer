@@ -294,6 +294,11 @@ impl AutoBriefings {
         self.pending.is_empty()
     }
 
+    /// How many briefings she still owes.
+    pub(crate) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
     pub(crate) fn clear(&mut self) {
         self.pending.clear();
     }
@@ -594,6 +599,7 @@ mod tests {
         briefings.request(assessment("a", 10));
         briefings.request(assessment("b", 20));
         briefings.request(assessment("a", 40));
+        assert_eq!(briefings.len(), 2);
         let current = current(&[assessment("a", 40), assessment("b", 20)]);
         // The newer request for "a" is now the newest.
         let first = briefings.next(&current, "").unwrap();
