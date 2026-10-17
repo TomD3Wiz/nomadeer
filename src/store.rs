@@ -1,8 +1,9 @@
+use crate::live_intel::LIVE_INTEL_RETENTION_SECS;
 use crate::model::{
-    Account, AppData, AutoIntelSettings, CachedKillmail, Connection, DashboardLayout, EsiSettings,
-    KillCounts, KillboardCoverage, MapPosition, Note, Signature, SystemAssessment, SystemNode,
-    SystemTrafficHistory, TrafficHour, TrafficReading, TrafficRows, TrafficSample, UmbraBriefing,
-    VisitLog,
+    Account, AppData, AutoIntelSettings, CachedKillmail, CharacterAffiliation, Connection,
+    DashboardLayout, EsiSettings, EveType, KillCounts, KillboardCoverage, MapPosition, Note,
+    Signature, SystemAssessment, SystemNode, SystemTrafficHistory, TrafficHour, TrafficReading,
+    TrafficRows, TrafficSample, UmbraBriefing, VisitLog,
 };
 use crate::paths;
 use crate::util::{DAY_SECS, hour_start, now};
@@ -10,6 +11,7 @@ use rusqlite::{
     Connection as SqliteConnection, OptionalExtension, Row, TransactionBehavior, params,
     types::Type,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +25,8 @@ pub(crate) const TRAFFIC_RETENTION_SECS: u64 = 8 * DAY_SECS;
 /// Umbra's feed keeps a month of briefings, and never more than this many.
 pub(crate) const UMBRA_FEED_RETENTION_SECS: u64 = 30 * DAY_SECS;
 pub(crate) const UMBRA_FEED_MAX_KEPT: usize = 500;
+/// Names and types looked up for pasted local and d-scans are trusted for a month.
+const LOOKUP_RETENTION_SECS: u64 = 30 * DAY_SECS;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const GATHER_ON_ARRIVAL_KEY: &str = "gather_intel_on_arrival";
 const UMBRA_BRIEFS_AUTOMATICALLY_KEY: &str = "umbra_briefs_automatically";
@@ -736,7 +740,298 @@ impl Store {
     ) -> Result<(), String> {
         Self::prune_killmails(conn, current_time)?;
         Self::prune_traffic(conn, current_time)?;
-        Self::prune_umbra_briefings(conn, current_time)
+        Self::prune_umbra_briefings(conn, current_time)?;
+        Self::prune_lookups(conn, current_time)
+    }
+
+    /// Drops earlier live intel, expired affiliations and lookups old enough that a
+    /// rename may have happened since.
+    fn prune_lookups(conn: &SqliteConnection, current_time: u64) -> Result<(), String> {
+        let lookup_cutoff = current_time.saturating_sub(LOOKUP_RETENTION_SECS) as i64;
+        let live_cutoff = current_time.saturating_sub(LIVE_INTEL_RETENTION_SECS) as i64;
+        for (sql, cutoff) in [
+            ("DELETE FROM eve_names WHERE fetched_at < ?1", lookup_cutoff),
+            ("DELETE FROM eve_types WHERE fetched_at < ?1", lookup_cutoff),
+            (
+                "DELETE FROM eve_groups WHERE fetched_at < ?1",
+                lookup_cutoff,
+            ),
+            (
+                "DELETE FROM character_affiliations WHERE expires_at < ?1",
+                current_time as i64,
+            ),
+            ("DELETE FROM live_intel WHERE captured_at < ?1", live_cutoff),
+        ] {
+            conn.execute(sql, params![cutoff])
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// IDs of names already looked up in `category` ("character", "inventory_type"),
+    /// keyed by the name lowercased, with the name as ESI spells it.
+    pub(crate) fn cached_ids_by_name(
+        &self,
+        category: &str,
+        names: &[String],
+    ) -> Result<HashMap<String, (u64, String)>, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, name FROM eve_names
+                 WHERE category = ?1 AND name = ?2 COLLATE NOCASE
+                 ORDER BY fetched_at DESC LIMIT 1",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut found = HashMap::new();
+        for name in names {
+            let row = stmt
+                .query_row(params![category, name], |row| {
+                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+                })
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(row) = row {
+                found.insert(name.to_lowercase(), row);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Names already looked up for these IDs.
+    pub(crate) fn cached_names(&self, ids: &[u64]) -> Result<HashMap<u64, String>, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare_cached("SELECT name FROM eve_names WHERE id = ?1")
+            .map_err(|error| error.to_string())?;
+        let mut found = HashMap::new();
+        for id in ids {
+            let name = stmt
+                .query_row(params![*id as i64], |row| row.get::<_, String>(0))
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(name) = name {
+                found.insert(*id, name);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Remembers what IDs are called: (ID, name, category).
+    pub(crate) fn store_names(
+        &self,
+        names: &[(u64, String, String)],
+        current_time: u64,
+    ) -> Result<(), String> {
+        let mut conn = self.open()?;
+        let tx = Self::write_transaction(&mut conn)?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO eve_names (id, name, category, fetched_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|error| error.to_string())?;
+            for (id, name, category) in names {
+                stmt.execute(params![*id as i64, name, category, current_time as i64])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Affiliations looked up before that ESI still holds to be current.
+    pub(crate) fn cached_affiliations(
+        &self,
+        character_ids: &[u64],
+        current_time: u64,
+    ) -> Result<HashMap<u64, CharacterAffiliation>, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT corporation_id, alliance_id FROM character_affiliations
+                 WHERE character_id = ?1 AND expires_at > ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut found = HashMap::new();
+        for character_id in character_ids {
+            let row = stmt
+                .query_row(params![*character_id as i64, current_time as i64], |row| {
+                    Ok(CharacterAffiliation {
+                        character_id: *character_id,
+                        corporation_id: row.get::<_, i64>(0)? as u64,
+                        alliance_id: row.get::<_, i64>(1)? as u64,
+                    })
+                })
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(row) = row {
+                found.insert(*character_id, row);
+            }
+        }
+        Ok(found)
+    }
+
+    pub(crate) fn store_affiliations(
+        &self,
+        affiliations: &[CharacterAffiliation],
+        expires_at: u64,
+    ) -> Result<(), String> {
+        let mut conn = self.open()?;
+        let tx = Self::write_transaction(&mut conn)?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO character_affiliations (
+                        character_id, corporation_id, alliance_id, expires_at
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|error| error.to_string())?;
+            for affiliation in affiliations {
+                stmt.execute(params![
+                    affiliation.character_id as i64,
+                    affiliation.corporation_id as i64,
+                    affiliation.alliance_id as i64,
+                    expires_at as i64,
+                ])
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Types already looked up, with their group, where that is known too.
+    pub(crate) fn cached_types(&self, type_ids: &[u32]) -> Result<HashMap<u32, EveType>, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT t.name, t.group_id, g.name, g.category_id
+                 FROM eve_types t JOIN eve_groups g ON g.group_id = t.group_id
+                 WHERE t.type_id = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut found = HashMap::new();
+        for type_id in type_ids {
+            let row = stmt
+                .query_row(params![*type_id], |row| {
+                    Ok(EveType {
+                        type_id: *type_id,
+                        name: row.get(0)?,
+                        group_id: row.get(1)?,
+                        group_name: row.get(2)?,
+                        category_id: row.get(3)?,
+                    })
+                })
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(row) = row {
+                found.insert(*type_id, row);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Groups already looked up: their name and category.
+    pub(crate) fn cached_groups(
+        &self,
+        group_ids: &[u32],
+    ) -> Result<HashMap<u32, (String, u32)>, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare_cached("SELECT name, category_id FROM eve_groups WHERE group_id = ?1")
+            .map_err(|error| error.to_string())?;
+        let mut found = HashMap::new();
+        for group_id in group_ids {
+            let row = stmt
+                .query_row(params![*group_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(row) = row {
+                found.insert(*group_id, row);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Remembers types with their groups.
+    pub(crate) fn store_types(&self, types: &[EveType], current_time: u64) -> Result<(), String> {
+        let mut conn = self.open()?;
+        let tx = Self::write_transaction(&mut conn)?;
+        {
+            let mut type_stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO eve_types (type_id, name, group_id, fetched_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|error| error.to_string())?;
+            let mut group_stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO eve_groups (group_id, name, category_id, fetched_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|error| error.to_string())?;
+            for info in types {
+                type_stmt
+                    .execute(params![
+                        info.type_id,
+                        info.name,
+                        info.group_id,
+                        current_time as i64
+                    ])
+                    .map_err(|error| error.to_string())?;
+                group_stmt
+                    .execute(params![
+                        info.group_id,
+                        info.group_name,
+                        info.category_id,
+                        current_time as i64
+                    ])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Keeps a system's latest paste of one kind ("local" or "dscan"), as JSON.
+    pub(crate) fn record_live_intel(
+        &self,
+        system_id: &str,
+        kind: &str,
+        captured_at: u64,
+        report: &str,
+    ) -> Result<(), String> {
+        let conn = self.open()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO live_intel (system_id, kind, captured_at, report)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![system_id, kind, captured_at as i64, report],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    /// Every kept paste: (system ID, kind, JSON report).
+    pub(crate) fn live_intel(&self) -> Result<Vec<(String, String, String)>, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare_cached("SELECT system_id, kind, report FROM live_intel")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Forgets a system's pastes, e.g. when it leaves the chain.
+    pub(crate) fn forget_live_intel(&self, system_id: &str) -> Result<(), String> {
+        let conn = self.open()?;
+        conn.execute(
+            "DELETE FROM live_intel WHERE system_id = ?1",
+            params![system_id],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 
     fn prune_killmails(conn: &SqliteConnection, current_time: u64) -> Result<(), String> {
@@ -970,6 +1265,42 @@ impl Store {
                  auto INTEGER NOT NULL DEFAULT 0,
                  UNIQUE (system_id, assessed_at)
               );
+              -- Pilots, corporations, alliances and item types looked up by name or
+              -- ID, for reading pasted local and d-scans.
+              CREATE TABLE IF NOT EXISTS eve_names (
+                 id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 fetched_at INTEGER NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS idx_eve_names_name
+                 ON eve_names(category, name COLLATE NOCASE);
+              CREATE TABLE IF NOT EXISTS character_affiliations (
+                 character_id INTEGER PRIMARY KEY,
+                 corporation_id INTEGER NOT NULL,
+                 alliance_id INTEGER NOT NULL DEFAULT 0,
+                 expires_at INTEGER NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS eve_types (
+                 type_id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 group_id INTEGER NOT NULL,
+                 fetched_at INTEGER NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS eve_groups (
+                 group_id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 category_id INTEGER NOT NULL,
+                 fetched_at INTEGER NOT NULL
+              );
+              -- The latest pasted local and d-scan of each system, as JSON.
+              CREATE TABLE IF NOT EXISTS live_intel (
+                 system_id TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 captured_at INTEGER NOT NULL,
+                 report TEXT NOT NULL,
+                 PRIMARY KEY (system_id, kind)
+              ) WITHOUT ROWID;
               CREATE INDEX IF NOT EXISTS idx_umbra_briefings_briefed_at
                  ON umbra_briefings(briefed_at);
               CREATE INDEX IF NOT EXISTS idx_signatures_system_id ON signatures(system_id);
@@ -1439,14 +1770,16 @@ fn traffic_kills(row: &Row<'_>, first_column: usize) -> rusqlite::Result<KillCou
 #[cfg(test)]
 mod tests {
     use super::{
-        KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS, UMBRA_FEED_MAX_KEPT,
-        UMBRA_FEED_RETENTION_SECS,
+        KILLMAIL_RETENTION_SECS, LIVE_INTEL_RETENTION_SECS, LOOKUP_RETENTION_SECS, Store,
+        TRAFFIC_RETENTION_SECS, UMBRA_FEED_MAX_KEPT, UMBRA_FEED_RETENTION_SECS,
     };
     use crate::model::{
-        AppData, AutoIntelSettings, CachedKillmail, DashboardLayout, KillCounts, KillboardCoverage,
-        MapPosition, TrafficHour, TrafficReading, TrafficRows, TrafficSample, UmbraBriefing,
+        AppData, AutoIntelSettings, CachedKillmail, CharacterAffiliation, DashboardLayout, EveType,
+        KillCounts, KillboardCoverage, MapPosition, TrafficHour, TrafficReading, TrafficRows,
+        TrafficSample, UmbraBriefing,
     };
     use rusqlite::Connection as SqliteConnection;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     const HOUR: u64 = 3_600;
@@ -1713,6 +2046,128 @@ mod tests {
 
         let history = store.system_traffic(1, hour).unwrap();
         assert_eq!(history.samples[0].kills.unwrap().ship_kills, 2);
+    }
+
+    #[test]
+    fn lookups_for_pasted_intel_are_cached_and_pruned() {
+        let db = TestDb::new("lookups");
+        let store = db.store();
+        let current_time = crate::util::now();
+        let old = current_time - LOOKUP_RETENTION_SECS - 1;
+        store
+            .store_names(
+                &[
+                    (90_000_001, "Some Pilot".to_owned(), "character".to_owned()),
+                    (98_000_001, "Some Corp".to_owned(), "corporation".to_owned()),
+                    (11182, "Cheetah".to_owned(), "inventory_type".to_owned()),
+                ],
+                current_time,
+            )
+            .unwrap();
+        store
+            .store_names(
+                &[(90_000_002, "Old Pilot".to_owned(), "character".to_owned())],
+                old,
+            )
+            .unwrap();
+        let names = ["SOME PILOT".to_owned(), "Nobody".to_owned()];
+        let ids = store.cached_ids_by_name("character", &names).unwrap();
+        assert_eq!(
+            ids.get("some pilot"),
+            Some(&(90_000_001, "Some Pilot".to_owned()))
+        );
+        assert_eq!(ids.len(), 1);
+        // A type's name is not a pilot's.
+        let cheetah = ["Cheetah".to_owned()];
+        assert!(
+            store
+                .cached_ids_by_name("character", &cheetah)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.cached_names(&[98_000_001, 1]).unwrap(),
+            HashMap::from([(98_000_001, "Some Corp".to_owned())])
+        );
+
+        let affiliation = CharacterAffiliation {
+            character_id: 90_000_001,
+            corporation_id: 98_000_001,
+            alliance_id: 0,
+        };
+        store
+            .store_affiliations(&[affiliation], current_time + 3_600)
+            .unwrap();
+        store
+            .store_affiliations(
+                &[CharacterAffiliation {
+                    character_id: 90_000_002,
+                    ..affiliation
+                }],
+                current_time - 1,
+            )
+            .unwrap();
+        let cached = store
+            .cached_affiliations(&[90_000_001, 90_000_002], current_time)
+            .unwrap();
+        assert_eq!(cached, HashMap::from([(90_000_001, affiliation)]));
+
+        let sabre = EveType {
+            type_id: 22456,
+            name: "Sabre".to_owned(),
+            group_id: 541,
+            group_name: "Interdictor".to_owned(),
+            category_id: 6,
+        };
+        store
+            .store_types(std::slice::from_ref(&sabre), current_time)
+            .unwrap();
+        assert_eq!(
+            store.cached_types(&[22456, 1]).unwrap(),
+            HashMap::from([(22456, sabre)])
+        );
+        assert_eq!(
+            store.cached_groups(&[541]).unwrap(),
+            HashMap::from([(541, ("Interdictor".to_owned(), 6))])
+        );
+
+        store
+            .record_live_intel("sys_a", "local", current_time - 60, "{\"pilot_count\":3}")
+            .unwrap();
+        store
+            .record_live_intel("sys_a", "local", current_time, "{\"pilot_count\":4}")
+            .unwrap();
+        store
+            .record_live_intel(
+                "sys_b",
+                "dscan",
+                current_time - LIVE_INTEL_RETENTION_SECS - 1,
+                "{}",
+            )
+            .unwrap();
+        assert_eq!(store.live_intel().unwrap().len(), 2);
+
+        // Loading prunes what is too old to trust.
+        store.load().unwrap();
+        assert!(
+            store
+                .cached_ids_by_name("character", &["Old Pilot".to_owned()])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.live_intel().unwrap(),
+            vec![(
+                "sys_a".to_owned(),
+                "local".to_owned(),
+                "{\"pilot_count\":4}".to_owned()
+            )]
+        );
+        store.forget_live_intel("sys_a").unwrap();
+        assert!(store.live_intel().unwrap().is_empty());
+        // Saving the map leaves the caches alone.
+        store.save(&AppData::default()).unwrap();
+        assert_eq!(store.cached_names(&[98_000_001]).unwrap().len(), 1);
     }
 
     #[test]
