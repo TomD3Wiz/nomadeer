@@ -7,7 +7,7 @@ use crate::portrait;
 use crate::store::Store;
 use crate::util::{clean, now, open_url};
 use crate::widgets::{pill, record_frame};
-use crate::zkill::{self, ZkillReport};
+use crate::zkill::{self, ZkillKill, ZkillReport};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -66,6 +66,7 @@ pub(crate) struct NomadeerApp {
     esi_busy: bool,
     zkill_busy_system_id: Option<u64>,
     zkill_reports: HashMap<u64, ZkillReport>,
+    selected_zkill_kill: Option<ZkillKill>,
     portrait_textures: HashMap<String, egui::TextureHandle>,
     portrait_requested: HashSet<String>,
     chain_snapshot_name: String,
@@ -100,6 +101,7 @@ impl NomadeerApp {
             esi_busy: false,
             zkill_busy_system_id: None,
             zkill_reports: HashMap::new(),
+            selected_zkill_kill: None,
             portrait_textures: HashMap::new(),
             portrait_requested: HashSet::new(),
             chain_snapshot_name: String::new(),
@@ -1686,7 +1688,10 @@ impl NomadeerApp {
                 ui.horizontal_wrapped(|ui| {
                     let (relative_time, time_color) = Self::relative_kill_time(&kill.killmail_time);
                     ui.label(egui::RichText::new(relative_time).color(time_color));
-                    if ui.button(format!("Kill {}", kill.killmail_id)).clicked() {
+                    if ui.button("View details").clicked() {
+                        self.selected_zkill_kill = Some(kill.clone());
+                    }
+                    if ui.button("Open in browser").clicked() {
                         self.open_external_url(&format!(
                             "https://zkillboard.com/kill/{}/",
                             kill.killmail_id
@@ -1706,7 +1711,6 @@ impl NomadeerApp {
                 let ship_name = kill
                     .victim_ship_type_name
                     .clone()
-                    .or_else(|| kill.victim_ship_type_id.map(|id| format!("Ship type {id}")))
                     .unwrap_or_else(|| "Unknown ship".to_owned());
                 ui.label(format!(
                     "{victim_name} lost {ship_name} · {} attackers · {}",
@@ -1728,6 +1732,193 @@ impl NomadeerApp {
                     (None, None) => {}
                 }
             });
+        }
+    }
+
+    fn zkill_details_window(&mut self, ctx: &egui::Context) {
+        let Some(kill) = self.selected_zkill_kill.clone() else {
+            return;
+        };
+
+        let mut open = true;
+        egui::Window::new(format!("Kill {}", kill.killmail_id))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(620.0)
+            .default_height(680.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let (relative_time, time_color) =
+                            Self::relative_kill_time(&kill.killmail_time);
+                        ui.label(egui::RichText::new(relative_time).color(time_color));
+                        ui.label(
+                            egui::RichText::new(&kill.killmail_time).color(theme::muted_text()),
+                        );
+                        if kill.solo {
+                            pill(ui, "solo");
+                        }
+                        if kill.npc {
+                            pill(ui, "NPC");
+                        }
+                        if kill.awox {
+                            pill(ui, "AWOX");
+                        }
+                    });
+
+                    if ui.button("Open in browser").clicked() {
+                        self.open_external_url(&format!(
+                            "https://zkillboard.com/kill/{}/",
+                            kill.killmail_id
+                        ));
+                    }
+
+                    ui.separator();
+                    ui.heading("Loss");
+                    let victim_name = kill
+                        .victim_character_name
+                        .as_deref()
+                        .unwrap_or("Unknown victim");
+                    let ship_name = kill
+                        .victim_ship_type_name
+                        .as_deref()
+                        .unwrap_or("Unknown ship");
+                    ui.label(
+                        egui::RichText::new(format!("{victim_name} · {ship_name}"))
+                            .color(theme::system_text())
+                            .strong(),
+                    );
+                    Self::zkill_affiliation(
+                        ui,
+                        kill.victim_corporation_name.as_deref(),
+                        kill.victim_alliance_name.as_deref(),
+                    );
+                    ui.label(format!(
+                        "{} damage taken · {} points",
+                        kill.victim_damage_taken, kill.points
+                    ));
+
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        pill(ui, &format!("{} total", Self::format_isk(kill.total_value)));
+                        pill(
+                            ui,
+                            &format!("{} fitted", Self::format_isk(kill.fitted_value)),
+                        );
+                        pill(
+                            ui,
+                            &format!("{} destroyed", Self::format_isk(kill.destroyed_value)),
+                        );
+                        pill(
+                            ui,
+                            &format!("{} dropped", Self::format_isk(kill.dropped_value)),
+                        );
+                    });
+
+                    ui.separator();
+                    egui::CollapsingHeader::new(format!("Attackers ({})", kill.attackers.len()))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let mut attackers = kill.attackers.clone();
+                            attackers.sort_by_key(|attacker| {
+                                (
+                                    std::cmp::Reverse(attacker.final_blow),
+                                    std::cmp::Reverse(attacker.damage_done),
+                                )
+                            });
+                            for attacker in attackers {
+                                record_frame(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        let attacker_name = attacker
+                                            .character_name
+                                            .as_deref()
+                                            .or(attacker.faction_name.as_deref())
+                                            .unwrap_or("NPC / unknown attacker");
+                                        ui.label(
+                                            egui::RichText::new(attacker_name)
+                                                .color(theme::character_text())
+                                                .strong(),
+                                        );
+                                        if attacker.final_blow {
+                                            pill(ui, "final blow");
+                                        }
+                                        ui.label(format!("sec {:.1}", attacker.security_status));
+                                    });
+                                    Self::zkill_affiliation(
+                                        ui,
+                                        attacker.corporation_name.as_deref(),
+                                        attacker.alliance_name.as_deref(),
+                                    );
+                                    let ship = attacker
+                                        .ship_type_name
+                                        .as_deref()
+                                        .unwrap_or("Unknown ship");
+                                    let weapon = attacker
+                                        .weapon_type_name
+                                        .as_deref()
+                                        .unwrap_or("Unknown weapon");
+                                    ui.label(format!(
+                                        "{ship} · {weapon} · {} damage",
+                                        attacker.damage_done
+                                    ));
+                                });
+                            }
+                        });
+
+                    ui.separator();
+                    egui::CollapsingHeader::new(format!(
+                        "Fitting and cargo ({})",
+                        kill.items.len()
+                    ))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if kill.items.is_empty() {
+                            ui.label("No item details were included in this killmail.");
+                        }
+                        for item in &kill.items {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(&item.type_name);
+                                if item.quantity_destroyed > 0 {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} destroyed",
+                                            item.quantity_destroyed
+                                        ))
+                                        .color(Color32::from_rgb(255, 91, 112)),
+                                    );
+                                }
+                                if item.quantity_dropped > 0 {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} dropped",
+                                            item.quantity_dropped
+                                        ))
+                                        .color(Color32::from_rgb(126, 231, 135)),
+                                    );
+                                }
+                            });
+                        }
+                    });
+                });
+            });
+
+        if !open {
+            self.selected_zkill_kill = None;
+        }
+    }
+
+    fn zkill_affiliation(ui: &mut egui::Ui, corporation: Option<&str>, alliance: Option<&str>) {
+        match (corporation, alliance) {
+            (Some(corporation), Some(alliance)) => {
+                ui.label(format!("{corporation} · {alliance}"));
+            }
+            (Some(corporation), None) => {
+                ui.label(corporation);
+            }
+            (None, Some(alliance)) => {
+                ui.label(alliance);
+            }
+            (None, None) => {}
         }
     }
 
@@ -2023,6 +2214,7 @@ impl eframe::App for NomadeerApp {
         self.esi_settings_window(ctx);
         self.side_panel(ctx);
         self.central_panel(ctx);
+        self.zkill_details_window(ctx);
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 }
