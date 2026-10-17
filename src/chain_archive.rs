@@ -163,6 +163,39 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_keep_wormhole_state_and_older_ones_still_load() {
+        // Saved before wormhole types, end-of-life times and probe scans.
+        let older: ChainSnapshot = serde_json::from_str(
+            r#"{"name": "Home", "created_at": 1,
+                "connections": [{
+                    "id": "conn_a", "from_system": "sys_a", "to_system": "sys_b",
+                    "signature_from": "ABC-123", "signature_to": "", "mass_status": "destab",
+                    "life_status": "eol", "ship_size": "", "notes": "", "created_at": 2
+                }],
+                "signatures": [{
+                    "id": "sig_a", "system_id": "sys_a", "code": "ABC-123",
+                    "sig_type": "wormhole", "target": "", "life": "", "status": "",
+                    "notes": "", "created_at": 3
+                }]}"#,
+        )
+        .unwrap();
+        assert_eq!(older.connections[0].wormhole_code, "");
+        assert_eq!(older.connections[0].eol_marked_at, 0);
+        assert_eq!(older.signatures[0].scan_group, "");
+
+        let mut marked = older.clone();
+        marked.connections[0].wormhole_code = "B274".to_owned();
+        marked.connections[0].wormhole_origin = "sys_a".to_owned();
+        marked.connections[0].eol_marked_at = 1_760_000_000;
+        marked.signatures[0].scan_group = "Cosmic Signature".to_owned();
+        marked.signatures[0].signal = 100.0;
+        let json = serde_json::to_string(&marked).unwrap();
+        let loaded: ChainSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.connections, marked.connections);
+        assert_eq!(loaded.signatures, marked.signatures);
+    }
+
+    #[test]
     fn snapshot_names_stay_inside_the_archive() {
         let archive = Path::new("archive");
         assert_eq!(

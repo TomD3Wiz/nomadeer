@@ -22,7 +22,9 @@ mod chain_art;
 mod chain_map;
 mod chain_view;
 mod layout;
+mod scan;
 mod umbra;
+mod wormholes;
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const WARNING_TEXT: Color32 = Color32::from_rgb(255, 194, 87);
@@ -231,6 +233,10 @@ pub(crate) struct NomadeerApp {
     chain_confirm_reset_layout: bool,
     /// The key to the chain map's artwork is open.
     chain_show_legend: bool,
+    /// What the last pasted probe scan did, shown beside the system's signatures.
+    scan_notice: Option<scan::ScanNotice>,
+    /// When the Paste scan button asked for the clipboard, until it arrives.
+    paste_requested: Option<Instant>,
     next_auto_sync: Instant,
     auto_sync_index: usize,
 }
@@ -303,6 +309,8 @@ impl NomadeerApp {
             chain_drag: None,
             chain_confirm_reset_layout: false,
             chain_show_legend: false,
+            scan_notice: None,
+            paste_requested: None,
             next_auto_sync: Instant::now() + Duration::from_secs(5),
             auto_sync_index: 0,
         };
@@ -1366,7 +1374,13 @@ impl NomadeerApp {
                         .systems
                         .iter()
                         .find(|system| system.solar_system_id == report.solar_system_id)
-                        .map(|system| local_intel::assess_system(system, &report, &traffic, now()));
+                        .map(|system| {
+                            let mut assessment =
+                                local_intel::assess_system(system, &report, &traffic, now());
+                            // What the player marked on the chain is evidence too.
+                            assessment.evidence.extend(self.chain_facts_for(&system.id));
+                            assessment
+                        });
                     let mut save_error = save_error;
                     if let Some(mut assessment) = assessment {
                         if let Some(previous) = self.system_assessments.get(&assessment.system_id) {
@@ -1533,6 +1547,8 @@ impl NomadeerApp {
             }
             CoreStatus::Ready => {}
         }
+        // The chain may have changed since the assessment, e.g. a hole marked EOL.
+        self.refresh_chain_facts(system_id);
         let Some(assessment) = self.system_assessments.get(system_id).cloned() else {
             self.set_umbra_notice(
                 Some(system_id.to_owned()),
@@ -2058,6 +2074,7 @@ impl NomadeerApp {
             ship_size: String::new(),
             notes: format!("Inferred from {character_name} movement"),
             created_at: now(),
+            ..Connection::default()
         });
     }
 
@@ -2090,6 +2107,7 @@ impl NomadeerApp {
             ship_size: String::new(),
             notes: "Linked on chain map".to_owned(),
             created_at: now(),
+            ..Connection::default()
         });
         self.save();
         self.status = format!("Linked {from_name} to {to_name}");
@@ -2363,7 +2381,7 @@ impl NomadeerApp {
             .auto_shrink([false, false])
             .show(&mut tabs_ui, |ui| match self.active_tab {
                 DashboardTab::Movement => self.recent_movements(ui),
-                DashboardTab::Connections => self.inferred_connections(ui),
+                DashboardTab::Connections => self.connections_tab(ui),
                 DashboardTab::Systems => self.systems_overview(ui),
                 DashboardTab::Intel => self.selected_system_intel(ui),
                 DashboardTab::Chain => self.chain_management(ui),
@@ -2607,6 +2625,7 @@ impl NomadeerApp {
                 self.delete_system(&system_id);
             }
         });
+        record_frame(ui, |ui| self.signatures_section(ui, &system_id));
     }
 
     /// What is under way for a system's intel: its killboard refresh and, with
@@ -3482,52 +3501,6 @@ impl NomadeerApp {
             });
         }
     }
-
-    fn inferred_connections(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Inferred connections");
-        let mut connections = self.data.connections.clone();
-        connections.sort_by_key(|connection| std::cmp::Reverse(connection.created_at));
-
-        if connections.is_empty() {
-            ui.label("No movement-derived connections yet.");
-            return;
-        }
-
-        let mut delete_id = None;
-        for connection in connections.into_iter().take(12) {
-            record_frame(ui, |ui| {
-                let from_system = self.system_by_id(&connection.from_system);
-                let to_system = self.system_by_id(&connection.to_system);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(self.system_name(&connection.from_system))
-                            .color(theme::system_text()),
-                    );
-                    ui.label(egui::RichText::new("→").color(theme::muted_text()));
-                    ui.label(
-                        egui::RichText::new(self.system_name(&connection.to_system))
-                            .color(theme::system_text()),
-                    );
-                });
-                if let Some(system) = from_system {
-                    ui.label(self.system_intel_summary(system));
-                }
-                if let Some(system) = to_system {
-                    ui.label(self.system_intel_summary(system));
-                }
-                if !connection.notes.is_empty() {
-                    ui.label(&connection.notes);
-                }
-                if ui.small_button("Delete connection").clicked() {
-                    delete_id = Some(connection.id.clone());
-                }
-            });
-        }
-
-        if let Some(id) = delete_id {
-            self.delete_connection(&id);
-        }
-    }
 }
 
 impl eframe::App for NomadeerApp {
@@ -3544,6 +3517,7 @@ impl eframe::App for NomadeerApp {
         self.maybe_check_umbra_core();
         self.maybe_start_intel();
         self.maybe_start_auto_briefing();
+        self.handle_paste(ctx);
         self.top_bar(ctx);
         self.esi_settings_window(ctx);
         self.local_intel_settings_window(ctx);

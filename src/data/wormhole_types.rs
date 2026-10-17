@@ -2,9 +2,6 @@
 //! The table is generated from ESI by tools/data/gen_wormhole_types.py; rerun it
 //! after a patch adds or changes holes rather than editing it.
 
-// Only the chain map's connection labels use it so far.
-#![allow(dead_code)]
-
 /// The kind of space a wormhole leads to, from its type's target system class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TargetClass {
@@ -138,6 +135,8 @@ pub(crate) fn by_code(code: &str) -> Option<&'static WormholeType> {
         .find(|wormhole| wormhole.code.eq_ignore_ascii_case(code))
 }
 
+// Nothing reads type IDs from the game yet; kept for scanner and ESI lookups.
+#[allow(dead_code)]
 pub(crate) fn by_type_id(type_id: u32) -> Option<&'static WormholeType> {
     WORMHOLE_TYPES
         .iter()

@@ -178,31 +178,64 @@ impl MapPosition {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Connection {
     pub(crate) id: String,
     pub(crate) from_system: String,
     pub(crate) to_system: String,
+    /// The signature ID of this wormhole in `from_system`, e.g. "ABC-123".
     pub(crate) signature_from: String,
+    /// The signature ID of this wormhole in `to_system`.
     pub(crate) signature_to: String,
+    /// "stable", "reduced", "critical" or "unknown"; see `wormhole::MassState`.
     pub(crate) mass_status: String,
+    /// "fresh", "eol" or "unknown"; see `wormhole::LifeState`.
     pub(crate) life_status: String,
     pub(crate) ship_size: String,
     pub(crate) notes: String,
     pub(crate) created_at: u64,
+    /// The wormhole's type code on the side it spawned, e.g. "B274"; empty when not
+    /// known. The other side is always a K162.
+    #[serde(default)]
+    pub(crate) wormhole_code: String,
+    /// The system the wormhole spawned in, i.e. the side showing `wormhole_code`;
+    /// empty when not known.
+    #[serde(default)]
+    pub(crate) wormhole_origin: String,
+    /// When the player marked it end of life, in Unix seconds; 0 when not marked.
+    #[serde(default)]
+    pub(crate) eol_marked_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Signature {
     pub(crate) id: String,
     pub(crate) system_id: String,
+    /// The in-game signature ID, e.g. "ABC-123".
     pub(crate) code: String,
+    /// The probe scanner's Type column, e.g. "Wormhole" or "Data Site"; empty until
+    /// scanned far enough.
     pub(crate) sig_type: String,
+    /// The site's name, e.g. "Unstable Wormhole".
     pub(crate) target: String,
     pub(crate) life: String,
     pub(crate) status: String,
     pub(crate) notes: String,
+    /// When it was first recorded.
     pub(crate) created_at: u64,
+    /// The probe scanner's Group column, e.g. "Cosmic Signature".
+    #[serde(default)]
+    pub(crate) scan_group: String,
+    /// The best signal strength scanned, 0 to 100.
+    #[serde(default)]
+    pub(crate) signal: f32,
+    /// When a scan last told Nomadeer something new about it; 0 if never.
+    #[serde(default)]
+    pub(crate) updated_at: u64,
+    /// The wormhole type code the player read off it, e.g. "B274" or "K162", while
+    /// it is not linked to a connection.
+    #[serde(default)]
+    pub(crate) wormhole_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

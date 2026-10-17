@@ -10,12 +10,16 @@ mod esi;
 mod forms;
 mod local_intel;
 mod model;
+mod paste;
 mod paths;
 mod portrait;
+mod probe_scan;
 mod recon;
+mod signatures;
 mod store;
 mod util;
 mod widgets;
+mod wormhole;
 mod zkill;
 
 use app::NomadeerApp;

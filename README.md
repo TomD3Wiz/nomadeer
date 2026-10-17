@@ -8,6 +8,8 @@ Nomadeer is a Rust application built with `egui`/`eframe`. Everything it stores 
 
 - Interactive chain map built from your characters' movement: zoom and pan around it, drag systems where you want them, and drag from one system to another to link them.
 - Systems you can read at a glance: wormholes swirl in their class colour (C1 cool blue through C6 red, with their own looks for Thera, shattered and Drifter systems), known space shows its security band, and a badge marks the NPC faction that holds it. Connections show their mass and end of life, and the map's **Legend** explains every look.
+- Probe scans pasted straight from the game: copy the probe scanner's rows and press **Ctrl+V** (or **Paste scan**) to add and update the selected system's signatures. Signatures that dropped off the scanner are offered for removal, never removed on their own.
+- Wormhole types and state on every connection: set its code (B274, H296, ...) with suggestions for where it leads, mark it end of life, mass reduced or critical from the map's right-click menu, and see its size, mass, lifetime and roughly when it expires. What you mark goes into Umbra's evidence for the system.
 - Character tracking through EVE single sign-on (loopback OAuth with PKCE, no client secret).
 - Save and restore historical chain snapshots.
 - Selected-system killboard history with detailed in-app kill reports.
@@ -165,7 +167,6 @@ Umbra's real-model tests are ignored by default; with the core installed, run th
 ## Roadmap ideas
 
 - Editable records instead of delete/recreate.
-- Wormhole type presets for mass, life, and ship size.
 - Import/export chain snapshots.
 - Optional encrypted data store.
 - Flathub publication and code-signed Windows builds.
