@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.TomD3Wiz.Nomadeer</id>
+  <name>Nomadeer</name>
+  <summary>Wormhole companion for EVE Online</summary>
+  <developer id="io.github.tomd3wiz">
+    <name>TomD3Wiz</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <description>
+    <p>
+      Nomadeer rides alongside your EVE Online session and keeps track of the
+      wormhole space around you, so you can spend less time on notes and more
+      time flying.
+    </p>
+    <ul>
+      <li>Chain mapping: follow your characters as they jump and build an
+        interactive map of the connections you find</li>
+      <li>Character tracking: see which system each of your characters is in
+        and follow their movement</li>
+      <li>Killboard intel: recent kills and activity for the selected system,
+        so you know who has been through before you arrive</li>
+      <li>Umbra: an optional on-device companion that watches the killboards
+        and gives you a short briefing on the selected system</li>
+    </ul>
+    <p>
+      Nomadeer is a fan-made tool and is not affiliated with CCP Games.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.TomD3Wiz.Nomadeer.desktop</launchable>
+  <icon type="stock">io.github.TomD3Wiz.Nomadeer</icon>
+
+  <url type="homepage">https://github.com/TomD3Wiz/nomadeer</url>
+  <url type="bugtracker">https://github.com/TomD3Wiz/nomadeer/issues</url>
+  <url type="vcs-browser">https://github.com/TomD3Wiz/nomadeer</url>
+
+  <categories>
+    <category>Game</category>
+    <category>Utility</category>
+  </categories>
+
+  <keywords>
+    <keyword>EVE Online</keyword>
+    <keyword>wormhole</keyword>
+    <keyword>chain mapper</keyword>
+    <keyword>killboard</keyword>
+    <keyword>intel</keyword>
+  </keywords>
+
+  <requires>
+    <display_length compare="ge">960</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <internet>always</internet>
+  </supports>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-10-17">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>
