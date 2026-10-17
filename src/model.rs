@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+/// Nomadeer's registered EVE application. It uses PKCE, so there is no secret.
+pub(crate) const DEFAULT_ESI_CLIENT_ID: &str = "93a6ff589aad4d09b2ed0003e742509b";
 pub(crate) const DEFAULT_ESI_SCOPES: &str = "publicData esi-location.read_location.v1 esi-location.read_ship_type.v1 esi-search.search_structures.v1 esi-universe.read_structures.v1 esi-ui.open_window.v1 esi-ui.write_waypoint.v1 esi-location.read_online.v1 esi-planets.read_customs_offices.v1 esi-structures.read_corporation.v1 esi-structures.read_character.v1 esi-activities.read_character.v1 esi.activity.char:read esi.cosmetic.char:read";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

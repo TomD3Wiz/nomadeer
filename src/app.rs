@@ -249,6 +249,9 @@ impl NomadeerApp {
         match self.store.load() {
             Ok(data) => {
                 self.data = data;
+                if self.data.esi_settings.client_id.is_empty() {
+                    self.data.esi_settings.client_id = DEFAULT_ESI_CLIENT_ID.to_owned();
+                }
                 self.system_assessments = self
                     .data
                     .system_assessments
@@ -305,7 +308,13 @@ impl NomadeerApp {
             return false;
         };
 
-        self.data.esi_settings.client_id = clean(&self.esi_settings_form.client_id);
+        let client_id = clean(&self.esi_settings_form.client_id);
+        self.data.esi_settings.client_id = if client_id.is_empty() {
+            DEFAULT_ESI_CLIENT_ID.to_owned()
+        } else {
+            client_id
+        };
+        self.esi_settings_form.client_id = self.data.esi_settings.client_id.clone();
         self.data.esi_settings.callback_port = callback_port;
         self.data.esi_settings.scopes = clean(&self.esi_settings_form.scopes);
         self.save();
@@ -539,7 +548,7 @@ impl NomadeerApp {
 
     fn esi_settings_contents(&mut self, ui: &mut egui::Ui) -> bool {
         let mut close_requested = false;
-        ui.label("Register an EVE app with this callback URL:");
+        ui.label("Nomadeer signs in with its own EVE app. To use your own instead, register it with this callback URL:");
         ui.monospace(format!(
             "http://localhost:{}/callback",
             self.esi_settings_form.callback_port
@@ -548,7 +557,7 @@ impl NomadeerApp {
         ui.label("Client ID");
         ui.add(
             egui::TextEdit::singleline(&mut self.esi_settings_form.client_id)
-                .hint_text("EVE Developers application Client ID"),
+                .hint_text("Leave empty to use Nomadeer's EVE app"),
         );
         ui.label("Callback port");
         ui.add(
