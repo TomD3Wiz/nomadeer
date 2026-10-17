@@ -310,7 +310,7 @@ const WORMHOLE_REGION_IDS: RangeInclusive<u64> = 11_000_000..=11_999_999;
 /// ESI publishes traffic hourly, for the hour up to its data time. A reading is used for
 /// up to two hours after that, so one missed capture does not blank the assessment, and
 /// its evidence names the hour it covers.
-const TRAFFIC_FRESH_SECS: u64 = 2 * HOUR_SECS;
+pub(crate) const TRAFFIC_FRESH_SECS: u64 = 2 * HOUR_SECS;
 /// Readings this close together are described as one hour of traffic.
 const TRAFFIC_SAME_HOUR_SECS: u64 = 10 * 60;
 /// Pads the jump count so a single kill in a quiet system does not read as a gate camp.
@@ -582,7 +582,7 @@ pub(crate) fn assess_system(
 }
 
 /// W-space is recognised by its system ID; names are no guide, as Jita and J-GAMP show.
-fn is_wormhole_space(system: &SystemNode) -> bool {
+pub(crate) fn is_wormhole_space(system: &SystemNode) -> bool {
     if system.solar_system_id != 0 {
         return WORMHOLE_SYSTEM_IDS.contains(&system.solar_system_id);
     }
@@ -632,7 +632,7 @@ fn traffic_baseline(samples: &[TrafficSample], latest_hour: u64) -> Option<Traff
 }
 
 /// EVE time of day, which is UTC, as "HH:MM".
-fn eve_clock(timestamp: u64) -> String {
+pub(crate) fn eve_clock(timestamp: u64) -> String {
     let seconds = timestamp % DAY_SECS;
     format!("{:02}:{:02}", seconds / HOUR_SECS, seconds % HOUR_SECS / 60)
 }

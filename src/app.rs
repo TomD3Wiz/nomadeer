@@ -23,6 +23,15 @@ const CHAIN_ARCHIVE_DIR: &str = "data/chains";
 const ASSESSMENT_STALE_SECS: u64 = HOUR_SECS;
 const WARNING_TEXT: Color32 = Color32::from_rgb(255, 194, 87);
 
+/// Traffic recent enough to show as describing a system now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecentTraffic {
+    /// End of the oldest hour shown.
+    data_time: u64,
+    jumps: Option<u32>,
+    kills: Option<KillCounts>,
+}
+
 enum EsiTaskResult {
     Authorized(AccountAuthorization),
     Location(LocationSync),
@@ -82,6 +91,16 @@ impl UmbraTask {
             Self::Briefing { waking: false, .. } => "Umbra is writing a briefing...",
         }
     }
+
+    /// The system she is briefing, when a panel for a different system is asking.
+    fn briefing_elsewhere(&self, panel_system_id: Option<&str>) -> Option<&str> {
+        match self {
+            Self::Briefing { system_id, .. } => panel_system_id
+                .filter(|panel| *panel != system_id)
+                .map(|_| system_id.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// Umbra's last word, kept in her panels until her next task.
@@ -135,10 +154,13 @@ pub(crate) struct NomadeerApp {
     traffic_rx: Receiver<TrafficTaskResult>,
     traffic_feeds: Vec<TrafficFeedState>,
     esi_busy: bool,
-    /// The player asked for the location update in flight, so report it even if unchanged.
-    announce_location_sync: bool,
+    /// The ESI task in flight is a background location sync, which only speaks up when a
+    /// character moves, so it does not bury other news every few seconds.
+    background_esi_task: bool,
     zkill_busy_system_id: Option<u64>,
     zkill_reports: HashMap<u64, ZkillReport>,
+    /// The latest traffic readings each killboard refresh found, by solar system ID.
+    refreshed_traffic: HashMap<u64, SystemTrafficHistory>,
     selected_zkill_kill: Option<ZkillKill>,
     system_assessments: HashMap<String, SystemAssessment>,
     umbra_task: Option<UmbraTask>,
@@ -198,9 +220,10 @@ impl NomadeerApp {
                 })
                 .collect(),
             esi_busy: false,
-            announce_location_sync: false,
+            background_esi_task: false,
             zkill_busy_system_id: None,
             zkill_reports: HashMap::new(),
+            refreshed_traffic: HashMap::new(),
             selected_zkill_kill: None,
             system_assessments: HashMap::new(),
             umbra_task: None,
@@ -330,64 +353,143 @@ impl NomadeerApp {
         self.data.systems.iter().find(|system| system.id == id)
     }
 
+    /// The class pill: the w-space class, or HS/LS/NS for known space. W-space is told
+    /// apart the same way the assessment does it, by system ID rather than by name.
     fn inferred_system_class(system: &SystemNode) -> String {
-        if let Some(class) = Self::wormhole_class_from_security_class(&system.class) {
-            return class;
+        if local_intel::is_wormhole_space(system) {
+            return Self::wormhole_class(system).unwrap_or("WH").to_owned();
         }
-        if let Some(class) = Self::wormhole_class_from_security_class(&system.constellation_name) {
-            return class;
-        }
-        if let Some(class) = Self::wormhole_class_from_security_class(&system.region_name) {
-            return class;
-        }
-
-        if system.security_status >= 0.45 {
-            "HS".to_owned()
+        if system.solar_system_id == 0 && system.region_id == 0 && system.security_status == 0.0 {
+            "Unknown"
+        } else if system.security_status >= 0.45 {
+            "HS"
         } else if system.security_status > 0.0 {
-            "LS".to_owned()
-        } else if system.security_status <= 0.0 && !system.name.starts_with('J') {
-            "NS".to_owned()
+            "LS"
         } else {
-            "Unknown".to_owned()
+            "NS"
         }
+        .to_owned()
     }
 
-    fn wormhole_class_from_security_class(security_class: &str) -> Option<String> {
-        let mut parts = security_class.split('-');
-        let prefix = parts.next()?;
-        let class_code = parts.next()?.chars().next()?;
-        if prefix != "C" {
+    /// W-space regions and constellations are named by class letter, e.g. "C-R00023"
+    /// for a C3 region; G is Thera and H the C13 shattered systems.
+    fn wormhole_class(system: &SystemNode) -> Option<&'static str> {
+        let entered = system.class.trim().to_ascii_uppercase();
+        let entered = match entered.as_str() {
+            "C1" => Some("C1"),
+            "C2" => Some("C2"),
+            "C3" => Some("C3"),
+            "C4" => Some("C4"),
+            "C5" => Some("C5"),
+            "C6" => Some("C6"),
+            "C13" => Some("C13"),
+            "THERA" => Some("Thera"),
+            _ => None,
+        };
+        entered.or_else(|| {
+            [&system.region_name, &system.constellation_name]
+                .into_iter()
+                .find_map(|name| {
+                    let mut parts = name.split('-');
+                    let letter = parts.next()?;
+                    parts.next()?.strip_prefix(['R', 'C'])?;
+                    Some(match letter {
+                        "A" => "C1",
+                        "B" => "C2",
+                        "C" => "C3",
+                        "D" => "C4",
+                        "E" => "C5",
+                        "F" => "C6",
+                        "G" => "Thera",
+                        "H" => "C13",
+                        _ => return None,
+                    })
+                })
+        })
+    }
+
+    /// A system's newest traffic that still describes it, from the map node or the
+    /// last killboard refresh. W-space has no traffic feed, so it never has any.
+    fn recent_traffic(
+        system: &SystemNode,
+        refreshed: Option<&SystemTrafficHistory>,
+        current_time: u64,
+    ) -> Option<RecentTraffic> {
+        if local_intel::is_wormhole_space(system) {
             return None;
         }
-
-        let class = match class_code {
-            'A' => "C1",
-            'B' => "C2",
-            'C' => "C3",
-            'D' => "C4",
-            'E' => "C5",
-            'F' => "C6",
-            _ => return None,
+        let is_fresh = |data_time: u64| {
+            data_time != 0
+                && current_time.saturating_sub(data_time) <= local_intel::TRAFFIC_FRESH_SECS
         };
-        Some(class.to_owned())
+        let node_time = system.intel_updated_at;
+        let jumps = match refreshed.and_then(|traffic| traffic.latest_jumps) {
+            Some(reading) if reading.data_time >= node_time => (reading.data_time, reading.value),
+            _ => (node_time, system.jumps_1h),
+        };
+        let kills = match refreshed.and_then(|traffic| traffic.latest_kills) {
+            Some(reading) if reading.data_time >= node_time => (reading.data_time, reading.value),
+            _ => (
+                node_time,
+                KillCounts {
+                    ship_kills: system.ship_kills_1h,
+                    pod_kills: system.pod_kills_1h,
+                    npc_kills: system.npc_kills_1h,
+                },
+            ),
+        };
+        let jumps = Some(jumps).filter(|(data_time, _)| is_fresh(*data_time));
+        let kills = Some(kills).filter(|(data_time, _)| is_fresh(*data_time));
+        let data_time = match (jumps, kills) {
+            (Some((jumps_time, _)), Some((kills_time, _))) => jumps_time.min(kills_time),
+            (Some((data_time, _)), None) | (None, Some((data_time, _))) => data_time,
+            (None, None) => return None,
+        };
+        Some(RecentTraffic {
+            data_time,
+            jumps: jumps.map(|(_, jumps)| jumps),
+            kills: kills.map(|(_, kills)| kills),
+        })
     }
 
-    fn system_intel_summary(system: &SystemNode) -> String {
+    fn recent_traffic_label(traffic: &RecentTraffic) -> String {
+        let mut facts = Vec::new();
+        if let Some(jumps) = traffic.jumps {
+            facts.push(format!("{jumps} jumps"));
+        }
+        if let Some(kills) = traffic.kills {
+            facts.push(format!(
+                "{} ships · {} pods · {} NPCs",
+                kills.ship_kills, kills.pod_kills, kills.npc_kills
+            ));
+        }
+        format!(
+            "Hour to {} EVE time: {}",
+            local_intel::eve_clock(traffic.data_time),
+            facts.join(" · ")
+        )
+    }
+
+    fn system_intel_summary(&self, system: &SystemNode) -> String {
         let region = if system.region_name.is_empty() {
             "Unknown region"
         } else {
             &system.region_name
         };
-
-        format!(
-            "{} · {} · {} jumps · kills {} ship / {} pod / {} NPC",
-            Self::inferred_system_class(system),
-            region,
-            system.jumps_1h,
-            system.ship_kills_1h,
-            system.pod_kills_1h,
-            system.npc_kills_1h
-        )
+        let traffic = Self::recent_traffic(
+            system,
+            self.refreshed_traffic.get(&system.solar_system_id),
+            now(),
+        );
+        match traffic {
+            Some(traffic) => format!(
+                "{} · {} · {}",
+                Self::inferred_system_class(system),
+                region,
+                Self::recent_traffic_label(&traffic)
+            ),
+            None => format!("{} · {}", Self::inferred_system_class(system), region),
+        }
     }
 
     fn open_external_url(&mut self, url: &str) {
@@ -596,22 +698,29 @@ impl NomadeerApp {
         }
     }
 
-    /// Shows what Umbra is doing and her last word. With a system, briefings and notices
-    /// about other systems are left out.
+    /// Shows what Umbra is doing and her last word. With a system, a briefing elsewhere
+    /// is named, and notices about other systems are left out.
     fn umbra_feedback(&self, ui: &mut egui::Ui, system_id: Option<&str>) {
         let concerns = |about: Option<&str>| system_id.is_none() || about == system_id;
+        // Any task keeps her from briefing anywhere, so every panel says what it is.
         if let Some(task) = &self.umbra_task {
-            let about = match task {
-                UmbraTask::Briefing { system_id, .. } => Some(system_id.as_str()),
-                _ => None,
-            };
-            // Installs and checks keep her from briefing anywhere, so show them everywhere.
-            if about.is_none() || concerns(about) {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(task.label());
-                });
-            }
+            ui.horizontal(|ui| {
+                ui.spinner();
+                match task.briefing_elsewhere(system_id) {
+                    Some(other) => ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.label("Umbra is briefing ");
+                        ui.label(
+                            egui::RichText::new(self.system_name(other))
+                                .color(theme::system_text()),
+                        );
+                        ui.label("...");
+                    }),
+                    None => ui.horizontal(|ui| {
+                        ui.label(task.label());
+                    }),
+                };
+            });
         }
         if let Some(notice) = &self.umbra_notice
             && (concerns(notice.system_id.as_deref())
@@ -787,6 +896,7 @@ impl NomadeerApp {
 
     fn spawn_authorize_account(&mut self, account_id: String) {
         self.esi_busy = true;
+        self.background_esi_task = false;
         self.status = "Opening browser to connect character...".to_owned();
         let tx = self.esi_tx.clone();
         let settings = self.data.esi_settings.clone();
@@ -818,7 +928,7 @@ impl NomadeerApp {
 
     fn spawn_sync_location(&mut self, account: Account, show_status: bool) {
         self.esi_busy = true;
-        self.announce_location_sync = show_status;
+        self.background_esi_task = !show_status;
         if show_status {
             self.status = format!("Updating {} location...", account.character_name);
         }
@@ -1015,6 +1125,13 @@ impl NomadeerApp {
                         (None, None) => format!("Loaded {kill_count} kills from the last 7 days"),
                     };
                     self.zkill_busy_system_id = None;
+                    self.refreshed_traffic.insert(
+                        report.solar_system_id,
+                        SystemTrafficHistory {
+                            samples: Vec::new(),
+                            ..traffic
+                        },
+                    );
                     self.zkill_reports.insert(report.solar_system_id, report);
                 }
                 Ok(Err(error)) => {
@@ -1246,7 +1363,10 @@ impl NomadeerApp {
                 }
                 Ok(Err(error)) => {
                     self.esi_busy = false;
-                    self.status = format!("Character update failed: {error}");
+                    // A failed background sync is retried in a few seconds anyway.
+                    if !self.background_esi_task {
+                        self.status = format!("Character update failed: {error}");
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -1335,16 +1455,18 @@ impl NomadeerApp {
             self.ensure_connection(&previous_system_id, &system_id, &character_name);
         }
 
-        // Auto-sync runs every few seconds, so only write when something changed.
-        if system_changed || account_changed || moved {
-            self.save();
-        }
         if self.selected_system_id.is_empty() {
             self.selected_system_id = system_id;
         }
-        // Background syncs only speak up on a move, so they do not bury other news.
-        if moved || std::mem::take(&mut self.announce_location_sync) {
+        if moved || !self.background_esi_task {
             self.status = format!("{character_name} is in {}", location.system.name);
+        }
+        // Auto-sync runs every few seconds, so only write when something changed, and
+        // only a failure is worth replacing the status for.
+        if (system_changed || account_changed || moved)
+            && let Err(error) = self.store.save(&self.data)
+        {
+            self.status = format!("Save failed: {error}");
         }
     }
 
@@ -2152,10 +2274,12 @@ impl NomadeerApp {
         let planet_count = system.planet_count;
         let stargate_count = system.stargate_count;
         let station_count = system.station_count;
-        let jumps_1h = system.jumps_1h;
-        let ship_kills_1h = system.ship_kills_1h;
-        let pod_kills_1h = system.pod_kills_1h;
-        let npc_kills_1h = system.npc_kills_1h;
+        let traffic_line = Self::recent_traffic(
+            system,
+            self.refreshed_traffic.get(&system.solar_system_id),
+            now(),
+        )
+        .map(|traffic| Self::recent_traffic_label(&traffic));
         let assessment_summary = self.system_assessments.get(&system_id).map(|assessment| {
             let (age, stale) = Self::assessment_age(assessment.generated_at, now());
             (
@@ -2222,10 +2346,9 @@ impl NomadeerApp {
                 "{} planets · {} gates · {} stations",
                 planet_count, stargate_count, station_count
             ));
-            ui.label(format!(
-                "Last hour: {} jumps · {} ships · {} pods · {} NPCs",
-                jumps_1h, ship_kills_1h, pod_kills_1h, npc_kills_1h
-            ));
+            if let Some(traffic_line) = &traffic_line {
+                ui.label(traffic_line);
+            }
             if let Some((summary, stale)) = &assessment_summary {
                 ui.label(egui::RichText::new(summary).color(if *stale {
                     theme::muted_text()
@@ -2906,6 +3029,20 @@ impl NomadeerApp {
         let systems = self.data.systems.clone();
         for system in systems {
             let is_selected = system.id == self.selected_system_id;
+            let jumps = Self::recent_traffic(
+                &system,
+                self.refreshed_traffic.get(&system.solar_system_id),
+                now(),
+            )
+            .and_then(|traffic| {
+                traffic.jumps.map(|jumps| {
+                    format!(
+                        " · {jumps} jumps in the hour to {} EVE time",
+                        local_intel::eve_clock(traffic.data_time)
+                    )
+                })
+            })
+            .unwrap_or_default();
             record_frame(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui.selectable_label(is_selected, &system.name).clicked() {
@@ -2918,11 +3055,8 @@ impl NomadeerApp {
                     }
                 });
                 ui.label(format!(
-                    "sec {:.1} · {} planets · {} gates · {} jumps last hour",
-                    system.security_status,
-                    system.planet_count,
-                    system.stargate_count,
-                    system.jumps_1h
+                    "sec {:.1} · {} planets · {} gates{jumps}",
+                    system.security_status, system.planet_count, system.stargate_count,
                 ));
                 if !system.notes.is_empty() {
                     ui.label(&system.notes);
@@ -3069,10 +3203,10 @@ impl NomadeerApp {
                     );
                 });
                 if let Some(system) = from_system {
-                    ui.label(Self::system_intel_summary(system));
+                    ui.label(self.system_intel_summary(system));
                 }
                 if let Some(system) = to_system {
-                    ui.label(Self::system_intel_summary(system));
+                    ui.label(self.system_intel_summary(system));
                 }
                 if !connection.notes.is_empty() {
                     ui.label(&connection.notes);
@@ -3112,9 +3246,9 @@ impl eframe::App for NomadeerApp {
 
 #[cfg(test)]
 mod tests {
-    use super::NomadeerApp;
+    use super::{NomadeerApp, RecentTraffic, UmbraTask};
     use crate::esi::SystemIntel;
-    use crate::model::{KillCounts, SystemNode, TrafficReading};
+    use crate::model::{KillCounts, SystemNode, SystemTrafficHistory, TrafficReading};
 
     fn intel() -> SystemIntel {
         SystemIntel {
@@ -3221,5 +3355,93 @@ mod tests {
         assert_eq!(system.ship_kills_1h, 0);
         // The node still holds older jump data, so it is only as fresh as that.
         assert_eq!(system.intel_updated_at, 7_300);
+    }
+
+    fn located(solar_system_id: u64, name: &str, security_status: f32, region: &str) -> SystemNode {
+        SystemNode {
+            solar_system_id,
+            name: name.to_owned(),
+            security_status,
+            region_id: 1,
+            region_name: region.to_owned(),
+            ..node()
+        }
+    }
+
+    #[test]
+    fn class_pill_follows_the_system_id_not_the_name() {
+        let class = |system: &SystemNode| NomadeerApp::inferred_system_class(system);
+        assert_eq!(class(&located(30_000_142, "Jita", 0.95, "The Forge")), "HS");
+        assert_eq!(
+            class(&located(30_002_187, "Amamake", 0.4, "Heimatar")),
+            "LS"
+        );
+        assert_eq!(
+            class(&located(30_001_198, "J-GAMP", -0.1, "Fountain")),
+            "NS"
+        );
+        assert_eq!(
+            class(&located(31_000_005, "Thera", -0.99, "G-R00031")),
+            "Thera"
+        );
+        assert_eq!(
+            class(&located(31_002_238, "J123456", -0.99, "C-R00023")),
+            "C3"
+        );
+        assert_eq!(class(&located(31_002_238, "J123456", -0.99, "")), "WH");
+
+        let mut manual = node();
+        assert_eq!(class(&manual), "Unknown");
+        manual.class = "c5".to_owned();
+        assert_eq!(class(&manual), "C5");
+    }
+
+    #[test]
+    fn traffic_is_shown_only_while_it_still_describes_the_system() {
+        let now = 20_000 * 3_600 + 1_200;
+        let mut system = located(30_002_187, "Amamake", 0.4, "Heimatar");
+        system.jumps_1h = 40;
+        system.ship_kills_1h = 2;
+        system.intel_updated_at = now - 2 * 86_400;
+        assert_eq!(NomadeerApp::recent_traffic(&system, None, now), None);
+
+        let refreshed = SystemTrafficHistory {
+            latest_jumps: Some(TrafficReading {
+                hour: 0,
+                data_time: now - 600,
+                value: 300,
+            }),
+            ..SystemTrafficHistory::default()
+        };
+        let traffic = NomadeerApp::recent_traffic(&system, Some(&refreshed), now).unwrap();
+        assert_eq!(
+            traffic,
+            RecentTraffic {
+                data_time: now - 600,
+                jumps: Some(300),
+                kills: None,
+            }
+        );
+        assert_eq!(
+            NomadeerApp::recent_traffic_label(&traffic),
+            "Hour to 08:10 EVE time: 300 jumps"
+        );
+
+        // W-space has no traffic feed, so its zeroes are never shown as measured.
+        let mut hole = located(31_002_238, "J123456", -0.99, "C-R00023");
+        hole.intel_updated_at = now - 600;
+        assert_eq!(NomadeerApp::recent_traffic(&hole, None, now), None);
+    }
+
+    #[test]
+    fn a_briefing_elsewhere_is_named_in_other_panels() {
+        let task = UmbraTask::Briefing {
+            system_id: "sys_a".to_owned(),
+            waking: false,
+        };
+        assert_eq!(task.briefing_elsewhere(Some("sys_b")), Some("sys_a"));
+        assert_eq!(task.briefing_elsewhere(Some("sys_a")), None);
+        assert_eq!(task.briefing_elsewhere(None), None);
+        assert_eq!(UmbraTask::Checking.briefing_elsewhere(Some("sys_b")), None);
     }
 }
