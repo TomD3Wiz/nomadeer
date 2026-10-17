@@ -163,6 +163,7 @@ jobs:
           # Fail if a build needs a newer glibc than Ubuntu 22.04's.
           APPIMAGE_MAX_GLIBC: "2.35"
           APPIMAGE_REQUIRE_ZSYNC: "1"
+          APPIMAGE_REQUIRE_APPSTREAM: "1"
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           packaging/linux/appimage/build-appimage.sh "${version}" \

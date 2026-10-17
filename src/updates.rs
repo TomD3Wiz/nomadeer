@@ -1376,8 +1376,10 @@ mod tests {
     #[test]
     fn setup_registration_follows_the_installer_scripts_app_id() {
         // Inno writes "{{" for a literal "{" and registers "<AppId>_is1".
+        // Compared line by line: a Windows checkout may give the script CRLF endings.
         let script = include_str!("../packaging/windows/nomadeer.iss");
-        assert!(script.contains(&format!("\nAppId={{{WINDOWS_APP_ID}\n")));
+        let app_id = format!("AppId={{{WINDOWS_APP_ID}");
+        assert!(script.lines().any(|line| line.trim_end() == app_id));
     }
 
     #[test]

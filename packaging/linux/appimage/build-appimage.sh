@@ -108,11 +108,23 @@ cp "$appdir/usr/share/applications/$APP_ID.desktop" "$appdir/$APP_ID.desktop"
 cp "$repo/assets/icons/nomadeer-256.png" "$appdir/$APP_ID.png"
 ln -s "$APP_ID.png" "$appdir/.DirIcon"
 
+# Validate the metainfo offline here and stop appimagetool doing it online: its
+# check fetches screenshot URLs, which point at main and do not exist until the
+# release branch is merged.
+if command -v appstreamcli >/dev/null 2>&1; then
+    appstreamcli validate --no-net "$appdir/usr/share/metainfo/$APP_ID.appdata.xml"
+elif [ "${APPIMAGE_REQUIRE_APPSTREAM:-0}" = 1 ]; then
+    echo "appstreamcli is not installed, so the metainfo cannot be validated" >&2
+    exit 1
+else
+    echo "warning: appstreamcli is not installed, so the metainfo was not validated" >&2
+fi
+
 target="$out/Nomadeer-$version-x86_64.AppImage"
 rm -f "$target" "$target.sha256" "$target.zsync"
 # appimagetool writes the .zsync into the current directory.
 (cd "$out" && ARCH=x86_64 VERSION=$version APPIMAGE_EXTRACT_AND_RUN=1 \
-    "$appimagetool" --runtime-file "$runtime" --mksquashfs-opt -no-xattrs \
+    "$appimagetool" --no-appstream --runtime-file "$runtime" --mksquashfs-opt -no-xattrs \
     --updateinformation "$UPDATE_INFORMATION" "$appdir" "$target")
 (cd "$out" && sha256sum "$(basename "$target")" > "$(basename "$target").sha256")
 if [ -f "$target.zsync" ]; then
