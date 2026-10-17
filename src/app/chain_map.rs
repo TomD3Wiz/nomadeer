@@ -2,7 +2,7 @@
 //! into place, and connections drawn by dragging from one system to another.
 
 use super::chain_art::{self, ConnectionStyle, Detail, Legend, NodeLook};
-use super::chain_view::{self, CONNECTION_PICK_DISTANCE, Camera, HANDLE_RADIUS, NODE_RADIUS};
+use super::chain_view::{self, CONNECTION_PICK_DISTANCE, Camera, NODE_RADIUS};
 use super::{ChainMapTarget, NomadeerApp, umbra};
 use crate::config::theme;
 use crate::util::now;
@@ -130,7 +130,16 @@ impl NomadeerApp {
             match self.chain_drag.take() {
                 Some(ChainDrag::Move { .. }) => self.save_quietly(),
                 Some(ChainDrag::Link { from_system_id }) if response.drag_stopped() => {
-                    let to_system_id = drop.and_then(|pos| {
+                    // Only a system the player can see takes the connection, not one
+                    // off the edge of the map or under its legend or controls.
+                    let on_map = |pos: &Pos2| {
+                        rect.contains(*pos)
+                            && !self
+                                .chain_overlays
+                                .iter()
+                                .any(|overlay| overlay.contains(*pos))
+                    };
+                    let to_system_id = drop.filter(on_map).and_then(|pos| {
                         chain_view::system_at(
                             &self.data.systems,
                             &positions,
@@ -183,6 +192,7 @@ impl NomadeerApp {
         let bounds = chain_view::chain_bounds(positions.values()).unwrap_or(bounds);
         camera = camera.kept_in_view(rect, bounds);
         self.paint_chain(ui, &painter, rect, camera, &positions, pointer);
+        self.chain_overlays.clear();
         if self.chain_show_legend {
             let legend = Legend::fit(rect.height() - 16.0);
             let legend_rect = Rect::from_min_size(
@@ -197,10 +207,13 @@ impl NomadeerApp {
                 Sense::click_and_drag(),
             );
             legend.paint(&painter, legend_rect);
+            self.chain_overlays.push(legend_rect);
         }
 
         let mut refit = false;
-        match self.chain_map_controls(ui, rect, camera.zoom) {
+        let (controls_rect, control) = self.chain_map_controls(ui, rect, camera.zoom);
+        self.chain_overlays.push(controls_rect);
+        match control {
             Some(MapControl::ZoomIn) => {
                 camera = camera.zoomed_at(rect, rect.center(), chain_view::ZOOM_STEP);
             }
@@ -244,16 +257,12 @@ impl NomadeerApp {
             return None;
         }
 
-        if let Some(from_system_id) =
-            chain_view::handle_at(&self.data.systems, positions, camera, rect, origin)
-        {
-            return Some(ChainDrag::Link { from_system_id });
-        }
-        let point = camera.to_map(rect, origin);
-        let Some(system_id) = chain_view::system_at(&self.data.systems, positions, point) else {
+        let Some((system_id, on_handle)) =
+            chain_view::target_at(&self.data.systems, positions, camera, rect, origin)
+        else {
             return Some(ChainDrag::Pan);
         };
-        if response.ctx.input(|input| input.modifiers.shift) {
+        if on_handle || response.ctx.input(|input| input.modifiers.shift) {
             return Some(ChainDrag::Link {
                 from_system_id: system_id,
             });
@@ -268,6 +277,7 @@ impl NomadeerApp {
                 system.map_position = Some(chain_view::to_map_position(*pos));
             }
         }
+        let point = camera.to_map(rect, origin);
         let grab = point - positions.get(&system_id).copied().unwrap_or(point);
         Some(ChainDrag::Move { system_id, grab })
     }
@@ -286,12 +296,21 @@ impl NomadeerApp {
         let screen = |point: &Pos2| camera.to_screen(rect, *point);
         let dragging = self.chain_drag.is_some();
         let pointer_point = pointer.map(|pos| camera.to_map(rect, pos));
-        let hovered_handle = pointer.filter(|_| !dragging).and_then(|pos| {
-            chain_view::handle_at(&self.data.systems, positions, camera, rect, pos)
-        });
-        let hovered_system_id = pointer_point
-            .and_then(|point| chain_view::system_at(&self.data.systems, positions, point))
-            .or_else(|| hovered_handle.clone());
+        // While dragging only bodies count, as the drop target; otherwise the handle
+        // shown is the one a drag from here would start at.
+        let (hovered_system_id, on_handle) = if dragging {
+            let system_id = pointer_point
+                .and_then(|point| chain_view::system_at(&self.data.systems, positions, point));
+            (system_id, false)
+        } else {
+            pointer
+                .and_then(|pos| {
+                    chain_view::target_at(&self.data.systems, positions, camera, rect, pos)
+                })
+                .map_or((None, false), |(system_id, on_handle)| {
+                    (Some(system_id), on_handle)
+                })
+        };
         let hovered_connection_id = if hovered_system_id.is_none() && !dragging {
             pointer_point.and_then(|point| {
                 chain_view::connection_at(
@@ -341,8 +360,8 @@ impl NomadeerApp {
 
         let radius = NODE_RADIUS * zoom;
         let detail = chain_art::detail_for_radius(radius);
-        // Wormholes turn only while the player is looking at them, and not at all
-        // when animations are switched off.
+        // A wormhole turns only while the pointer is on it, so an idle map does not
+        // keep redrawing, and not at all when animations are switched off.
         let still = ui.style().animation_time <= 0.0 || detail == Detail::Minimal;
         let time = ui.input(|input| input.time);
         let mut turning = false;
@@ -367,7 +386,7 @@ impl NomadeerApp {
             let look = chain_art::node_look(system);
             let opacity = chain_art::status_opacity(&system.status);
             let mut phase = chain_art::resting_phase(&system.id);
-            if !still && (is_hovered || is_selected) && matches!(look, NodeLook::Wormhole(_)) {
+            if !still && is_hovered && matches!(look, NodeLook::Wormhole(_)) {
                 phase += chain_art::spin(time);
                 turning = true;
             }
@@ -422,13 +441,14 @@ impl NomadeerApp {
                 );
             }
 
-            if detail_alpha > 0.0 {
+            // A system not located yet already shows its "?".
+            if detail_alpha > 0.0 && look != NodeLook::Unknown {
                 chain_art::shadowed_text(
                     painter,
                     pos,
                     Align2::CENTER_CENTER,
                     &umbra::feed_class_label(system),
-                    FontId::proportional(12.0 * zoom),
+                    chain_art::label_font(12.0 * zoom),
                     Color32::WHITE.gamma_multiply(detail_alpha * opacity),
                 );
             }
@@ -438,7 +458,7 @@ impl NomadeerApp {
                     pos + vec2(0.0, radius + 6.0 * zoom),
                     Align2::CENTER_TOP,
                     &system.name,
-                    FontId::proportional(13.0 * zoom),
+                    chain_art::label_font(13.0 * zoom),
                     theme::system_text().gamma_multiply(name_alpha),
                 );
             }
@@ -452,15 +472,15 @@ impl NomadeerApp {
             && let Some(center) = positions.get(system_id)
         {
             let handle = screen(&chain_view::connector_handle(*center));
-            let on_handle = hovered_handle.as_deref() == Some(system_id.as_str());
+            let handle_radius = chain_view::handle_radius(zoom);
             let (fill, mark) = if on_handle {
                 (LINK_COLOR, theme::panel_background())
             } else {
                 (theme::panel_background(), LINK_COLOR)
             };
-            painter.circle_filled(handle, HANDLE_RADIUS, fill);
-            painter.circle_stroke(handle, HANDLE_RADIUS, Stroke::new(1.5_f32, LINK_COLOR));
-            let arm = HANDLE_RADIUS * 0.5;
+            painter.circle_filled(handle, handle_radius, fill);
+            painter.circle_stroke(handle, handle_radius, Stroke::new(1.5_f32, LINK_COLOR));
+            let arm = handle_radius * 0.5;
             for offset in [vec2(arm, 0.0), vec2(0.0, arm)] {
                 painter.line_segment(
                     [handle - offset, handle + offset],
@@ -507,7 +527,7 @@ impl NomadeerApp {
                 ))
             }
             (Some(_), _, _) => None,
-            (None, Some(system_id), _) if hovered_handle.is_some() => Some(format!(
+            (None, Some(system_id), _) if on_handle => Some(format!(
                 "Drag to another system to link {}",
                 self.system_name(system_id)
             )),
@@ -566,8 +586,14 @@ impl NomadeerApp {
         }
     }
 
-    /// Zoom, Fit and Reset layout, in the map's top-right corner.
-    fn chain_map_controls(&self, ui: &mut egui::Ui, rect: Rect, zoom: f32) -> Option<MapControl> {
+    /// Zoom, Fit and Reset layout, in the map's top-right corner. Returns where they
+    /// are drawn with what the player pressed.
+    fn chain_map_controls(
+        &self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        zoom: f32,
+    ) -> (Rect, Option<MapControl>) {
         let row_height = ui.spacing().interact_size.y + 8.0;
         let strip = Rect::from_min_max(
             pos2(rect.left() + 8.0, rect.top() + 8.0),
@@ -586,31 +612,36 @@ impl NomadeerApp {
 
         // Laid out right to left, so the controls are added last first.
         let mut control = None;
-        egui::Frame::new()
-            .fill(theme::panel_background().gamma_multiply(0.92))
-            .stroke(Stroke::new(1.0_f32, theme::panel_stroke()))
-            .corner_radius(6.0)
-            .inner_margin(egui::Margin::symmetric(6, 3))
-            .show(&mut controls, |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                if self.chain_confirm_reset_layout {
-                    if ui.small_button("Keep").clicked() {
-                        control = Some(MapControl::KeepLayout);
-                    }
-                    if ui.small_button("Reset").clicked() {
-                        control = Some(MapControl::ResetLayout);
-                    }
-                    ui.label(
-                        egui::RichText::new("Arrange every system automatically?")
-                            .color(theme::muted_text()),
-                    );
-                } else {
-                    let placed = self
-                        .data
-                        .systems
-                        .iter()
-                        .any(|system| system.map_position.is_some());
-                    if ui
+        // The whole strip, its gaps, labels and greyed-out buttons too, keeps clicks,
+        // drags and scrolling off the systems beneath it.
+        let shown = controls.scope_builder(
+            egui::UiBuilder::new().sense(Sense::click_and_drag()),
+            |strip| {
+                egui::Frame::new()
+                    .fill(theme::panel_background().gamma_multiply(0.92))
+                    .stroke(Stroke::new(1.0_f32, theme::panel_stroke()))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(6, 3))
+                    .show(strip, |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if self.chain_confirm_reset_layout {
+                            if ui.small_button("Keep").clicked() {
+                                control = Some(MapControl::KeepLayout);
+                            }
+                            if ui.small_button("Reset").clicked() {
+                                control = Some(MapControl::ResetLayout);
+                            }
+                            ui.label(
+                                egui::RichText::new("Arrange every system automatically?")
+                                    .color(theme::muted_text()),
+                            );
+                        } else {
+                            let placed = self
+                                .data
+                                .systems
+                                .iter()
+                                .any(|system| system.map_position.is_some());
+                            if ui
                         .add_enabled(placed, egui::Button::new("Reset layout").small())
                         .on_hover_text(
                             "Forget where systems were dragged and arrange the chain automatically",
@@ -622,40 +653,44 @@ impl NomadeerApp {
                     {
                         control = Some(MapControl::AskResetLayout);
                     }
-                }
-                ui.separator();
-                if ui
-                    .small_button("Fit")
-                    .on_hover_text("Show the whole chain (or double-click empty space)")
-                    .clicked()
-                {
-                    control = Some(MapControl::Fit);
-                }
-                if ui.small_button("+").on_hover_text("Zoom in").clicked() {
-                    control = Some(MapControl::ZoomIn);
-                }
-                ui.label(
-                    egui::RichText::new(format!("{:.0}%", zoom * 100.0))
-                        .monospace()
-                        .color(theme::muted_text()),
-                );
-                if ui.small_button("−").on_hover_text("Zoom out").clicked() {
-                    control = Some(MapControl::ZoomOut);
-                }
-                ui.separator();
-                if ui
-                    .add(
-                        egui::Button::new("Legend")
-                            .small()
-                            .selected(self.chain_show_legend),
-                    )
-                    .on_hover_text("What the systems, badges and connections on the map mean")
-                    .clicked()
-                {
-                    control = Some(MapControl::ToggleLegend);
-                }
-            });
-        control
+                        }
+                        ui.separator();
+                        if ui
+                            .small_button("Fit")
+                            .on_hover_text("Show the whole chain (or double-click empty space)")
+                            .clicked()
+                        {
+                            control = Some(MapControl::Fit);
+                        }
+                        if ui.small_button("+").on_hover_text("Zoom in").clicked() {
+                            control = Some(MapControl::ZoomIn);
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{:.0}%", zoom * 100.0))
+                                .monospace()
+                                .color(theme::muted_text()),
+                        );
+                        if ui.small_button("−").on_hover_text("Zoom out").clicked() {
+                            control = Some(MapControl::ZoomOut);
+                        }
+                        ui.separator();
+                        if ui
+                            .add(
+                                egui::Button::new("Legend")
+                                    .small()
+                                    .selected(self.chain_show_legend),
+                            )
+                            .on_hover_text(
+                                "What the systems, badges and connections on the map mean",
+                            )
+                            .clicked()
+                        {
+                            control = Some(MapControl::ToggleLegend);
+                        }
+                    });
+            },
+        );
+        (shown.response.rect, control)
     }
 
     /// The right-click menu for whatever was under the pointer.

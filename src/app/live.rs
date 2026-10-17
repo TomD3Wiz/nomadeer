@@ -7,22 +7,27 @@ use crate::auto_intel::{self, IntelRequest};
 use crate::config::theme;
 use crate::eve_lookup;
 use crate::live_intel::{
-    self, DscanReport, DscanRow, LIVE_INTEL_FRESH_SECS, LiveContribution, LocalReport,
-    SystemLiveIntel,
+    self, DscanReport, DscanRow, KillerOverlap, LIVE_INTEL_FRESH_SECS, LiveContribution,
+    LocalGroup, LocalReport, SystemKills,
 };
 use crate::local_intel;
-use crate::model::{CachedKillmail, SystemAssessment, SystemNode, SystemTrafficHistory};
+use crate::model::{SystemAssessment, SystemNode, SystemTrafficHistory};
+use crate::paste;
 use crate::store::KILLMAIL_RETENTION_SECS;
 use crate::util::now;
 use crate::wormhole;
 use crate::zkill::ZkillReport;
 use eframe::egui;
+use std::collections::HashSet;
 use std::thread;
 use std::time::Instant;
 
 /// How each kind of paste is kept in the database.
 const LOCAL: &str = "local";
 const DSCAN: &str = "dscan";
+/// When live intel has run out and the system has no killboard read to re-assess
+/// it from, the read is tried again after this long if it fails.
+const EXPIRY_RETRY_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LiveKind {
@@ -37,12 +42,80 @@ pub(super) enum LiveTaskResult {
         report: LocalReport,
         /// The system's solar system ID and cached week of kills, when its killboard
         /// has been read.
-        killmails: Option<(u64, Vec<CachedKillmail>)>,
+        killmails: Option<(u64, SystemKills)>,
     },
     Dscan {
         system_id: String,
         report: DscanReport,
     },
+}
+
+/// What the sidebar shows of a local paste that takes a pass over the system's kills,
+/// worked out again only when the paste, the killboard or the minute changes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct LocalCheck {
+    /// The system, paste time, killboard read, kills held and minute it is for.
+    key: (String, u64, u64, usize, u64),
+    groups: Vec<LocalGroup>,
+    /// None until the system's killboard has been read.
+    overlap: Option<KillerOverlap>,
+    /// The whole week has been read recently, so no kills here means none.
+    week_read: bool,
+    /// Pilots in local who got kills here this week.
+    killers: HashSet<u64>,
+}
+
+impl LocalCheck {
+    fn key(
+        system_id: &str,
+        report: &LocalReport,
+        kills: Option<&SystemKills>,
+        current_time: u64,
+    ) -> (String, u64, u64, usize, u64) {
+        (
+            system_id.to_owned(),
+            report.captured_at,
+            kills.map_or(0, SystemKills::read_at),
+            kills.map_or(0, |kills| kills.killmails.len()),
+            current_time / 60,
+        )
+    }
+
+    fn new(
+        system_id: &str,
+        report: &LocalReport,
+        kills: Option<&SystemKills>,
+        current_time: u64,
+    ) -> Self {
+        let pilots = report
+            .pilots
+            .iter()
+            .map(|pilot| pilot.character_id)
+            .collect::<HashSet<_>>();
+        let killers = kills
+            .map(|kills| {
+                kills
+                    .killmails
+                    .iter()
+                    .filter(|kill| {
+                        !kill.npc
+                            && current_time.saturating_sub(kill.killmail_time)
+                                <= 7 * crate::util::DAY_SECS
+                    })
+                    .flat_map(|kill| kill.attacker_ids.iter().copied())
+                    .filter(|id| pilots.contains(id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            key: Self::key(system_id, report, kills, current_time),
+            groups: live_intel::local_groups(report),
+            overlap: kills
+                .map(|kills| live_intel::killer_overlap(report, &kills.killmails, current_time)),
+            week_read: kills.is_some_and(|kills| kills.covers_week(current_time)),
+            killers,
+        }
+    }
 }
 
 impl NomadeerApp {
@@ -83,6 +156,18 @@ impl NomadeerApp {
     }
 
     pub(super) fn apply_local_paste(&mut self, lines: &[String]) {
+        let own_names = self
+            .data
+            .accounts
+            .iter()
+            .map(|account| account.character_name.as_str())
+            .collect::<Vec<_>>();
+        if !paste::could_be_local(&live_intel::local_names(lines), &own_names) {
+            self.status = "That paste is a single name, not the local member list. Copy all \
+                           of local in game (Ctrl+A, Ctrl+C)"
+                .to_owned();
+            return;
+        }
         let Some(system) = self.selected_system() else {
             self.status = "Select a system on the chain map before pasting local".to_owned();
             return;
@@ -106,24 +191,29 @@ impl NomadeerApp {
         let store = self.store.clone();
         let tx = self.live_tx.clone();
         self.live_reading.push((system_id.clone(), LiveKind::Local));
+        // Taken now, so pastes that finish out of order still sort by when they
+        // were made.
+        let captured_at = now();
         thread::spawn(move || {
+            let report = eve_lookup::read_local(&store, &lines, &own, captured_at);
             let current_time = now();
-            let report = eve_lookup::read_local(&store, &lines, &own, current_time);
             let killmails = (solar_system_id != 0)
                 .then(|| {
-                    let kills = store
+                    let killmails = store
                         .cached_killmails(
                             solar_system_id,
                             current_time.saturating_sub(KILLMAIL_RETENTION_SECS),
                         )
                         .ok()?;
-                    let read = !kills.is_empty()
-                        || store
-                            .killboard_coverage(solar_system_id)
-                            .ok()
-                            .flatten()
-                            .is_some();
-                    read.then_some((solar_system_id, kills))
+                    let coverage = store.killboard_coverage(solar_system_id).ok().flatten();
+                    let read = !killmails.is_empty() || coverage.is_some();
+                    read.then_some((
+                        solar_system_id,
+                        SystemKills {
+                            killmails,
+                            coverage,
+                        },
+                    ))
                 })
                 .flatten();
             let _ = tx.send(LiveTaskResult::Local {
@@ -148,32 +238,55 @@ impl NomadeerApp {
         let store = self.store.clone();
         let tx = self.live_tx.clone();
         self.live_reading.push((system_id.clone(), LiveKind::Dscan));
+        let captured_at = now();
         thread::spawn(move || {
-            let report = eve_lookup::read_dscan(&store, &rows, now());
+            let report = eve_lookup::read_dscan(&store, &rows, captured_at);
             let _ = tx.send(LiveTaskResult::Dscan { system_id, report });
         });
     }
 
     pub(super) fn poll_live_tasks(&mut self) {
         while let Ok(task) = self.live_rx.try_recv() {
-            let (system_id, kind) = match &task {
-                LiveTaskResult::Local { system_id, .. } => (system_id.clone(), LiveKind::Local),
-                LiveTaskResult::Dscan { system_id, .. } => (system_id.clone(), LiveKind::Dscan),
+            let (system_id, kind, captured_at) = match &task {
+                LiveTaskResult::Local {
+                    system_id, report, ..
+                } => (system_id.clone(), LiveKind::Local, report.captured_at),
+                LiveTaskResult::Dscan { system_id, report } => {
+                    (system_id.clone(), LiveKind::Dscan, report.captured_at)
+                }
             };
-            self.live_reading.retain(|(reading, reading_kind)| {
-                !(*reading == system_id && *reading_kind == kind)
-            });
+            // This paste is read; another of the same kind may still be reading.
+            if let Some(index) = self
+                .live_reading
+                .iter()
+                .position(|(reading, reading_kind)| *reading == system_id && *reading_kind == kind)
+            {
+                self.live_reading.remove(index);
+            }
+            if let LiveTaskResult::Local {
+                killmails: Some((solar_system_id, kills)),
+                ..
+            } = &task
+            {
+                self.keep_latest_kills(*solar_system_id, kills.clone());
+            }
             // The system left the chain while its paste was being read.
             if self.system_by_id(&system_id).is_none() {
                 continue;
             }
+            // Pastes are read side by side, so a newer one can finish first; it stays.
+            let held = self
+                .live_intel
+                .get(&system_id)
+                .and_then(|intel| match kind {
+                    LiveKind::Local => intel.local.as_ref().map(|report| report.captured_at),
+                    LiveKind::Dscan => intel.dscan.as_ref().map(|report| report.captured_at),
+                });
+            if held.is_some_and(|held| held > captured_at) {
+                continue;
+            }
             let (saved, summary, error) = match task {
-                LiveTaskResult::Local {
-                    report, killmails, ..
-                } => {
-                    if let Some((solar_system_id, kills)) = killmails {
-                        self.system_killmails.insert(solar_system_id, kills);
-                    }
+                LiveTaskResult::Local { report, .. } => {
                     let summary = self.local_status(&system_id, &report);
                     let saved =
                         serde_json::to_string(&report).map(|json| (report.captured_at, json));
@@ -222,6 +335,19 @@ impl NomadeerApp {
         traffic: &SystemTrafficHistory,
         current_time: u64,
     ) -> SystemAssessment {
+        self.assess_as_of(system, report, traffic, current_time, current_time)
+    }
+
+    /// As [`Self::assess`], dated `assessed_at`: an assessment from an older
+    /// killboard read keeps that read's time, so it still shows as due a refresh.
+    fn assess_as_of(
+        &mut self,
+        system: &SystemNode,
+        report: &ZkillReport,
+        traffic: &SystemTrafficHistory,
+        assessed_at: u64,
+        current_time: u64,
+    ) -> SystemAssessment {
         let live = self.live_contribution(system, current_time);
         let expires_at = self
             .live_intel
@@ -236,7 +362,7 @@ impl NomadeerApp {
             }
         }
         let mut assessment =
-            local_intel::assess_with_live_intel(system, report, traffic, &live, current_time);
+            local_intel::assess_with_live_intel(system, report, traffic, &live, assessed_at);
         // What the player marked on the chain is evidence too.
         assessment.evidence.extend(self.chain_facts_for(&system.id));
         assessment
@@ -246,16 +372,26 @@ impl NomadeerApp {
         let Some(intel) = self.live_intel.get(&system.id) else {
             return LiveContribution::default();
         };
-        let killmails = self
-            .system_killmails
-            .get(&system.solar_system_id)
-            .map(Vec::as_slice);
-        live_intel::contribution(intel, killmails, current_time)
+        let kills = self.system_killmails.get(&system.solar_system_id);
+        live_intel::contribution(intel, kills, current_time)
     }
 
-    /// Re-assesses a system for its live intel: straight away from the killboard
-    /// already read when that is recent, otherwise by reading it again. With `brief`,
-    /// Umbra briefs the new assessment if she briefs on her own.
+    /// Keeps a system's kills unless those already held were read more recently.
+    pub(super) fn keep_latest_kills(&mut self, solar_system_id: u64, kills: SystemKills) {
+        let held = self
+            .system_killmails
+            .get(&solar_system_id)
+            .map(SystemKills::read_at);
+        if held.is_none_or(|held| held <= kills.read_at()) {
+            self.system_killmails.insert(solar_system_id, kills);
+        }
+    }
+
+    /// Re-assesses a system for its live intel. With `brief`, for a new paste, that is
+    /// straight away from the killboard already read when that is recent, otherwise
+    /// by reading it again, and Umbra briefs the new assessment if she briefs on her
+    /// own. Without, for intel that ran out, the last killboard read is reused however
+    /// old, so taking the paste out never starts a read or a briefing of its own.
     fn reassess_with_live_intel(&mut self, system_id: &str, brief: bool) {
         let Some(system) = self.system_by_id(system_id).cloned() else {
             return;
@@ -264,7 +400,9 @@ impl NomadeerApp {
         let report = self
             .zkill_reports
             .get(&system.solar_system_id)
-            .filter(|report| !auto_intel::assessment_is_stale(report.coverage.until, current_time))
+            .filter(|report| {
+                !brief || !auto_intel::assessment_is_stale(report.coverage.until, current_time)
+            })
             .cloned();
         match report {
             Some(report) => {
@@ -273,7 +411,14 @@ impl NomadeerApp {
                     .get(&system.solar_system_id)
                     .cloned()
                     .unwrap_or_default();
-                let mut assessment = self.assess(&system, &report, &traffic, current_time);
+                let assessed_at =
+                    if auto_intel::assessment_is_stale(report.coverage.until, current_time) {
+                        report.coverage.until
+                    } else {
+                        current_time
+                    };
+                let mut assessment =
+                    self.assess_as_of(&system, &report, &traffic, assessed_at, current_time);
                 if let Some(previous) = self.system_assessments.get(system_id) {
                     local_intel::keep_briefing(&mut assessment, previous);
                 }
@@ -290,6 +435,11 @@ impl NomadeerApp {
                 let request = if brief {
                     IntelRequest::Player
                 } else {
+                    // Only an assessment from an earlier session has no killboard read
+                    // to fall back on. Should the read fail, it is tried again later,
+                    // so intel that ran out never stays in the assessment.
+                    self.live_expiry
+                        .insert(system.id.clone(), current_time + EXPIRY_RETRY_SECS);
                     IntelRequest::Arrival
                 };
                 self.intel_queue
@@ -344,10 +494,18 @@ impl NomadeerApp {
         system_id: &str,
         report: &LocalReport,
         current_time: u64,
-    ) -> Option<live_intel::KillerOverlap> {
+    ) -> Option<KillerOverlap> {
+        let kills = self.system_kills(system_id)?;
+        Some(live_intel::killer_overlap(
+            report,
+            &kills.killmails,
+            current_time,
+        ))
+    }
+
+    fn system_kills(&self, system_id: &str) -> Option<&SystemKills> {
         let system = self.system_by_id(system_id)?;
-        let kills = self.system_killmails.get(&system.solar_system_id)?;
-        Some(live_intel::killer_overlap(report, kills, current_time))
+        self.system_killmails.get(&system.solar_system_id)
     }
 
     /// The selected system's latest local and d-scan, with the Paste button.
@@ -377,8 +535,26 @@ impl NomadeerApp {
                 });
             });
         }
-        let intel = self.live_intel.get(system_id).cloned().unwrap_or_default();
-        if intel == SystemLiveIntel::default() {
+        let current_time = now();
+        // Worked out once, not on every frame the sidebar is drawn.
+        let check = self
+            .live_intel
+            .get(system_id)
+            .and_then(|intel| intel.local.as_ref())
+            .and_then(|report| {
+                let kills = self.system_kills(system_id);
+                let key = LocalCheck::key(system_id, report, kills, current_time);
+                (self.local_check.as_ref().map(|check| &check.key) != Some(&key))
+                    .then(|| LocalCheck::new(system_id, report, kills, current_time))
+            });
+        if let Some(check) = check {
+            self.local_check = Some(check);
+        }
+        let intel = self
+            .live_intel
+            .get(system_id)
+            .filter(|intel| intel.local.is_some() || intel.dscan.is_some());
+        let Some(intel) = intel else {
             if !self
                 .live_reading
                 .iter()
@@ -394,10 +570,9 @@ impl NomadeerApp {
                 );
             }
             return;
-        }
-        let current_time = now();
-        if let Some(report) = &intel.local {
-            self.local_panel(ui, system_id, report, current_time);
+        };
+        if let (Some(report), Some(check)) = (&intel.local, &self.local_check) {
+            self.local_panel(ui, system_id, report, check, current_time);
         }
         if let Some(report) = &intel.dscan {
             dscan_panel(ui, system_id, report, current_time);
@@ -409,6 +584,7 @@ impl NomadeerApp {
         ui: &mut egui::Ui,
         system_id: &str,
         report: &LocalReport,
+        check: &LocalCheck,
         current_time: u64,
     ) {
         let fresh = paste_heading(ui, "Local", report.captured_at, current_time);
@@ -432,22 +608,16 @@ impl NomadeerApp {
                 .on_hover_text(format!("Not counted: {}", report.own.join(", ")));
             }
         });
-        let groups = live_intel::local_groups(report);
-        if !groups.is_empty() {
-            let shown = groups
+        if !check.groups.is_empty() {
+            let shown = check
+                .groups
                 .iter()
                 .take(5)
                 .map(|group| format!("{} {}", group.count, group.name))
                 .collect::<Vec<_>>();
             ui.label(egui::RichText::new(shown.join(" · ")).color(text_color));
         }
-        let overlap = self.killer_overlap(system_id, report, current_time);
-        let killers = self
-            .system_by_id(system_id)
-            .and_then(|system| self.system_killmails.get(&system.solar_system_id))
-            .map(|kills| killer_ids(kills, current_time))
-            .unwrap_or_default();
-        match overlap {
+        match check.overlap {
             Some(overlap) if overlap.pilots_7d > 0 => {
                 let text = if overlap.pilots_24h > 0 {
                     format!(
@@ -468,10 +638,20 @@ impl NomadeerApp {
                     .color(warning_color),
                 );
             }
-            Some(_) => {
+            Some(_) if check.week_read => {
                 ui.label(
                     egui::RichText::new("No one here got kills in this system this week")
                         .color(theme::muted_text()),
+                );
+            }
+            Some(_) => {
+                ui.label(
+                    egui::RichText::new("None of them in the kills read so far")
+                        .color(theme::muted_text()),
+                )
+                .on_hover_text(
+                    "The killboard has not been read through the whole week lately, \
+                     so this is not an all-clear. Refresh it to check again.",
                 );
             }
             None => {
@@ -520,7 +700,7 @@ impl NomadeerApp {
                                         .color(theme::muted_text()),
                                 );
                             }
-                            if killers.contains(&pilot.character_id) {
+                            if check.killers.contains(&pilot.character_id) {
                                 ui.label(
                                     egui::RichText::new("got kills here").color(warning_color),
                                 );
@@ -681,18 +861,6 @@ fn ship_count_text(count: usize) -> String {
         1 => "1 ship".to_owned(),
         count => format!("{count} ships"),
     }
-}
-
-/// Pilots who were attackers on player kills in the last week.
-fn killer_ids(kills: &[CachedKillmail], current_time: u64) -> std::collections::HashSet<u64> {
-    kills
-        .iter()
-        .filter(|kill| {
-            !kill.npc
-                && current_time.saturating_sub(kill.killmail_time) <= 7 * crate::util::DAY_SECS
-        })
-        .flat_map(|kill| kill.attacker_ids.iter().copied())
-        .collect()
 }
 
 #[cfg(test)]

@@ -211,7 +211,7 @@ pub(crate) struct NomadeerApp {
     refreshed_traffic: HashMap<u64, SystemTrafficHistory>,
     /// Each system's cached week of kills, by solar system ID, for checking pasted
     /// local against.
-    system_killmails: HashMap<u64, Vec<CachedKillmail>>,
+    system_killmails: HashMap<u64, live_intel::SystemKills>,
     /// The latest pasted local and d-scan of each system, by map system ID.
     live_intel: HashMap<String, live_intel::SystemLiveIntel>,
     /// Pastes being read: the system and what was pasted.
@@ -221,6 +221,8 @@ pub(crate) struct NomadeerApp {
     /// When the live intel in each system's assessment runs out, so it is
     /// re-assessed without it.
     live_expiry: HashMap<String, u64>,
+    /// The selected system's local paste, checked against its kills.
+    local_check: Option<live::LocalCheck>,
     selected_zkill_kill: Option<ZkillKill>,
     system_assessments: HashMap<String, SystemAssessment>,
     umbra_task: Option<UmbraTask>,
@@ -250,6 +252,9 @@ pub(crate) struct NomadeerApp {
     chain_confirm_reset_layout: bool,
     /// The key to the chain map's artwork is open.
     chain_show_legend: bool,
+    /// Where the legend and the corner controls covered the map last frame, so a
+    /// connection is never dropped on a system hidden under them.
+    chain_overlays: Vec<egui::Rect>,
     /// What the last pasted probe scan did, shown beside the system's signatures.
     scan_notice: Option<scan::ScanNotice>,
     /// When the Paste scan button asked for the clipboard, until it arrives.
@@ -309,6 +314,7 @@ impl NomadeerApp {
             system_killmails: HashMap::new(),
             live_intel: HashMap::new(),
             live_reading: Vec::new(),
+            local_check: None,
             live_tx,
             live_rx,
             live_expiry: HashMap::new(),
@@ -333,6 +339,7 @@ impl NomadeerApp {
             chain_drag: None,
             chain_confirm_reset_layout: false,
             chain_show_legend: false,
+            chain_overlays: Vec::new(),
             scan_notice: None,
             paste_requested: None,
             next_auto_sync: Instant::now() + Duration::from_secs(5),
@@ -1403,8 +1410,13 @@ impl NomadeerApp {
                     self.intel_errors.remove(&report.solar_system_id);
                     let kill_count = report.history.kills_7d + report.history.npc_kills_7d;
                     if let Some(killmails) = killmails {
-                        self.system_killmails
-                            .insert(report.solar_system_id, killmails);
+                        self.keep_latest_kills(
+                            report.solar_system_id,
+                            live_intel::SystemKills {
+                                killmails,
+                                coverage: Some(report.coverage),
+                            },
+                        );
                     }
                     let assessment = self
                         .data

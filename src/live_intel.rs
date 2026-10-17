@@ -7,9 +7,9 @@
 //! Everything here is pure; `eve_lookup` resolves names and types through ESI.
 
 use crate::local_intel::{count_label, join_phrases};
-use crate::model::{CachedKillmail, EveType};
+use crate::model::{CachedKillmail, EveType, KillboardCoverage};
 use crate::probe_scan;
-use crate::util::DAY_SECS;
+use crate::util::{DAY_SECS, HOUR_SECS};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -20,6 +20,9 @@ pub(crate) const LIVE_INTEL_RETENTION_SECS: u64 = DAY_SECS;
 /// Grids are usually a few thousand km across, so anything this close is taken to
 /// be on grid with the scanning ship.
 pub(crate) const ON_GRID_KM: f64 = 10_000.0;
+/// A killboard read longer ago than this may be missing the kills that matter most
+/// for who is in local now.
+const KILLBOARD_CURRENT_SECS: u64 = HOUR_SECS;
 /// NPC corporations, such as the starter corporations many pilots sit in, say
 /// nothing about who someone flies with.
 const NPC_CORPORATION_IDS: std::ops::RangeInclusive<u64> = 1_000_000..=1_999_999;
@@ -119,6 +122,31 @@ pub(crate) fn local_groups(report: &LocalReport) -> Vec<LocalGroup> {
     let mut groups = groups.into_values().collect::<Vec<_>>();
     groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
     groups
+}
+
+/// A system's cached kills, and the span the killboard has been read over.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct SystemKills {
+    pub(crate) killmails: Vec<CachedKillmail>,
+    /// Where the kills are known to be complete; None when that was never recorded.
+    pub(crate) coverage: Option<KillboardCoverage>,
+}
+
+impl SystemKills {
+    /// Whether the kills hold the whole last week, read recently enough that a pilot
+    /// missing from them really got no kills here. A partly read or old killboard
+    /// only ever counts kills, never their absence.
+    pub(crate) fn covers_week(&self, current_time: u64) -> bool {
+        self.coverage.is_some_and(|coverage| {
+            coverage.since <= current_time.saturating_sub(7 * DAY_SECS)
+                && current_time.saturating_sub(coverage.until) <= KILLBOARD_CURRENT_SECS
+        })
+    }
+
+    /// When the killboard was last read, 0 when unknown.
+    pub(crate) fn read_at(&self) -> u64 {
+        self.coverage.map_or(0, |coverage| coverage.until)
+    }
 }
 
 /// How many of local's pilots, and of their player corporations, were attackers on
@@ -522,7 +550,7 @@ impl LiveContribution {
     }
 }
 
-/// Evidence, threat and activity from a system's fresh pastes. `killmails` are the
+/// Evidence, threat and activity from a system's fresh pastes. `kills` are the
 /// system's cached kills, None when its killboard has not been read.
 ///
 /// Scoring, all of it capped at 50 threat and 40 activity together:
@@ -539,12 +567,12 @@ impl LiveContribution {
 ///   15; covert ops and tactical destroyers 3 up to 9.
 pub(crate) fn contribution(
     intel: &SystemLiveIntel,
-    killmails: Option<&[CachedKillmail]>,
+    kills: Option<&SystemKills>,
     current_time: u64,
 ) -> LiveContribution {
     let mut live = LiveContribution::default();
     if let Some(local) = intel.fresh_local(current_time) {
-        add_local(&mut live, local, killmails, current_time);
+        add_local(&mut live, local, kills, current_time);
     }
     if let Some(dscan) = intel.fresh_dscan(current_time) {
         add_dscan(&mut live, dscan);
@@ -557,7 +585,7 @@ pub(crate) fn contribution(
 fn add_local(
     live: &mut LiveContribution,
     report: &LocalReport,
-    killmails: Option<&[CachedKillmail]>,
+    kills: Option<&SystemKills>,
     current_time: u64,
 ) {
     let pilots = report.pilot_count;
@@ -602,13 +630,13 @@ fn add_local(
         ));
     }
 
-    let Some(killmails) = killmails else {
+    let Some(kills) = kills else {
         return;
     };
     if report.pilots.is_empty() {
         return;
     }
-    let overlap = killer_overlap(report, killmails, current_time);
+    let overlap = killer_overlap(report, &kills.killmails, current_time);
     if overlap.pilots_24h > 0 {
         live.evidence.push(format!(
             "{} in local got kills here in the last 24 hours",
@@ -632,7 +660,7 @@ fn add_local(
                 "{} in local got kills here in the last 7 days",
                 count_label(overlap.corporations_7d, "corporation")
             ));
-        } else {
+        } else if kills.covers_week(current_time) {
             live.evidence
                 .push("No one in local got kills here in the last 7 days".to_owned());
         }
@@ -698,15 +726,29 @@ fn add_dscan(live: &mut LiveContribution, report: &DscanReport) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DscanRow, KillerOverlap, LIVE_INTEL_FRESH_SECS, LocalPilot, LocalReport, SystemLiveIntel,
-        ThreatClass, contribution, group_count_text, killer_overlap, local_groups, local_names,
-        parse_dscan_row, summarise_dscan,
+        DscanRow, KillerOverlap, LIVE_INTEL_FRESH_SECS, LocalPilot, LocalReport, SystemKills,
+        SystemLiveIntel, ThreatClass, contribution, group_count_text, killer_overlap, local_groups,
+        local_names, parse_dscan_row, summarise_dscan,
     };
-    use crate::model::{CachedKillmail, EveType};
+    use crate::model::{CachedKillmail, EveType, KillboardCoverage};
     use crate::util::{DAY_SECS, HOUR_SECS};
     use std::collections::HashMap;
 
     const NOW: u64 = 1_000 * DAY_SECS;
+
+    /// Kills from a killboard read through the whole week, `read_ago` seconds back,
+    /// or only `partial` seconds back from then.
+    fn read(killmails: &[CachedKillmail], read_ago: u64, partial: Option<u64>) -> SystemKills {
+        let until = NOW - read_ago;
+        SystemKills {
+            killmails: killmails.to_vec(),
+            coverage: Some(KillboardCoverage {
+                solar_system_id: 1,
+                since: partial.map_or(until - 7 * DAY_SECS, |seconds| until - seconds),
+                until,
+            }),
+        }
+    }
 
     fn pilot(character_id: u64, corporation_id: u64, alliance_id: u64) -> LocalPilot {
         LocalPilot {
@@ -987,7 +1029,7 @@ mod tests {
             local: Some(report),
             dscan: None,
         };
-        let live = contribution(&intel, Some(&kills[..]), NOW);
+        let live = contribution(&intel, Some(&read(&kills, 60, None)), NOW);
         assert_eq!(
             live.evidence,
             vec![
@@ -1007,12 +1049,23 @@ mod tests {
         assert_eq!(unchecked.evidence.len(), 3);
         assert!(unchecked.threat < live.threat);
 
-        // A quiet killboard is said plainly.
-        let quiet = contribution(&intel, Some(&[][..]), NOW);
+        // A quiet killboard is said plainly, but only once the whole week has been
+        // read, and recently.
+        let quiet = contribution(&intel, Some(&read(&[], 60, None)), NOW);
         assert_eq!(
             quiet.evidence.last().map(String::as_str),
             Some("No one in local got kills here in the last 7 days")
         );
+        for unsure in [
+            read(&[], 60, Some(6 * HOUR_SECS)),
+            read(&[], 4 * DAY_SECS, None),
+            SystemKills::default(),
+        ] {
+            assert!(!unsure.covers_week(NOW));
+            let evidence = contribution(&intel, Some(&unsure), NOW).evidence;
+            assert_eq!(evidence, unchecked.evidence, "{unsure:?}");
+        }
+        assert!(read(&[], 60, None).covers_week(NOW));
     }
 
     #[test]
@@ -1053,7 +1106,7 @@ mod tests {
             ..dscan(fleet)
         };
         let kills = [kill(HOUR_SECS, &(1..=400).collect::<Vec<_>>(), &[], false)];
-        let most = contribution(&crowd, Some(&kills[..]), NOW);
+        let most = contribution(&crowd, Some(&read(&kills, 0, None)), NOW);
         assert_eq!(most.threat, 50.0);
         assert_eq!(most.activity, 40.0);
     }
