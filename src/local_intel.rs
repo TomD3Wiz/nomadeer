@@ -621,9 +621,13 @@ pub(crate) fn is_wormhole_space(system: &SystemNode) -> bool {
     let class = system.class.trim().to_ascii_uppercase();
     class.starts_with("C-")
         || class == "THERA"
-        || class
-            .strip_prefix('C')
-            .is_some_and(|class| matches!(class, "1" | "2" | "3" | "4" | "5" | "6" | "13"))
+        || class == "DRIFTER"
+        || class.strip_prefix('C').is_some_and(|class| {
+            matches!(
+                class,
+                "1" | "2" | "3" | "4" | "5" | "6" | "13" | "14" | "15" | "16" | "17" | "18"
+            )
+        })
 }
 
 /// Average jumps over the captured hours before `latest_hour`, from the same hour of day
@@ -1294,11 +1298,18 @@ mod tests {
         assert!(!is_wormhole_space(&system(30_001_198, "J-GAMP")));
         assert!(is_wormhole_space(&system(HOME_HOLE, "J123456")));
         assert!(is_wormhole_space(&system(31_000_005, "Thera")));
+        assert!(is_wormhole_space(&system(31_000_792, "J135422")));
+        assert!(is_wormhole_space(&system(31_000_001, "Sentinel MZ")));
 
         let mut manual = system(0, "J123456");
         assert!(!is_wormhole_space(&manual));
         manual.class = "C3".to_owned();
         assert!(is_wormhole_space(&manual));
+        manual.class = "c16".to_owned();
+        assert!(is_wormhole_space(&manual));
+        manual.class = "C19".to_owned();
+        assert!(!is_wormhole_space(&manual));
+        manual.class = "C3".to_owned();
         manual.region_id = 10_000_002;
         assert!(!is_wormhole_space(&manual));
     }
