@@ -6,7 +6,7 @@ Nomadeer is a Rust application built with `egui`/`eframe`. Everything it stores 
 
 ## Features
 
-- Interactive chain map built from your characters' movement, with direct connection and removal controls.
+- Interactive chain map built from your characters' movement: zoom and pan around it, drag systems where you want them, and drag from one system to another to link them.
 - Character tracking through EVE single sign-on (loopback OAuth with PKCE, no client secret).
 - Save and restore historical chain snapshots.
 - Selected-system killboard history with detailed in-app kill reports.
@@ -164,7 +164,6 @@ Umbra's real-model tests are ignored by default; with the core installed, run th
 ## Roadmap ideas
 
 - Editable records instead of delete/recreate.
-- Drag/drop chain map nodes and saved layout positions.
 - Wormhole type presets for mass, life, and ship size.
 - Import/export chain snapshots.
 - Optional encrypted data store.

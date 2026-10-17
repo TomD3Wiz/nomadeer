@@ -68,16 +68,20 @@ impl Default for AutoIntelSettings {
     }
 }
 
-/// How the area under the chain map is shared between the dashboard tabs and Umbra.
+/// How the dashboard is shared: the chain map above, and under it the dashboard tabs
+/// beside Umbra.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DashboardLayout {
     /// The tabs' share of the width; Umbra has the rest.
     pub(crate) tabs_fraction: f32,
+    /// The chain map's share of the height; the tabs and Umbra have the rest.
+    pub(crate) map_fraction: f32,
 }
 
 impl DashboardLayout {
     pub(crate) const DEFAULT_TABS_FRACTION: f32 = 1.0 / 3.0;
+    pub(crate) const DEFAULT_MAP_FRACTION: f32 = 0.45;
 
     /// A stored share is kept only when it leaves both sides some room.
     pub(crate) fn is_valid_fraction(fraction: f32) -> bool {
@@ -89,6 +93,7 @@ impl Default for DashboardLayout {
     fn default() -> Self {
         Self {
             tabs_fraction: Self::DEFAULT_TABS_FRACTION,
+            map_fraction: Self::DEFAULT_MAP_FRACTION,
         }
     }
 }
@@ -150,6 +155,27 @@ pub(crate) struct SystemNode {
     pub(crate) owner: String,
     pub(crate) notes: String,
     pub(crate) created_at: u64,
+    /// Where the player placed the system on the chain map, in map units. Systems
+    /// never placed by hand are arranged automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) map_position: Option<MapPosition>,
+}
+
+/// A point on the chain map, in map units: before zooming, a system is 76 units across.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MapPosition {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+}
+
+impl MapPosition {
+    /// A position only counts when both coordinates are real numbers.
+    pub(crate) fn finite(x: Option<f32>, y: Option<f32>) -> Option<Self> {
+        match (x, y) {
+            (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Some(Self { x, y }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 use crate::model::{
     Account, AppData, AutoIntelSettings, CachedKillmail, Connection, DashboardLayout, EsiSettings,
-    KillCounts, KillboardCoverage, Note, Signature, SystemAssessment, SystemNode,
+    KillCounts, KillboardCoverage, MapPosition, Note, Signature, SystemAssessment, SystemNode,
     SystemTrafficHistory, TrafficHour, TrafficReading, TrafficRows, TrafficSample, UmbraBriefing,
     VisitLog,
 };
@@ -28,6 +28,7 @@ const GATHER_ON_ARRIVAL_KEY: &str = "gather_intel_on_arrival";
 const UMBRA_BRIEFS_AUTOMATICALLY_KEY: &str = "umbra_briefs_automatically";
 const RECON_DEFAULTS_APPLIED_KEY: &str = "recon_defaults_applied";
 const DASHBOARD_TABS_FRACTION_KEY: &str = "dashboard_tabs_fraction";
+const DASHBOARD_MAP_FRACTION_KEY: &str = "dashboard_map_fraction";
 
 /// Everything kept in `app_settings`.
 #[derive(Default)]
@@ -132,14 +133,22 @@ impl Store {
             )
             .map_err(|error| error.to_string())?;
         }
-        tx.execute(
-            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)",
-            params![
+        for (key, fraction) in [
+            (
                 DASHBOARD_TABS_FRACTION_KEY,
-                data.dashboard_layout.tabs_fraction.to_string()
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+                data.dashboard_layout.tabs_fraction,
+            ),
+            (
+                DASHBOARD_MAP_FRACTION_KEY,
+                data.dashboard_layout.map_fraction,
+            ),
+        ] {
+            tx.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?1, ?2)",
+                params![key, fraction.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        }
 
         for account in &data.accounts {
             tx.execute(
@@ -173,10 +182,10 @@ impl Store {
                     id, solar_system_id, name, class, security_status, constellation_id,
                     constellation_name, region_id, region_name, planet_count, stargate_count,
                     station_count, jumps_1h, ship_kills_1h, pod_kills_1h, npc_kills_1h,
-                    intel_updated_at, effect, status, owner, notes, created_at
+                    intel_updated_at, effect, status, owner, notes, created_at, map_x, map_y
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                    ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
                  )",
                 params![
                     system.id,
@@ -201,6 +210,8 @@ impl Store {
                     system.owner,
                     system.notes,
                     system.created_at as i64,
+                    system.map_position.map(|position| position.x),
+                    system.map_position.map(|position| position.y),
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -845,7 +856,9 @@ impl Store {
                 status TEXT NOT NULL DEFAULT '',
                 owner TEXT NOT NULL DEFAULT '',
                 notes TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                map_x REAL,
+                map_y REAL
              );
              CREATE TABLE IF NOT EXISTS connections (
                 id TEXT PRIMARY KEY,
@@ -1022,6 +1035,9 @@ impl Store {
             "intel_updated_at",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // Where the player placed each system on the chain map; NULL until they do.
+        self.add_missing_column(conn, "systems", "map_x", "REAL")?;
+        self.add_missing_column(conn, "systems", "map_y", "REAL")?;
 
         Ok(())
     }
@@ -1110,6 +1126,13 @@ impl Store {
                         loaded.dashboard_layout.tabs_fraction = fraction;
                     }
                 }
+                DASHBOARD_MAP_FRACTION_KEY => {
+                    if let Ok(fraction) = value.parse::<f32>()
+                        && DashboardLayout::is_valid_fraction(fraction)
+                    {
+                        loaded.dashboard_layout.map_fraction = fraction;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1158,7 +1181,7 @@ impl Store {
                 "SELECT id, solar_system_id, name, class, security_status, constellation_id,
                     constellation_name, region_id, region_name, planet_count, stargate_count,
                     station_count, jumps_1h, ship_kills_1h, pod_kills_1h, npc_kills_1h,
-                    intel_updated_at, effect, status, owner, notes, created_at
+                    intel_updated_at, effect, status, owner, notes, created_at, map_x, map_y
               FROM systems ORDER BY created_at, name",
             )
             .map_err(|error| error.to_string())?;
@@ -1187,6 +1210,7 @@ impl Store {
                     owner: row.get(19)?,
                     notes: row.get(20)?,
                     created_at: row.get::<_, i64>(21)? as u64,
+                    map_position: MapPosition::finite(row.get(22)?, row.get(23)?),
                 })
             })
             .map_err(|error| error.to_string())?;
@@ -1378,7 +1402,7 @@ mod tests {
     };
     use crate::model::{
         AppData, AutoIntelSettings, CachedKillmail, DashboardLayout, KillCounts, KillboardCoverage,
-        TrafficHour, TrafficReading, TrafficRows, TrafficSample, UmbraBriefing,
+        MapPosition, TrafficHour, TrafficReading, TrafficRows, TrafficSample, UmbraBriefing,
     };
     use rusqlite::Connection as SqliteConnection;
     use std::path::PathBuf;
@@ -1857,6 +1881,118 @@ mod tests {
         // Legacy JSON without the split gets the default.
         let legacy: AppData = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.dashboard_layout, DashboardLayout::default());
+    }
+
+    #[test]
+    fn chain_map_height_defaults_and_persists_beside_the_tabs_share() {
+        let db = TestDb::new("map-height");
+        let store = db.store();
+        // A database saved before the map could be resized has no row for it.
+        let mut data = data_with_client_id("older");
+        data.dashboard_layout.tabs_fraction = 0.4;
+        store.save(&data).unwrap();
+        {
+            let conn = SqliteConnection::open(&db.path).unwrap();
+            conn.execute(
+                "DELETE FROM app_settings WHERE key = 'dashboard_map_fraction'",
+                [],
+            )
+            .unwrap();
+        }
+        let loaded = store.load().unwrap().dashboard_layout;
+        assert_eq!(loaded.tabs_fraction, 0.4);
+        assert_eq!(loaded.map_fraction, DashboardLayout::DEFAULT_MAP_FRACTION);
+
+        data.dashboard_layout.map_fraction = 0.6;
+        store.save(&data).unwrap();
+        assert_eq!(store.load().unwrap().dashboard_layout.map_fraction, 0.6);
+
+        for bad in ["0", "1", "NaN", "tall"] {
+            let conn = SqliteConnection::open(&db.path).unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value = ?1 WHERE key = 'dashboard_map_fraction'",
+                [bad],
+            )
+            .unwrap();
+            let loaded = store.load().unwrap().dashboard_layout;
+            assert_eq!(
+                loaded.map_fraction,
+                DashboardLayout::DEFAULT_MAP_FRACTION,
+                "{bad}"
+            );
+            assert_eq!(loaded.tabs_fraction, 0.4, "{bad}");
+        }
+
+        // JSON saved with only the tabs' share keeps it and gets the default height.
+        let legacy: AppData =
+            serde_json::from_str(r#"{"dashboard_layout": {"tabs_fraction": 0.5}}"#).unwrap();
+        assert_eq!(legacy.dashboard_layout.tabs_fraction, 0.5);
+        assert_eq!(
+            legacy.dashboard_layout.map_fraction,
+            DashboardLayout::DEFAULT_MAP_FRACTION
+        );
+    }
+
+    #[test]
+    fn map_positions_survive_the_systems_migration_and_persist() {
+        let db = TestDb::new("map-positions");
+        {
+            // Systems saved before they could be placed by hand.
+            let conn = SqliteConnection::open(&db.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE systems (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    class TEXT NOT NULL DEFAULT '',
+                    effect TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    owner TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL
+                 );
+                 INSERT INTO systems (id, name, created_at)
+                    VALUES ('sys_a', 'J123456', 1), ('sys_b', 'Amamake', 2);",
+            )
+            .unwrap();
+        }
+        let store = db.store();
+        let mut data = store.load().unwrap();
+        assert_eq!(data.systems.len(), 2);
+        assert!(
+            data.systems
+                .iter()
+                .all(|system| system.map_position.is_none())
+        );
+        // A second store over the same file re-runs the migration without errors.
+        db.store().load().unwrap();
+
+        data.systems[0].map_position = Some(MapPosition { x: -120.5, y: 64.0 });
+        store.save(&data).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.systems[0].map_position,
+            Some(MapPosition { x: -120.5, y: 64.0 })
+        );
+        assert_eq!(loaded.systems[1].map_position, None);
+
+        // Half a position, or one that is not a real number, is no position.
+        {
+            let conn = SqliteConnection::open(&db.path).unwrap();
+            conn.execute("UPDATE systems SET map_y = NULL WHERE id = 'sys_a'", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE systems SET map_x = 1e999, map_y = 0 WHERE id = 'sys_b'",
+                [],
+            )
+            .unwrap();
+        }
+        let loaded = store.load().unwrap();
+        assert!(
+            loaded
+                .systems
+                .iter()
+                .all(|system| system.map_position.is_none())
+        );
     }
 
     #[test]

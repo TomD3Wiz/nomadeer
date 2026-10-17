@@ -130,8 +130,37 @@ fn slugify_snapshot_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_snapshot_path;
+    use super::{ChainSnapshot, safe_snapshot_path};
+    use crate::model::MapPosition;
     use std::path::Path;
+
+    #[test]
+    fn snapshots_keep_hand_placed_systems_and_older_ones_still_load() {
+        // Saved before systems could be placed by hand.
+        let older: ChainSnapshot = serde_json::from_str(
+            r#"{"name": "Home", "created_at": 1, "systems": [{
+                "id": "sys_a", "name": "J123456", "class": "C3", "effect": "",
+                "status": "home", "owner": "", "notes": "", "created_at": 1
+            }]}"#,
+        )
+        .unwrap();
+        assert_eq!(older.systems[0].map_position, None);
+
+        let mut placed = older.clone();
+        placed.systems[0].map_position = Some(MapPosition { x: 40.0, y: -12.5 });
+        let json = serde_json::to_string(&placed).unwrap();
+        let loaded: ChainSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.systems[0].map_position,
+            placed.systems[0].map_position
+        );
+        // Systems without a place write nothing for it, as older versions did.
+        assert!(
+            !serde_json::to_string(&older)
+                .unwrap()
+                .contains("map_position")
+        );
+    }
 
     #[test]
     fn snapshot_names_stay_inside_the_archive() {
