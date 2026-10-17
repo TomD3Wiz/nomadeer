@@ -2,6 +2,8 @@
 
 A native desktop companion for EVE Online wormhole explorers: it maps your chain as you move, tracks your characters, and briefs you on the systems you pass through.
 
+![Nomadeer's chain map with wormhole and faction artwork, the selected system's intel, and Umbra's briefing feed](docs/screenshots/nomadeer-chain-and-umbra.png)
+
 Nomadeer is a Rust application built with `egui`/`eframe`. Everything it stores stays on your computer in a local SQLite database; it does not run a web server.
 
 ## Features
