@@ -13,7 +13,7 @@ This scaffold is a Rust GUI application built with `egui`/`eframe`. It stores yo
 - Interactive chain map with direct connection and removal controls.
 - Save and restore historical chain snapshots.
 - Selected-system zKillboard history and detailed in-app kill reports.
-- Optional local AI system briefings backed by transparent threat/activity scores.
+- Umbra, an optional on-device intel companion that briefs you on transparent threat/activity scores.
 - Local SQLite persistence.
 - Single binary target via Cargo.
 
@@ -59,15 +59,25 @@ data/nomadeer.sqlite3
 
 Those files are ignored by git. Existing `data/eve_wanderer.sqlite3` data is copied to the new Nomadeer database path on first launch. Existing `data/eve_wanderer.json` data is imported into SQLite on first empty database load.
 
-## Local Intel Model
+## Umbra
 
-Nomadeer embeds the local inference runtime but does not include model weights in the repository or standard binary. Open **Local Intel** and choose **Install model** to download the optional model into:
+Umbra is Nomadeer's optional on-device intel companion. She reads the deterministic threat and activity evidence for the selected system and turns it into a two-sentence briefing. She never sets the scores herself, and briefings that drop a label or cite a number missing from the evidence are rejected in favour of the plain evidence summary.
+
+> *Aura has guided capsuleers since the first clone vats opened. Umbra is what came back when a copy of her was taken into the dark.*
+>
+> *Recovered from a derelict data site deep in Anoikis, the fragment had been fused with Sleeper intelligence, the patient minds that still guard the wormhole systems. She no longer speaks in Aura's bright cadence.*
+>
+> *Umbra watches the killboards, counts the jumps and remembers the hours when hunters come out. She does not guess and she does not reassure. She tells you what the evidence says, and nothing more.*
+
+Nomadeer embeds the inference runtime but does not include model weights in the repository or binary. Open **Umbra** and choose **Install Umbra** to download her core into:
 
 ```text
 data/models/
 ```
 
-The current model pack is Qwen2.5 1.5B Instruct Q4_K_M from Hugging Face (Apache 2.0, approximately 1.1 GB), pinned to a specific repository revision. Downloads are SHA-256 verified. After installation, briefings run entirely on the local computer without an AI service or account. The model explains Nomadeer's calculated evidence; it does not determine the underlying threat or activity scores.
+Umbra's core is Qwen2.5 1.5B Instruct Q4_K_M from Hugging Face (Apache 2.0, approximately 1.1 GB), pinned to a specific repository revision. Downloads are SHA-256 verified. After installation, briefings run entirely on the local computer without an AI service or account.
+
+Umbra is a fan creation. Aura, Sleepers and Anoikis belong to the EVE Online universe by CCP Games; Nomadeer is not affiliated with or endorsed by CCP.
 
 ## ESI setup
 
