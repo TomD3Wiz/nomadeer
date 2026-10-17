@@ -15,6 +15,12 @@ build=${BUILD_DIR:-/build}
 dist=${DIST_DIR:-/dist}
 target=x86_64-pc-windows-gnu
 
+# HOST_OWNER=uid:gid hands the build and output back to that user when the
+# container runs as a real root (rootful docker), even if the build fails.
+if [ -n "${HOST_OWNER:-}" ]; then
+    trap 'chown -R "$HOST_OWNER" "$build" "$dist"' EXIT
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \

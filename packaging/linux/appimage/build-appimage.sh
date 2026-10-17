@@ -47,6 +47,10 @@ glibc_needed() {
     objdump -T "$1" | awk '$2 != "w"' | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1
 }
 
+if [ -n "${APPIMAGE_MAX_GLIBC:-}" ] && ! command -v objdump >/dev/null 2>&1; then
+    echo "APPIMAGE_MAX_GLIBC is set, but checking it needs objdump (binutils)" >&2
+    exit 1
+fi
 for bin in "$optimized" "$compatible"; do
     [ -f "$bin" ] || { echo "missing release build: $bin" >&2; exit 1; }
     need=$(glibc_needed "$bin")

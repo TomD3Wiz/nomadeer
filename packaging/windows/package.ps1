@@ -6,10 +6,13 @@ Builds the Nomadeer Windows installer and portable zip from release binaries.
 Runs Inno Setup on packaging\windows\nomadeer.iss to produce
 Nomadeer-<version>-Setup.exe, builds Nomadeer-<version>-Windows-Portable.zip
 and writes a .sha256 file (sha256sum format) next to each. The release
-workflow runs it after building both editions with:
+workflow runs it after building both editions with a static C runtime, so
+the exes start without the Visual C++ Redistributable:
 
-  RUSTFLAGS=-C target-cpu=x86-64-v3 cargo build --release --target-dir target/optimized
-  cargo build --release --target-dir target/compatible
+  RUSTFLAGS='-C target-feature=+crt-static -C target-cpu=x86-64-v3'
+    cargo build --release --target-dir target/optimized
+  RUSTFLAGS='-C target-feature=+crt-static'
+    cargo build --release --target-dir target/compatible
 
 .EXAMPLE
 ./packaging/windows/package.ps1 -Version 0.1.0
