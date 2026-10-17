@@ -91,7 +91,9 @@ fn resolve_data_dir(inputs: &DataDirInputs<'_>) -> PathBuf {
         }
     }
 
-    // 2. A portable copy keeps data beside the executable.
+    // 2. A portable copy keeps data beside the executable. Once that folder has a
+    //    database it stays in use even if the marker goes (see the portable
+    //    README in packaging/windows).
     if let Some(exe_dir) = inputs.exe_dir {
         let candidate = exe_dir.join(DATA_DIR_NAME);
         if (inputs.is_file)(&exe_dir.join(PORTABLE_MARKER))

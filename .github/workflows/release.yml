@@ -182,13 +182,16 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
+        # crt-static links the C runtime into the exe, so it starts on PCs
+        # without the Visual C++ Redistributable (VCRUNTIME140.dll). It must be
+        # here: RUSTFLAGS replaces any rustflags from Cargo config.
         include:
           # AVX2/FMA build: Umbra briefings run about 3x faster.
           - variant: optimized
-            rustflags: "-C target-cpu=x86-64-v3"
+            rustflags: "-C target-feature=+crt-static -C target-cpu=x86-64-v3"
           # Baseline x86-64 build for CPUs without AVX2.
           - variant: compatible
-            rustflags: ""
+            rustflags: "-C target-feature=+crt-static"
 
     steps:
       - name: Checkout
@@ -207,6 +210,16 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked --target-dir target/${{ matrix.variant }}
+
+      - name: Check the exe needs no Visual C++ runtime
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe was not found' }
+          $dependents = & $dumpbin /nologo /dependents target/${{ matrix.variant }}/release/nomadeer.exe
+          $dependents
+          if ($dependents -match '(?i)vcruntime|msvcp') { throw 'nomadeer.exe needs the Visual C++ Redistributable' }
 
       - name: Upload binary
         uses: actions/upload-artifact@v4

@@ -81,13 +81,28 @@ pub(crate) fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut attempt = 1;
     loop {
         match std::fs::rename(from, to) {
-            Err(error) if attempt < attempts && error.kind() == ErrorKind::PermissionDenied => {
+            Err(error) if attempt < attempts && is_transient_lock(&error, cfg!(windows)) => {
                 std::thread::sleep(Duration::from_millis(100));
                 attempt += 1;
             }
             result => return result,
         }
     }
+}
+
+/// Whether a failed move looks like another program briefly holding one of the
+/// files. A locked destination is refused with access denied; a scanner holding
+/// the source open gives a sharing or lock violation, which std reports as an
+/// uncategorized error.
+fn is_transient_lock(error: &std::io::Error, windows: bool) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    error.kind() == ErrorKind::PermissionDenied
+        || (windows
+            && matches!(
+                error.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+            ))
 }
 
 pub(crate) fn open_url(url: &str) -> Result<(), String> {
@@ -120,7 +135,8 @@ pub(crate) fn open_url(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hour_start, parse_http_date, replace_file};
+    use super::{hour_start, is_transient_lock, parse_http_date, replace_file};
+    use std::io::{Error, ErrorKind};
 
     #[test]
     fn replace_file_overwrites_an_existing_file() {
@@ -137,6 +153,22 @@ mod tests {
         assert!(replace_file(&part, &installed).is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retries_moves_blocked_by_scanners_and_indexers() {
+        assert!(is_transient_lock(&ErrorKind::PermissionDenied.into(), true));
+        assert!(is_transient_lock(
+            &ErrorKind::PermissionDenied.into(),
+            false
+        ));
+        // ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION on Windows.
+        assert!(is_transient_lock(&Error::from_raw_os_error(32), true));
+        assert!(is_transient_lock(&Error::from_raw_os_error(33), true));
+        // The same numbers mean something else elsewhere (EPIPE, EDOM on Linux).
+        assert!(!is_transient_lock(&Error::from_raw_os_error(32), false));
+        assert!(!is_transient_lock(&Error::from_raw_os_error(2), true));
+        assert!(!is_transient_lock(&ErrorKind::NotFound.into(), true));
     }
 
     #[test]

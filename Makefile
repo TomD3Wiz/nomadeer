@@ -21,6 +21,10 @@ WINDOWS_INNOSETUP_IMAGE ?= docker.io/amake/innosetup:innosetup6-bookworm@sha256:
 ifneq (,$(findstring podman,$(CONTAINER)))
 WINDOWS_INNOSETUP_USER ?= --userns=keep-id:uid=1000,gid=101
 endif
+# Rootful docker runs the build containers as a real root; they then hand
+# what they wrote back to you. Podman and rootless docker already map the
+# container's root to you, so nothing is changed there.
+CONTAINER_OWNER ?= $(if $(findstring podman,$(CONTAINER)),,$(shell $(CONTAINER) info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless || echo "$$(id -u):$$(id -g)"))
 WINDOWS_BUILD_DIR := target/windows-cross
 WINDOWS_DIST_DIR := $(DIST_DIR)/windows
 
@@ -76,7 +80,7 @@ flatpak: release
 		-v "$(CURDIR):/src:ro" \
 		-v "$(CURDIR)/$(FLATPAK_BUILD_DIR):/build" \
 		-v "$(CURDIR)/$(FLATPAK_DIST_DIR):/dist" \
-		-e FLATPAK_WORK_DIR=/build \
+		-e FLATPAK_WORK_DIR=/build -e HOST_OWNER=$(CONTAINER_OWNER) \
 		$(FLATPAK_IMAGE) sh /src/packaging/linux/flatpak/build-flatpak.sh $(VERSION) /dist
 
 # Nomadeer-<version>-Setup.exe and the portable zip, cross-built from Linux.
@@ -87,6 +91,7 @@ windows-installer:
 		-v "$(CURDIR):/src:ro" \
 		-v "$(CURDIR)/$(WINDOWS_BUILD_DIR):/build" \
 		-v "$(CURDIR)/$(WINDOWS_DIST_DIR):/dist" \
+		-e HOST_OWNER=$(CONTAINER_OWNER) \
 		$(WINDOWS_RUST_IMAGE) sh /src/packaging/windows/build-cross.sh $(VERSION)
 	$(CONTAINER) run --rm --security-opt label=disable $(WINDOWS_INNOSETUP_USER) \
 		-v "$(CURDIR):/work:ro" \
