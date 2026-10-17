@@ -5,7 +5,7 @@ use crate::util::{HOUR_SECS, hour_start, now, open_url, parse_http_date};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::blocking::{Client, Response as HttpResponse};
-use reqwest::header::{EXPIRES, HeaderName, LAST_MODIFIED};
+use reqwest::header::{DATE, EXPIRES, HeaderName, LAST_MODIFIED};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -29,6 +29,8 @@ const TRAFFIC_EXPIRES_SLACK_SECS: u64 = 15;
 pub(crate) const ONLINE_SCOPE: &str = "esi-location.read_online.v1";
 /// ESI caches a character's online status for about a minute.
 const ONLINE_CACHE_SECS: u64 = 60;
+/// Longest Nomadeer trusts an online status, whatever ESI's headers say.
+const MAX_ONLINE_CACHE_SECS: u64 = 5 * 60;
 
 type FeedCacheLock<T> = OnceLock<Mutex<Option<FeedCache<T>>>>;
 
@@ -95,7 +97,7 @@ pub(crate) struct LocationSync {
     pub(crate) system: SystemIntel,
 }
 
-/// Whether a character is logged in, valid until ESI's `expires_at`.
+/// Whether a character is logged in, valid for `cache_lifetime`.
 #[derive(Debug)]
 pub(crate) struct OnlineSync {
     pub(crate) account_id: String,
@@ -103,7 +105,7 @@ pub(crate) struct OnlineSync {
     pub(crate) refresh_token: String,
     pub(crate) token_expires_at: u64,
     pub(crate) online: bool,
-    pub(crate) expires_at: u64,
+    pub(crate) cache_lifetime: Duration,
 }
 
 /// A character's access and refresh tokens, refreshed when about to expire.
@@ -262,7 +264,10 @@ pub(crate) fn sync_online(settings: EsiSettings, account: Account) -> Result<Onl
     let character_id = character_id(&account)?;
     let url = format!("{ESI_BASE_URL}/characters/{character_id}/online/?datasource=tranquility");
     let response = get_response(&url, Some(&tokens.access_token))?;
-    let expires_at = online_expires_at(header_time(&response, EXPIRES), now());
+    let cache_lifetime = online_cache_lifetime(
+        header_time(&response, DATE),
+        header_time(&response, EXPIRES),
+    );
     let online = response
         .json::<OnlineResponse>()
         .map_err(|error| format!("Could not parse ESI response: {error}"))?
@@ -274,13 +279,19 @@ pub(crate) fn sync_online(settings: EsiSettings, account: Account) -> Result<Onl
         refresh_token: tokens.refresh_token,
         token_expires_at: tokens.token_expires_at,
         online,
-        expires_at,
+        cache_lifetime,
     })
 }
 
-/// When ESI will have a newer online status; about a minute when it does not say.
-fn online_expires_at(expires: Option<u64>, current_time: u64) -> u64 {
-    expires.unwrap_or(current_time + ONLINE_CACHE_SECS)
+/// How long until ESI has a newer online status. Both times come from the response
+/// itself, so a wrong local clock does not matter. About a minute when ESI does not
+/// say, and never more than a few minutes.
+fn online_cache_lifetime(date: Option<u64>, expires: Option<u64>) -> Duration {
+    let secs = match (date, expires) {
+        (Some(date), Some(expires)) => expires.saturating_sub(date),
+        _ => ONLINE_CACHE_SECS,
+    };
+    Duration::from_secs(secs.min(MAX_ONLINE_CACHE_SECS))
 }
 
 fn fresh_tokens(settings: &EsiSettings, account: &Account) -> Result<Tokens, String> {
@@ -342,6 +353,21 @@ pub(crate) fn token_scopes(access_token: &str) -> Option<Vec<String>> {
 /// Whether the access token was granted `scope`; `None` when it cannot be read.
 pub(crate) fn token_has_scope(access_token: &str, scope: &str) -> Option<bool> {
     token_scopes(access_token).map(|scopes| scopes.iter().any(|granted| granted == scope))
+}
+
+/// A space-separated scope list that also asks for `scope`.
+pub(crate) fn with_scope(scopes: &str, scope: &str) -> String {
+    let scopes = scopes.trim();
+    if scopes
+        .split_whitespace()
+        .any(|requested| requested == scope)
+    {
+        scopes.to_owned()
+    } else if scopes.is_empty() {
+        scope.to_owned()
+    } else {
+        format!("{scopes} {scope}")
+    }
 }
 
 fn validate_settings(settings: &EsiSettings) -> Result<(), String> {
@@ -742,8 +768,8 @@ fn get_response(url: &str, access_token: Option<&str>) -> Result<HttpResponse, S
 #[cfg(test)]
 mod tests {
     use super::{
-        ONLINE_SCOPE, feed_times, online_expires_at, token_has_scope, token_scopes,
-        traffic_next_poll_delay, traffic_retry_delay,
+        ONLINE_SCOPE, feed_times, online_cache_lifetime, token_has_scope, token_scopes,
+        traffic_next_poll_delay, traffic_retry_delay, with_scope,
     };
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -800,9 +826,27 @@ mod tests {
     }
 
     #[test]
-    fn online_status_expires_when_esi_says_or_after_a_minute() {
-        assert_eq!(online_expires_at(Some(1_030), 1_000), 1_030);
-        assert_eq!(online_expires_at(None, 1_000), 1_060);
+    fn with_scope_adds_a_scope_once() {
+        assert_eq!(
+            with_scope("publicData", ONLINE_SCOPE),
+            format!("publicData {ONLINE_SCOPE}")
+        );
+        assert_eq!(with_scope("  ", ONLINE_SCOPE), ONLINE_SCOPE);
+        let both = format!("publicData {ONLINE_SCOPE}");
+        assert_eq!(with_scope(&format!(" {both} "), ONLINE_SCOPE), both);
+    }
+
+    #[test]
+    fn online_status_lasts_as_esi_says_within_limits() {
+        let secs = Duration::from_secs;
+        assert_eq!(online_cache_lifetime(Some(1_000), Some(1_030)), secs(30));
+        // Without both headers, about a minute.
+        assert_eq!(online_cache_lifetime(None, Some(1_030)), secs(60));
+        assert_eq!(online_cache_lifetime(Some(1_000), None), secs(60));
+        assert_eq!(online_cache_lifetime(None, None), secs(60));
+        // Already expired, or absurdly far off.
+        assert_eq!(online_cache_lifetime(Some(1_000), Some(900)), secs(0));
+        assert_eq!(online_cache_lifetime(Some(1_000), Some(37_000)), secs(300));
     }
 
     #[test]

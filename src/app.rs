@@ -989,7 +989,9 @@ impl NomadeerApp {
         }
     }
 
-    fn start_authorize_account(&mut self, account_id: String) {
+    /// Signs the character in again. `with_online_status` asks to see whether they are
+    /// logged in for this sign-in only, so the saved scopes stay as the player set them.
+    fn start_authorize_account(&mut self, account_id: String, with_online_status: bool) {
         if self.esi_busy {
             self.status = "Already working on a character update".to_owned();
             return;
@@ -1002,7 +1004,11 @@ impl NomadeerApp {
             return;
         }
 
-        self.spawn_authorize_account(account_id);
+        let mut settings = self.data.esi_settings.clone();
+        if with_online_status {
+            settings.scopes = esi::with_scope(&settings.scopes, ONLINE_SCOPE);
+        }
+        self.spawn_authorize_account(account_id, settings);
     }
 
     fn start_add_character(&mut self) {
@@ -1039,15 +1045,14 @@ impl NomadeerApp {
         });
         recon::mark_added_character(&mut self.data, &account_id);
         self.save();
-        self.spawn_authorize_account(account_id);
+        self.spawn_authorize_account(account_id, self.data.esi_settings.clone());
     }
 
-    fn spawn_authorize_account(&mut self, account_id: String) {
+    fn spawn_authorize_account(&mut self, account_id: String, settings: EsiSettings) {
         self.esi_busy = true;
         self.background_esi_task = false;
         self.status = "Opening browser to connect character...".to_owned();
         let tx = self.esi_tx.clone();
-        let settings = self.data.esi_settings.clone();
         thread::spawn(move || {
             let result =
                 esi::authorize_account(settings, account_id).map(EsiTaskResult::Authorized);
@@ -1130,18 +1135,15 @@ impl NomadeerApp {
             return;
         }
 
-        // Logged-off characters cannot move, so they are skipped until they log in.
         let accounts: Vec<Account> = self
             .data
             .accounts
             .iter()
             .filter(|account| {
                 account.auth_status == "authorized"
-                    && self.online_polls.wants_location_poll(
-                        &account.id,
-                        recon::online_status_available(account),
-                        self.located_this_session.contains(&account.id),
-                    )
+                    && self
+                        .online_polls
+                        .wants_location_poll(&account.id, recon::online_status_available(account))
             })
             .cloned()
             .collect();
@@ -1799,22 +1801,18 @@ impl NomadeerApp {
             account.token_expires_at = Some(sync.token_expires_at);
             account.updated_at = now();
         }
-        let is_recon = account.recon;
-        let last_system_id = account.last_system_id.clone();
 
         let was_online = self.online_polls.record(
             &sync.account_id,
             sync.online,
-            sync.expires_at,
-            now(),
+            sync.cache_lifetime,
             Instant::now(),
         );
-        // Logging in puts a recon pilot back in the system they logged off in.
-        if self.data.auto_intel.gather_on_arrival
-            && !last_system_id.is_empty()
-            && auto_intel::is_login_arrival(is_recon, was_online, sync.online)
-        {
-            self.queue_arrival_intel(&last_system_id);
+        // The next location after logging in is judged like the first of the session:
+        // it is where the pilot is flying now, which may already be past where they
+        // logged off, as this status can trail the login by a minute or two.
+        if auto_intel::logged_in(was_online, sync.online) {
+            self.located_this_session.remove(&sync.account_id);
         }
         if tokens_changed && let Err(error) = self.store.save(&self.data) {
             self.status = format!("Save failed: {error}");
@@ -2982,11 +2980,10 @@ impl NomadeerApp {
             self.save();
         }
         if let Some(id) = sign_in_for_online_id {
-            self.request_online_scope();
-            self.start_authorize_account(id);
+            self.start_authorize_account(id, true);
         }
         if let Some(id) = authorize_id {
-            self.start_authorize_account(id);
+            self.start_authorize_account(id, false);
         }
         if let Some(id) = sync_id {
             self.start_sync_location(id);
@@ -3016,17 +3013,6 @@ impl NomadeerApp {
                 .on_hover_text("Sign in again so Nomadeer can see when this pilot is logged in.")
                 .clicked(),
             _ => false,
-        }
-    }
-
-    /// Makes sure the next sign-in asks to see whether characters are logged in.
-    fn request_online_scope(&mut self) {
-        let scopes = &mut self.esi_settings_form.scopes;
-        if !scopes.split_whitespace().any(|scope| scope == ONLINE_SCOPE) {
-            if !scopes.trim().is_empty() {
-                scopes.push(' ');
-            }
-            scopes.push_str(ONLINE_SCOPE);
         }
     }
 
