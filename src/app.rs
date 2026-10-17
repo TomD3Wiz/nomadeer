@@ -18,6 +18,8 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod umbra;
+
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const WARNING_TEXT: Color32 = Color32::from_rgb(255, 194, 87);
 const RECON_HINT: &str = "Nomadeer gathers intel and Umbra briefs wherever recon pilots arrive.";
@@ -102,6 +104,10 @@ impl UmbraTask {
         matches!(self, Self::Briefing { auto: true, .. })
     }
 
+    fn is_waking(&self) -> bool {
+        matches!(self, Self::Briefing { waking: true, .. })
+    }
+
     /// The system she is briefing, if any.
     fn briefing_system(&self) -> Option<&str> {
         match self {
@@ -147,6 +153,7 @@ enum DashboardTab {
     Connections,
     Systems,
     Intel,
+    Umbra,
     Chain,
 }
 
@@ -198,6 +205,12 @@ pub(crate) struct NomadeerApp {
     umbra_needs_repair: bool,
     /// Checks run once per process on their own; after that the player asks for them.
     umbra_check_attempted: bool,
+    /// Her briefings, oldest first, as shown in her tab.
+    umbra_feed: Vec<UmbraBriefing>,
+    /// Her portrait once loaded; None inside when it could not be decoded.
+    umbra_avatar: Option<Option<egui::TextureHandle>>,
+    /// The player pressed Clear history and has not yet confirmed.
+    umbra_confirm_clear: bool,
     local_intel_progress: Option<DownloadProgress>,
     local_model_import_path: String,
     portrait_textures: HashMap<String, egui::TextureHandle>,
@@ -264,6 +277,9 @@ impl NomadeerApp {
             umbra_notice: None,
             umbra_needs_repair: false,
             umbra_check_attempted: false,
+            umbra_feed: Vec::new(),
+            umbra_avatar: None,
+            umbra_confirm_clear: false,
             local_intel_progress: None,
             local_model_import_path: String::new(),
             portrait_textures: HashMap::new(),
@@ -293,6 +309,7 @@ impl NomadeerApp {
                     .cloned()
                     .map(|assessment| (assessment.system_id.clone(), assessment))
                     .collect();
+                self.load_umbra_feed();
                 self.sync_esi_settings_form();
                 self.reconcile_selected_system();
                 self.refresh_chain_snapshots();
@@ -712,21 +729,7 @@ impl NomadeerApp {
                     }
                 });
 
-                let mut auto_brief = self.data.auto_intel.umbra_briefs_automatically;
-                if ui
-                    .checkbox(&mut auto_brief, "Umbra briefs automatically")
-                    .on_hover_text(
-                        "Umbra briefs each system as soon as fresh intel is in, without being asked.",
-                    )
-                    .changed()
-                {
-                    self.data.auto_intel.umbra_briefs_automatically = auto_brief;
-                    if !auto_brief {
-                        self.auto_briefings.clear();
-                        self.interrupt_auto_briefing();
-                    }
-                    self.save();
-                }
+                self.umbra_auto_brief_toggle(ui);
 
                 if let Some(progress) = &self.local_intel_progress {
                     let fraction = if progress.total == 0 {
@@ -1672,6 +1675,7 @@ impl NomadeerApp {
                 };
                 self.system_assessments
                     .insert(briefed.system_id.clone(), briefed.clone());
+                self.record_umbra_briefing(&briefed, auto);
                 self.upsert_system_assessment(briefed);
                 match self.store.save(&self.data) {
                     Ok(()) if auto => {}
@@ -2260,11 +2264,17 @@ impl NomadeerApp {
             ui.separator();
             self.dashboard_tabs(ui);
             ui.separator();
+            // Umbra's feed scrolls on its own so it can follow her newest briefing.
+            if self.active_tab == DashboardTab::Umbra {
+                self.umbra_tab(ui);
+                return;
+            }
             egui::ScrollArea::vertical().show(ui, |ui| match self.active_tab {
                 DashboardTab::Movement => self.recent_movements(ui),
                 DashboardTab::Connections => self.inferred_connections(ui),
                 DashboardTab::Systems => self.systems_overview(ui),
                 DashboardTab::Intel => self.selected_system_intel(ui),
+                DashboardTab::Umbra => self.umbra_tab(ui),
                 DashboardTab::Chain => self.chain_management(ui),
             });
         });
@@ -2725,6 +2735,11 @@ impl NomadeerApp {
             now(),
         )
         .map(|traffic| Self::recent_traffic_label(&traffic));
+        let umbra_words = self
+            .system_assessments
+            .get(&system_id)
+            .and_then(umbra::sidebar_words)
+            .map(str::to_owned);
         let assessment_summary = self.system_assessments.get(&system_id).map(|assessment| {
             let (age, stale) = Self::assessment_age(assessment.generated_at, now());
             (
@@ -2800,6 +2815,9 @@ impl NomadeerApp {
                 } else {
                     theme::accent()
                 }));
+            }
+            if let Some(words) = &umbra_words {
+                umbra::umbra_quote(ui, words);
             }
             self.intel_activity(ui, &system_node, true);
             ui.label(format!(
@@ -3043,6 +3061,12 @@ impl NomadeerApp {
                 self.active_tab = DashboardTab::Intel;
             }
             if ui
+                .selectable_label(self.active_tab == DashboardTab::Umbra, "Umbra")
+                .clicked()
+            {
+                self.active_tab = DashboardTab::Umbra;
+            }
+            if ui
                 .selectable_label(self.active_tab == DashboardTab::Chain, "Chain")
                 .clicked()
             {
@@ -3202,8 +3226,6 @@ impl NomadeerApp {
         } else {
             theme::accent()
         };
-        let core = local_intel::core_status();
-        let umbra_idle = self.umbra_free_for_player();
         record_frame(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("System assessment");
@@ -3247,53 +3269,7 @@ impl NomadeerApp {
                     }
                 });
             }
-            ui.label(&assessment.briefing);
-            ui.horizontal_wrapped(|ui| {
-                if assessment.model_generated {
-                    pill(ui, "Umbra briefing");
-                } else {
-                    pill(ui, "Evidence summary");
-                }
-                if core != CoreStatus::Missing && !self.umbra_needs_repair {
-                    // An unchecked core is being checked, or is checked on request.
-                    if ui
-                        .add_enabled(
-                            umbra_idle,
-                            egui::Button::new(if assessment.model_generated {
-                                "Ask Umbra again"
-                            } else {
-                                "Ask Umbra"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.start_local_briefing(&system.id);
-                    }
-                } else if ui
-                    .button(if self.umbra_needs_repair {
-                        "Repair Umbra"
-                    } else {
-                        "Install Umbra"
-                    })
-                    .clicked()
-                {
-                    self.show_local_intel_settings = true;
-                }
-            });
-            self.umbra_feedback(ui, Some(&system.id));
-            egui::CollapsingHeader::new("Evidence")
-                .default_open(false)
-                .show(ui, |ui| {
-                    for evidence in &assessment.evidence {
-                        ui.label(format!("• {evidence}"));
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "Public killmails may be delayed or absent; quiet never means safe.",
-                        )
-                        .color(theme::muted_text()),
-                    );
-                });
+            self.assessment_briefing(ui, system, assessment);
         });
     }
 

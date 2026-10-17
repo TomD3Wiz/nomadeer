@@ -261,3 +261,28 @@ pub(crate) struct SystemAssessment {
     pub(crate) model_generated: bool,
     pub(crate) generated_at: u64,
 }
+
+/// One of Umbra's accepted briefings, kept for her feed. The system's name and class
+/// are as they were when she wrote it, so the entry still reads after the chain moves on.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UmbraBriefing {
+    /// Database row id; 0 until saved.
+    pub(crate) id: i64,
+    pub(crate) solar_system_id: u64,
+    /// The map system it was written for.
+    pub(crate) system_id: String,
+    pub(crate) system_name: String,
+    /// W-space class, or known-space band and security, e.g. "C3" or "LS 0.3".
+    pub(crate) system_class: String,
+    pub(crate) threat_score: u8,
+    pub(crate) activity_score: u8,
+    pub(crate) confidence: String,
+    pub(crate) briefing: String,
+    /// When the assessment she briefed was made; with the system it identifies the
+    /// assessment, so briefing it again adds nothing new.
+    pub(crate) assessed_at: u64,
+    /// When she wrote it.
+    pub(crate) briefed_at: u64,
+    /// She wrote it on her own rather than when the player asked.
+    pub(crate) auto: bool,
+}
