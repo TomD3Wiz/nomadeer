@@ -795,15 +795,13 @@ impl NomadeerApp {
                     traffic,
                     save_error,
                 })) => {
-                    let kill_count = report.history.kills_7d;
+                    let kill_count = report.history.kills_7d + report.history.npc_kills_7d;
                     let assessment = self
                         .data
                         .systems
                         .iter()
                         .find(|system| system.solar_system_id == report.solar_system_id)
-                        .map(|system| {
-                            local_intel::assess_system(system, &report, &traffic.samples)
-                        });
+                        .map(|system| local_intel::assess_system(system, &report, &traffic, now()));
                     let mut save_error = save_error;
                     if let Some(assessment) = assessment {
                         self.system_assessments
@@ -2124,7 +2122,7 @@ impl NomadeerApp {
         let total_value = report.total_value;
         let solo_kills = report.solo_kills;
         let npc_kills = report.npc_kills;
-        let history_kills = report.history.kills_7d;
+        let history_kills = report.history.kills_7d + report.history.npc_kills_7d;
         let assessment = self.system_assessments.get(&system.id).cloned();
 
         if let Some(assessment) = assessment {

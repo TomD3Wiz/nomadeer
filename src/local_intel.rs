@@ -1,5 +1,5 @@
-use crate::model::{SystemAssessment, SystemNode, TrafficSample};
-use crate::util::now;
+use crate::model::{SystemAssessment, SystemNode, SystemTrafficHistory, TrafficSample};
+use crate::util::{DAY_SECS, HOUR_SECS};
 use crate::zkill::ZkillReport;
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
@@ -8,6 +8,7 @@ use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
@@ -103,18 +104,46 @@ pub(crate) fn remove_model() -> Result<(), String> {
     Ok(())
 }
 
+/// W-space solar system IDs, Thera included.
+const WORMHOLE_SYSTEM_IDS: RangeInclusive<u64> = 31_000_000..=31_999_999;
+const WORMHOLE_REGION_IDS: RangeInclusive<u64> = 11_000_000..=11_999_999;
+/// ESI publishes traffic hourly; anything older no longer describes the system now.
+const TRAFFIC_FRESH_SECS: u64 = 2 * HOUR_SECS;
+/// Pads the jump count so a single kill in a quiet system does not read as a gate camp.
+const KILL_RATE_JUMP_PADDING: f32 = 50.0;
+
+struct TrafficBaseline {
+    usual_jumps: f32,
+    samples: usize,
+    same_hour: bool,
+}
+
 pub(crate) fn assess_system(
     system: &SystemNode,
     report: &ZkillReport,
-    traffic: &[TrafficSample],
+    traffic: &SystemTrafficHistory,
+    current_time: u64,
 ) -> SystemAssessment {
     let history = &report.history;
-    let is_wormhole = system.name.starts_with('J');
+    let is_wormhole = is_wormhole_space(system);
+    let is_fresh = |data_time: u64| current_time.saturating_sub(data_time) <= TRAFFIC_FRESH_SECS;
+    // Wormhole space has no traffic feed, and an old hour says nothing about the system now.
+    let jumps = traffic
+        .latest_jumps
+        .filter(|reading| !is_wormhole && is_fresh(reading.data_time));
+    let esi_kills = traffic
+        .latest_kills
+        .filter(|reading| !is_wormhole && is_fresh(reading.data_time))
+        .map(|reading| reading.value);
+    let esi_player_kills =
+        esi_kills.map_or(0, |kills| (kills.ship_kills + kills.pod_kills) as usize);
+    // ESI's ship and pod kills are the same losses zKill reports, so the larger count wins.
+    let kills_1h = history.kills_1h.max(esi_player_kills);
 
     let kills_1_to_4 = history.kills_4h.saturating_sub(history.kills_1h);
     let kills_4_to_8 = history.kills_8h.saturating_sub(history.kills_4h);
     let kills_8_to_24 = history.kills_24h.saturating_sub(history.kills_8h);
-    let mut threat = history.kills_1h as f32 * 20.0
+    let mut threat = kills_1h as f32 * 20.0
         + kills_1_to_4 as f32 * 12.0
         + kills_4_to_8 as f32 * 7.0
         + kills_8_to_24 as f32 * 3.0
@@ -123,85 +152,64 @@ pub(crate) fn assess_system(
     threat += history.busiest_corporation_24h.saturating_sub(2) as f32 * 2.0;
     threat += (history.isk_destroyed_24h / 500_000_000.0).min(12.0) as f32;
     threat += (history.kills_current_hour_7d as f32 * 1.5).min(8.0);
-
-    if !is_wormhole {
-        let player_kills = system.ship_kills_1h + system.pod_kills_1h;
-        threat += (player_kills as f32 * 6.0).min(24.0);
-        if system.jumps_1h > 0 {
-            let kills_per_thousand = player_kills as f32 * 1_000.0 / system.jumps_1h as f32;
-            threat += (kills_per_thousand * 2.5).min(18.0);
-        }
+    if let Some(jumps) = jumps {
+        let kill_rate = kills_1h as f32 / (jumps.value as f32 + KILL_RATE_JUMP_PADDING);
+        threat += (kill_rate * 100.0).min(18.0);
     }
 
-    let mut activity = if is_wormhole {
-        (history.kills_24h as f32 * 12.0 + history.kills_7d as f32 * 1.5).min(100.0)
-    } else {
-        let jump_activity = if system.jumps_1h == 0 {
-            0.0
-        } else {
-            (system.jumps_1h as f32).log10() * 28.0
-        };
-        let combat_activity = (system.ship_kills_1h + system.pod_kills_1h) as f32 * 5.0;
-        let npc_activity = (system.npc_kills_1h as f32).sqrt().min(20.0);
-        (jump_activity + combat_activity + npc_activity).min(100.0)
-    };
+    let npc_losses = (history.npc_kills_24h as f32 * 2.0).min(10.0);
+    let mut activity = match jumps {
+        Some(jumps) => {
+            let jump_activity = if jumps.value == 0 {
+                0.0
+            } else {
+                (jumps.value as f32).log10() * 28.0
+            };
+            let combat_activity = kills_1h as f32 * 5.0;
+            let npc_activity =
+                esi_kills.map_or(0.0, |kills| (kills.npc_kills as f32).sqrt().min(20.0));
+            jump_activity + combat_activity + npc_activity + npc_losses
+        }
+        // Without current traffic the killboard is the only sign of pilots in the system.
+        None => {
+            history.kills_24h.max(kills_1h) as f32 * 12.0
+                + history.kills_7d as f32 * 1.5
+                + history.npc_kills_24h as f32 * 6.0
+                + history.npc_kills_7d as f32 * 0.75
+        }
+    }
+    .min(100.0);
 
-    // Wormhole space has no jump feed, so its captured hours say nothing about traffic.
-    let jump_samples = if is_wormhole {
-        Vec::new()
-    } else {
-        traffic
-            .iter()
-            .filter_map(|sample| sample.jumps.map(|jumps| (sample.hour, jumps)))
-            .collect::<Vec<_>>()
-    };
-    let assessment_time = now();
-    let current_hour_start = assessment_time / 3_600 * 3_600;
-    let current_utc_hour = current_hour_start / 3_600 % 24;
-    let historical_samples = jump_samples
-        .iter()
-        .copied()
-        .filter(|(hour, _)| *hour < current_hour_start)
-        .collect::<Vec<_>>();
-    let same_hour_samples = historical_samples
-        .iter()
-        .copied()
-        .filter(|(hour, _)| hour / 3_600 % 24 == current_utc_hour)
-        .collect::<Vec<_>>();
-    let baseline_source = if same_hour_samples.len() >= 2 {
-        &same_hour_samples
-    } else {
-        &historical_samples
-    };
-    let baseline_jumps = if baseline_source.is_empty() {
-        None
-    } else {
-        Some(
-            baseline_source
-                .iter()
-                .map(|(_, jumps)| *jumps as f32)
-                .sum::<f32>()
-                / baseline_source.len() as f32,
-        )
-    };
-
-    if !is_wormhole
-        && let Some(baseline) = baseline_jumps
-        && baseline >= 1.0
-    {
-        let relative_traffic = system.jumps_1h as f32 / baseline;
+    let baseline = jumps.and_then(|latest| traffic_baseline(&traffic.samples, latest.hour));
+    let usual_jumps = baseline
+        .as_ref()
+        .map(|baseline| baseline.usual_jumps)
+        .filter(|usual| *usual >= 1.0);
+    if let (Some(jumps), Some(usual)) = (jumps, usual_jumps) {
+        let relative_traffic = jumps.value as f32 / usual;
         let baseline_adjustment = ((relative_traffic - 1.0) * 20.0).clamp(-15.0, 20.0);
         activity = (activity + baseline_adjustment).clamp(0.0, 100.0);
     }
 
     let threat_score = threat.clamp(0.0, 100.0).round() as u8;
     let activity_score = activity.clamp(0.0, 100.0).round() as u8;
-    let confidence = if jump_samples.len() >= 24 {
-        "High"
-    } else if jump_samples.len() >= 4 || history.kills_7d > 0 {
-        "Medium"
+    let confidence = if is_wormhole {
+        // Only the killboard covers w-space, and an empty killboard does not prove a quiet hole.
+        if history.kills_7d + history.npc_kills_7d > 0 {
+            "Medium"
+        } else {
+            "Low"
+        }
     } else {
-        "Low"
+        match (&jumps, &baseline) {
+            (Some(_), Some(baseline))
+                if baseline.same_hour && baseline.samples >= 3 && esi_kills.is_some() =>
+            {
+                "High"
+            }
+            (Some(_), Some(baseline)) if baseline.samples >= 4 => "Medium",
+            _ => "Low",
+        }
     }
     .to_owned();
 
@@ -230,6 +238,12 @@ pub(crate) fn assess_system(
             count_label(history.kills_current_hour_7d, "kill")
         ));
     }
+    if history.npc_kills_24h > 0 {
+        evidence.push(format!(
+            "{} lost to NPCs in the last 24 hours",
+            count_label(history.npc_kills_24h, "ship")
+        ));
+    }
     if history.isk_destroyed_24h > 0.0 {
         evidence.push(format!(
             "{} destroyed in the last 24 hours",
@@ -243,25 +257,31 @@ pub(crate) fn assess_system(
         ));
     }
     if !is_wormhole {
-        evidence.push(format!(
-            "{}, {} and {} in the last hour",
-            count_label(system.jumps_1h as usize, "jump"),
-            count_label(system.ship_kills_1h as usize, "ship kill"),
-            count_label(system.pod_kills_1h as usize, "pod kill")
-        ));
-        if let Some(baseline) = baseline_jumps
-            && baseline >= 1.0
-        {
-            let difference = (system.jumps_1h as f32 - baseline) / baseline * 100.0;
+        let mut traffic_facts = Vec::new();
+        if let Some(jumps) = jumps {
+            traffic_facts.push(count_label(jumps.value as usize, "jump"));
+        }
+        if let Some(kills) = esi_kills {
+            traffic_facts.push(count_label(kills.ship_kills as usize, "ship kill"));
+            traffic_facts.push(count_label(kills.pod_kills as usize, "pod kill"));
+        }
+        if !traffic_facts.is_empty() {
+            evidence.push(format!("{} in the last hour", join_phrases(&traffic_facts)));
+        }
+        if jumps.is_none() {
+            evidence.push("Traffic data for this system is not available yet".to_owned());
+        }
+        if let (Some(jumps), Some(usual)) = (jumps, usual_jumps) {
+            let difference = (jumps.value as f32 - usual) / usual * 100.0;
             evidence.push(format!(
                 "Traffic is {:.0}% {} its usual level",
                 difference.abs(),
                 if difference >= 0.0 { "above" } else { "below" }
             ));
-            if same_hour_samples.len() >= 2 {
+            if let Some(baseline) = baseline.as_ref().filter(|baseline| baseline.same_hour) {
                 evidence.push(format!(
                     "Usual traffic is based on {} earlier samples at this time of day",
-                    same_hour_samples.len()
+                    baseline.samples
                 ));
             }
         }
@@ -276,7 +296,63 @@ pub(crate) fn assess_system(
         evidence,
         briefing,
         model_generated: false,
-        generated_at: now(),
+        generated_at: current_time,
+    }
+}
+
+/// W-space is recognised by its system ID; names are no guide, as Jita and J-GAMP show.
+fn is_wormhole_space(system: &SystemNode) -> bool {
+    if system.solar_system_id != 0 {
+        return WORMHOLE_SYSTEM_IDS.contains(&system.solar_system_id);
+    }
+    if system.region_id != 0 {
+        return WORMHOLE_REGION_IDS.contains(&system.region_id);
+    }
+    // A system added by hand may only carry its class.
+    let class = system.class.trim().to_ascii_uppercase();
+    class.starts_with("C-")
+        || class == "THERA"
+        || class
+            .strip_prefix('C')
+            .is_some_and(|class| matches!(class, "1" | "2" | "3" | "4" | "5" | "6" | "13"))
+}
+
+/// Average jumps over the captured hours before `latest_hour`, from the same hour of day
+/// when at least two days have been captured.
+fn traffic_baseline(samples: &[TrafficSample], latest_hour: u64) -> Option<TrafficBaseline> {
+    let window_start = latest_hour.saturating_sub(7 * DAY_SECS);
+    let earlier = samples
+        .iter()
+        .filter(|sample| sample.hour >= window_start && sample.hour < latest_hour)
+        .filter_map(|sample| sample.jumps.map(|jumps| (sample.hour, jumps)))
+        .collect::<Vec<_>>();
+    let hour_of_day = latest_hour / HOUR_SECS % 24;
+    let same_hour = earlier
+        .iter()
+        .copied()
+        .filter(|(hour, _)| hour / HOUR_SECS % 24 == hour_of_day)
+        .collect::<Vec<_>>();
+    let (source, same_hour) = if same_hour.len() >= 2 {
+        (same_hour, true)
+    } else {
+        (earlier, false)
+    };
+    if source.is_empty() {
+        return None;
+    }
+    Some(TrafficBaseline {
+        usual_jumps: source.iter().map(|(_, jumps)| *jumps as f32).sum::<f32>()
+            / source.len() as f32,
+        samples: source.len(),
+        same_hour,
+    })
+}
+
+fn join_phrases(phrases: &[String]) -> String {
+    match phrases.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -576,10 +652,101 @@ fn format_isk(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_briefing, fact_sheet, generate_briefing, install_model, is_model_installed,
-        numbers_in, score_label, validate_briefing,
+        assess_system, clean_briefing, fact_sheet, generate_briefing, install_model,
+        is_model_installed, is_wormhole_space, numbers_in, score_label, validate_briefing,
     };
-    use crate::model::SystemAssessment;
+    use crate::model::{
+        KillCounts, SystemAssessment, SystemNode, SystemTrafficHistory, TrafficReading,
+        TrafficSample,
+    };
+    use crate::util::{DAY_SECS, HOUR_SECS};
+    use crate::zkill::{ZkillHistory, ZkillReport};
+
+    /// Twenty minutes into an hour, so data captured this hour is fresh.
+    const NOW: u64 = 20_000 * HOUR_SECS + 1_200;
+    const JITA: u64 = 30_000_142;
+    const HOME_HOLE: u64 = 31_002_238;
+
+    fn system(solar_system_id: u64, name: &str) -> SystemNode {
+        SystemNode {
+            id: format!("esi_sys_{solar_system_id}"),
+            solar_system_id,
+            name: name.to_owned(),
+            class: String::new(),
+            security_status: 0.0,
+            constellation_id: 0,
+            constellation_name: String::new(),
+            region_id: 0,
+            region_name: String::new(),
+            planet_count: 0,
+            stargate_count: 0,
+            station_count: 0,
+            // Values left on the map node must never be scored.
+            jumps_1h: 9_999,
+            ship_kills_1h: 99,
+            pod_kills_1h: 99,
+            npc_kills_1h: 99,
+            intel_updated_at: 0,
+            effect: String::new(),
+            status: String::new(),
+            owner: String::new(),
+            notes: String::new(),
+            created_at: 0,
+        }
+    }
+
+    fn report(history: ZkillHistory) -> ZkillReport {
+        ZkillReport {
+            solar_system_id: 0,
+            recent_kills: Vec::new(),
+            history,
+            cached_killmails: Vec::new(),
+            total_value: 0.0,
+            solo_kills: 0,
+            npc_kills: 0,
+        }
+    }
+
+    fn kills_in_last_hour(kills: usize) -> ZkillHistory {
+        ZkillHistory {
+            kills_1h: kills,
+            kills_4h: kills,
+            kills_8h: kills,
+            kills_24h: kills,
+            kills_7d: kills,
+            ..ZkillHistory::default()
+        }
+    }
+
+    /// Traffic captured this hour, `data_age` seconds before `NOW`.
+    fn traffic(jumps: u32, kills: KillCounts, data_age: u64) -> SystemTrafficHistory {
+        let hour = (NOW - data_age) / HOUR_SECS * HOUR_SECS;
+        SystemTrafficHistory {
+            latest_jumps: Some(TrafficReading {
+                hour,
+                data_time: NOW - data_age,
+                value: jumps,
+            }),
+            latest_kills: Some(TrafficReading {
+                hour,
+                data_time: NOW - data_age,
+                value: kills,
+            }),
+            samples: vec![TrafficSample {
+                hour,
+                jumps: Some(jumps),
+                kills: Some(kills),
+            }],
+        }
+    }
+
+    fn player_kills(ship_kills: u32, pod_kills: u32) -> KillCounts {
+        KillCounts {
+            ship_kills,
+            pod_kills,
+            npc_kills: 0,
+        }
+    }
 
     fn test_assessment(
         threat: u8,
@@ -597,6 +764,182 @@ mod tests {
             model_generated: false,
             generated_at: 1,
         }
+    }
+
+    #[test]
+    fn wormhole_space_is_told_apart_by_system_id() {
+        assert!(!is_wormhole_space(&system(JITA, "Jita")));
+        assert!(!is_wormhole_space(&system(30_001_198, "J-GAMP")));
+        assert!(is_wormhole_space(&system(HOME_HOLE, "J123456")));
+        assert!(is_wormhole_space(&system(31_000_005, "Thera")));
+
+        let mut manual = system(0, "J123456");
+        assert!(!is_wormhole_space(&manual));
+        manual.class = "C3".to_owned();
+        assert!(is_wormhole_space(&manual));
+        manual.region_id = 10_000_002;
+        assert!(!is_wormhole_space(&manual));
+    }
+
+    #[test]
+    fn jita_is_scored_with_its_traffic() {
+        let assessment = assess_system(
+            &system(JITA, "Jita"),
+            &report(ZkillHistory::default()),
+            &traffic(2_000, player_kills(0, 0), 600),
+            NOW,
+        );
+        assert!(
+            assessment
+                .evidence
+                .contains(&"2000 jumps, 0 ship kills and 0 pod kills in the last hour".to_owned())
+        );
+        assert!(assessment.activity_score >= 80);
+    }
+
+    #[test]
+    fn killboard_and_traffic_kills_are_not_added_together() {
+        let fresh = traffic(60, player_kills(1, 1), 600);
+        let wormhole = assess_system(
+            &system(HOME_HOLE, "J123456"),
+            &report(kills_in_last_hour(2)),
+            &fresh,
+            NOW,
+        );
+        let kspace = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(kills_in_last_hour(2)),
+            &fresh,
+            NOW,
+        );
+        assert_eq!(wormhole.threat_score, 40);
+        assert!(kspace.threat_score <= wormhole.threat_score + 2);
+
+        // Kills the killboard has not seen yet still count once.
+        let unreported = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(ZkillHistory::default()),
+            &traffic(10, player_kills(2, 1), 600),
+            NOW,
+        );
+        assert_eq!(unreported.threat_score, 65);
+    }
+
+    #[test]
+    fn one_kill_in_a_quiet_system_is_not_a_camp() {
+        let assessment = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(kills_in_last_hour(1)),
+            &traffic(5, player_kills(1, 0), 600),
+            NOW,
+        );
+        assert_eq!(assessment.threat_score, 22);
+    }
+
+    #[test]
+    fn npc_losses_count_as_activity_not_threat() {
+        let history = ZkillHistory {
+            npc_kills_24h: 2,
+            npc_kills_7d: 2,
+            ..ZkillHistory::default()
+        };
+        let assessment = assess_system(
+            &system(HOME_HOLE, "J123456"),
+            &report(history),
+            &SystemTrafficHistory::default(),
+            NOW,
+        );
+        assert_eq!(assessment.threat_score, 0);
+        assert!(assessment.activity_score > 0);
+        assert!(
+            assessment
+                .evidence
+                .contains(&"2 ships lost to NPCs in the last 24 hours".to_owned())
+        );
+    }
+
+    #[test]
+    fn stale_traffic_is_not_scored() {
+        let assessment = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(ZkillHistory::default()),
+            &traffic(5_000, player_kills(12, 6), 5 * HOUR_SECS),
+            NOW,
+        );
+        assert_eq!(assessment.threat_score, 0);
+        assert_eq!(assessment.activity_score, 0);
+        assert_eq!(assessment.confidence, "Low");
+        assert!(
+            assessment
+                .evidence
+                .contains(&"Traffic data for this system is not available yet".to_owned())
+        );
+        assert!(
+            !assessment
+                .evidence
+                .iter()
+                .any(|fact| fact.contains("jumps"))
+        );
+    }
+
+    #[test]
+    fn usual_traffic_prefers_the_same_hour_of_day() {
+        let mut history = traffic(200, player_kills(0, 0), 600);
+        let latest_hour = history.samples[0].hour;
+        let mut samples = (1..=3)
+            .map(|days| TrafficSample {
+                hour: latest_hour - days * DAY_SECS,
+                jumps: Some(100),
+                kills: Some(KillCounts::default()),
+            })
+            .collect::<Vec<_>>();
+        samples.push(TrafficSample {
+            hour: latest_hour - HOUR_SECS,
+            jumps: Some(1_000),
+            kills: Some(KillCounts::default()),
+        });
+        samples.sort_by_key(|sample| sample.hour);
+        samples.extend(history.samples);
+        history.samples = samples;
+
+        let assessment = assess_system(
+            &system(30_002_187, "Amamake"),
+            &report(ZkillHistory::default()),
+            &history,
+            NOW,
+        );
+        assert!(
+            assessment
+                .evidence
+                .contains(&"Traffic is 100% above its usual level".to_owned())
+        );
+        assert!(assessment.evidence.contains(
+            &"Usual traffic is based on 3 earlier samples at this time of day".to_owned()
+        ));
+        assert_eq!(assessment.confidence, "High");
+    }
+
+    #[test]
+    fn empty_wormhole_killboard_is_low_confidence() {
+        let history = SystemTrafficHistory {
+            samples: (0..48)
+                .map(|hours| TrafficSample {
+                    hour: NOW / HOUR_SECS * HOUR_SECS - hours * HOUR_SECS,
+                    jumps: Some(0),
+                    kills: Some(KillCounts::default()),
+                })
+                .rev()
+                .collect(),
+            ..SystemTrafficHistory::default()
+        };
+        let assessment = assess_system(
+            &system(HOME_HOLE, "J123456"),
+            &report(ZkillHistory::default()),
+            &history,
+            NOW,
+        );
+        assert_eq!(assessment.threat_score, 0);
+        assert_eq!(assessment.confidence, "Low");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::model::CachedKillmail;
+use crate::util::{DAY_SECS, HOUR_SECS, hour_start};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -20,6 +21,8 @@ pub(crate) struct ZkillReport {
     pub(crate) npc_kills: usize,
 }
 
+/// Kill counts and attacker figures cover kills by players. Ships lost only to NPCs
+/// are counted separately in `npc_kills_*`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ZkillHistory {
     pub(crate) kills_1h: usize,
@@ -27,9 +30,11 @@ pub(crate) struct ZkillHistory {
     pub(crate) kills_8h: usize,
     pub(crate) kills_24h: usize,
     pub(crate) kills_7d: usize,
+    /// Kills in this UTC hour of day on the previous 7 days, leaving out today's.
     pub(crate) kills_current_hour_7d: usize,
     pub(crate) solo_24h: usize,
-    pub(crate) npc_24h: usize,
+    pub(crate) npc_kills_24h: usize,
+    pub(crate) npc_kills_7d: usize,
     pub(crate) isk_destroyed_24h: f64,
     pub(crate) unique_attackers_24h: usize,
     pub(crate) busiest_attacker_24h: usize,
@@ -185,7 +190,7 @@ pub(crate) fn fetch_system_report(
     }
 
     let cached_killmails = merge_cached_killmails(solar_system_id, cached_killmails, &kills);
-    let history = summarize_history(&cached_killmails);
+    let history = summarize_history(&cached_killmails, crate::util::now());
     let kills = kills.into_iter().take(10).collect::<Vec<_>>();
     let names = fetch_eve_names(&client, zkill_name_ids(&kills)).unwrap_or_default();
 
@@ -356,9 +361,10 @@ fn merge_cached_killmails(
     kills
 }
 
-fn summarize_history(kills: &[CachedKillmail]) -> ZkillHistory {
-    let current_time = crate::util::now();
-    let current_utc_hour = current_time / 3_600 % 24;
+fn summarize_history(kills: &[CachedKillmail], current_time: u64) -> ZkillHistory {
+    let current_hour_start = hour_start(current_time);
+    let current_utc_hour = current_hour_start / HOUR_SECS % 24;
+    let pattern_start = current_hour_start.saturating_sub(7 * DAY_SECS);
     let mut history = ZkillHistory::default();
     let mut attackers = HashSet::new();
     let mut attacker_kills = HashMap::<u64, usize>::new();
@@ -366,17 +372,25 @@ fn summarize_history(kills: &[CachedKillmail]) -> ZkillHistory {
 
     for kill in kills {
         let age = current_time.saturating_sub(kill.killmail_time);
-        if age <= 7 * 24 * 60 * 60 {
-            history.kills_7d += 1;
-            if kill.killmail_time / 3_600 % 24 == current_utc_hour {
-                history.kills_current_hour_7d += 1;
-            }
+        if kill.npc {
+            // Sleepers, rats and CONCORD are activity, not hostile pilots.
+            history.npc_kills_7d += usize::from(age <= 7 * DAY_SECS);
+            history.npc_kills_24h += usize::from(age <= DAY_SECS);
+            continue;
         }
-        if age <= 24 * 60 * 60 {
+        if age <= 7 * DAY_SECS {
+            history.kills_7d += 1;
+        }
+        // Earlier days only: this hour's kills already count in the last-hour window.
+        if (pattern_start..current_hour_start).contains(&kill.killmail_time)
+            && kill.killmail_time / HOUR_SECS % 24 == current_utc_hour
+        {
+            history.kills_current_hour_7d += 1;
+        }
+        if age <= DAY_SECS {
             history.kills_24h += 1;
             history.isk_destroyed_24h += kill.total_value;
             history.solo_24h += usize::from(kill.solo);
-            history.npc_24h += usize::from(kill.npc);
             for id in &kill.attacker_ids {
                 attackers.insert(*id);
                 *attacker_kills.entry(*id).or_default() += 1;
@@ -385,13 +399,13 @@ fn summarize_history(kills: &[CachedKillmail]) -> ZkillHistory {
                 *corporation_kills.entry(*id).or_default() += 1;
             }
         }
-        if age <= 8 * 60 * 60 {
+        if age <= 8 * HOUR_SECS {
             history.kills_8h += 1;
         }
-        if age <= 4 * 60 * 60 {
+        if age <= 4 * HOUR_SECS {
             history.kills_4h += 1;
         }
-        if age <= 60 * 60 {
+        if age <= HOUR_SECS {
             history.kills_1h += 1;
         }
     }
@@ -540,4 +554,62 @@ fn parse_killmail_time(value: &str) -> Option<u64> {
     let days = era * 146_097 + day_of_era - 719_468;
     let timestamp = days * 86_400 + hour * 3_600 + minute * 60 + second;
     u64::try_from(timestamp).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_history;
+    use crate::model::CachedKillmail;
+    use crate::util::{DAY_SECS, HOUR_SECS};
+
+    /// Thirty minutes into an hour.
+    const NOW: u64 = 20_000 * HOUR_SECS + 1_800;
+
+    fn killmail(killmail_id: u64, killmail_time: u64, npc: bool) -> CachedKillmail {
+        CachedKillmail {
+            killmail_id,
+            solar_system_id: 31_002_238,
+            killmail_time,
+            total_value: 100_000_000.0,
+            solo: false,
+            npc,
+            attacker_ids: if npc { Vec::new() } else { vec![90_000_001] },
+            corporation_ids: vec![if npc { 500_021 } else { 98_000_001 }],
+        }
+    }
+
+    #[test]
+    fn npc_losses_are_kept_out_of_player_kills() {
+        let history = summarize_history(
+            &[
+                killmail(1, NOW - 600, true),
+                killmail(2, NOW - 900, true),
+                killmail(3, NOW - 2 * DAY_SECS, true),
+                killmail(4, NOW - 1_200, false),
+            ],
+            NOW,
+        );
+        assert_eq!(history.kills_1h, 1);
+        assert_eq!(history.kills_7d, 1);
+        assert_eq!(history.npc_kills_24h, 2);
+        assert_eq!(history.npc_kills_7d, 3);
+        assert_eq!(history.busiest_corporation_24h, 1);
+        assert_eq!(history.isk_destroyed_24h, 100_000_000.0);
+    }
+
+    #[test]
+    fn time_of_day_pattern_leaves_out_this_hour() {
+        let history = summarize_history(
+            &[
+                killmail(1, NOW - 600, false),
+                killmail(2, NOW - DAY_SECS, false),
+                killmail(3, NOW - 3 * DAY_SECS - 600, false),
+                killmail(4, NOW - DAY_SECS - 2 * HOUR_SECS, false),
+                killmail(5, NOW - 8 * DAY_SECS, false),
+            ],
+            NOW,
+        );
+        assert_eq!(history.kills_1h, 1);
+        assert_eq!(history.kills_current_hour_7d, 2);
+    }
 }

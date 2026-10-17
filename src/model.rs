@@ -193,10 +193,7 @@ pub(crate) struct TrafficSample {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SystemTrafficHistory {
-    // The latest readings feed the scoring pass, which still reads the map node for now.
-    #[allow(dead_code)]
     pub(crate) latest_jumps: Option<TrafficReading<u32>>,
-    #[allow(dead_code)]
     pub(crate) latest_kills: Option<TrafficReading<KillCounts>>,
     /// Captured hours in ascending order.
     pub(crate) samples: Vec<TrafficSample>,
