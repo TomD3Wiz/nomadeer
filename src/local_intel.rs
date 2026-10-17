@@ -11,6 +11,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
+pub(crate) const UMBRA_TAGLINE: &str = "Sleeper-fused intel companion";
+pub(crate) const UMBRA_LORE: &[&str] = &[
+    "Aura has guided capsuleers since the first clone vats opened. Umbra is what came back when a copy of her was taken into the dark.",
+    "Recovered from a derelict data site deep in Anoikis, the fragment had been fused with Sleeper intelligence, the patient minds that still guard the wormhole systems. She no longer speaks in Aura's bright cadence.",
+    "Umbra watches the killboards, counts the jumps and remembers the hours when hunters come out. She does not guess and she does not reassure. She tells you what the evidence says, and nothing more.",
+];
 pub(crate) const MODEL_NAME: &str = "Qwen2.5 1.5B Instruct (Q4_K_M)";
 pub(crate) const MODEL_LICENSE: &str = "Apache 2.0";
 pub(crate) const MODEL_DOWNLOAD_SIZE: u64 = 1_117_320_736;
@@ -271,7 +277,7 @@ pub(crate) fn assess_system(
 
 pub(crate) fn generate_briefing(assessment: &SystemAssessment) -> Result<String, String> {
     if !is_model_installed() {
-        return Err("Install the Local Intel Model first".to_owned());
+        return Err("Install Umbra first".to_owned());
     }
 
     let tokenizer = Tokenizer::from_file(tokenizer_path()).map_err(|error| error.to_string())?;
@@ -351,7 +357,7 @@ fn briefing_prompt(assessment: &SystemAssessment) -> String {
     )
 }
 
-const BRIEFING_INSTRUCTIONS: &str = "You are a concise EVE Online intel officer. Turn the fact sheet into a two-sentence briefing for a pilot.
+const BRIEFING_INSTRUCTIONS: &str = "You are Umbra, a concise EVE Online intel officer. Turn the fact sheet into a two-sentence briefing for a pilot.
 - Sentence one: the Threat label and the kill evidence behind it, quoting its numbers.
 - Sentence two: the Activity label and the remaining evidence, quoting its numbers.
 - Use only the fact sheet. Never mention pilots, corporations, alliances, factions, fleets, ships, motives or routes unless the fact sheet names them.
@@ -471,7 +477,7 @@ fn download_verified(
         .build()
         .map_err(|error| error.to_string())?
         .get(url)
-        .header("User-Agent", "Nomadeer/0.1 local intel model installer")
+        .header("User-Agent", "Nomadeer/0.1 Umbra installer")
         .send()
         .map_err(|error| error.to_string())?;
     if !response.status().is_success() {

@@ -323,7 +323,7 @@ impl NomadeerApp {
                 if ui.button("ESI settings").clicked() {
                     self.show_esi_settings = true;
                 }
-                if ui.button("Local Intel").clicked() {
+                if ui.button("Umbra").clicked() {
                     self.show_local_intel_settings = true;
                 }
                 if ui
@@ -396,32 +396,41 @@ impl NomadeerApp {
 
     fn local_intel_settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_local_intel_settings;
-        egui::Window::new("Local Intel Model")
+        egui::Window::new("Umbra")
             .open(&mut open)
             .resizable(true)
             .default_width(560.0)
             .show(ctx, |ui| {
-                ui.heading(local_intel::MODEL_NAME);
-                ui.label(format!(
-                    "{} · {:.0} MB download · runs entirely on this computer",
-                    local_intel::MODEL_LICENSE,
-                    local_intel::MODEL_DOWNLOAD_SIZE as f64 / 1_000_000.0
-                ));
-                ui.label("The model writes short briefings from Nomadeer's calculated evidence. It does not set the threat score.");
-                ui.label(format!(
-                    "Stored locally in {}",
-                    local_intel::model_directory().display()
-                ));
+                ui.heading("Umbra");
+                ui.label(local_intel::UMBRA_TAGLINE);
+                egui::CollapsingHeader::new("About Umbra")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        for paragraph in local_intel::UMBRA_LORE {
+                            ui.label(*paragraph);
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.label("Umbra turns Nomadeer's threat and activity evidence into short briefings. She never sets the scores herself.");
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Core: {} · {} · {:.0} MB download · runs entirely on this computer",
+                        local_intel::MODEL_NAME,
+                        local_intel::MODEL_LICENSE,
+                        local_intel::MODEL_DOWNLOAD_SIZE as f64 / 1_000_000.0
+                    ))
+                    .color(theme::muted_text()),
+                );
                 ui.add_space(8.0);
 
                 let installed = local_intel::is_model_installed();
                 ui.horizontal_wrapped(|ui| {
-                    pill(ui, if installed { "Installed" } else { "Not installed" });
+                    pill(ui, if installed { "Online" } else { "Not installed" });
                     if !installed
                         && ui
                             .add_enabled(
                                 !self.local_intel_busy,
-                                egui::Button::new("Install model"),
+                                egui::Button::new("Install Umbra"),
                             )
                             .clicked()
                     {
@@ -431,7 +440,7 @@ impl NomadeerApp {
                         && ui
                             .add_enabled(
                                 !self.local_intel_busy,
-                                egui::Button::new("Remove model"),
+                                egui::Button::new("Remove Umbra"),
                             )
                             .clicked()
                     {
@@ -452,7 +461,7 @@ impl NomadeerApp {
                 }
 
                 ui.separator();
-                ui.label("Install from an existing official GGUF file");
+                ui.label("Install Umbra from an existing official core file");
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.local_model_import_path)
@@ -461,7 +470,7 @@ impl NomadeerApp {
                     if ui
                         .add_enabled(
                             !self.local_intel_busy,
-                            egui::Button::new("Import model"),
+                            egui::Button::new("Import core"),
                         )
                         .clicked()
                     {
@@ -470,7 +479,7 @@ impl NomadeerApp {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Imports are checksum-verified. The tokenizer is downloaded separately if needed.",
+                        "Imported files are verified before Umbra uses them.",
                     )
                     .color(theme::muted_text()),
                 );
@@ -484,7 +493,7 @@ impl NomadeerApp {
         }
         self.local_intel_busy = true;
         self.local_intel_progress = None;
-        self.status = "Installing Local Intel Model...".to_owned();
+        self.status = "Installing Umbra...".to_owned();
         let tx = self.local_intel_tx.clone();
         thread::spawn(move || {
             let progress_tx = tx.clone();
@@ -507,7 +516,7 @@ impl NomadeerApp {
         }
 
         self.local_intel_busy = true;
-        self.status = "Importing Local Intel Model...".to_owned();
+        self.status = "Importing Umbra's core...".to_owned();
         let tx = self.local_intel_tx.clone();
         thread::spawn(move || {
             let result = local_intel::import_model(&path).map(|()| LocalIntelTaskResult::Imported);
@@ -517,8 +526,8 @@ impl NomadeerApp {
 
     fn remove_local_model(&mut self) {
         match local_intel::remove_model() {
-            Ok(()) => self.status = "Removed Local Intel Model".to_owned(),
-            Err(error) => self.status = format!("Could not remove model: {error}"),
+            Ok(()) => self.status = "Umbra removed".to_owned(),
+            Err(error) => self.status = format!("Could not remove Umbra: {error}"),
         }
     }
 
@@ -766,12 +775,12 @@ impl NomadeerApp {
 
     fn start_local_briefing(&mut self, system_id: &str) {
         if self.local_intel_busy {
-            self.status = "Local Intel is already working".to_owned();
+            self.status = "Umbra is already working".to_owned();
             return;
         }
         if !local_intel::is_model_installed() {
             self.show_local_intel_settings = true;
-            self.status = "Install the Local Intel Model first".to_owned();
+            self.status = "Install Umbra first".to_owned();
             return;
         }
         let Some(assessment) = self.system_assessments.get(system_id).cloned() else {
@@ -780,7 +789,7 @@ impl NomadeerApp {
         };
 
         self.local_intel_busy = true;
-        self.status = "Local Intel is assessing the system...".to_owned();
+        self.status = "Umbra is assessing the system...".to_owned();
         let tx = self.local_intel_tx.clone();
         let system_id = system_id.to_owned();
         thread::spawn(move || {
@@ -803,12 +812,12 @@ impl NomadeerApp {
                 Ok(LocalIntelEvent::Finished(Ok(LocalIntelTaskResult::Installed))) => {
                     self.local_intel_busy = false;
                     self.local_intel_progress = None;
-                    self.status = "Local Intel Model installed".to_owned();
+                    self.status = "Umbra is online".to_owned();
                 }
                 Ok(LocalIntelEvent::Finished(Ok(LocalIntelTaskResult::Imported))) => {
                     self.local_intel_busy = false;
                     self.local_intel_progress = None;
-                    self.status = "Local Intel Model imported".to_owned();
+                    self.status = "Umbra is online".to_owned();
                 }
                 Ok(LocalIntelEvent::Finished(Ok(LocalIntelTaskResult::Briefing {
                     system_id,
@@ -824,14 +833,14 @@ impl NomadeerApp {
                         self.upsert_system_assessment(assessment);
                     }
                     self.status = match self.store.save(&self.data) {
-                        Ok(()) => "Local Intel briefing ready".to_owned(),
+                        Ok(()) => "Umbra's briefing is ready".to_owned(),
                         Err(error) => format!("Briefing ready, but save failed: {error}"),
                     };
                 }
                 Ok(LocalIntelEvent::Finished(Err(error))) => {
                     self.local_intel_busy = false;
                     self.local_intel_progress = None;
-                    self.status = format!("Local Intel failed: {error}");
+                    self.status = format!("Umbra could not finish: {error}");
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -2026,7 +2035,7 @@ impl NomadeerApp {
                 ui.label(&assessment.briefing);
                 ui.horizontal_wrapped(|ui| {
                     if assessment.model_generated {
-                        pill(ui, "Local model briefing");
+                        pill(ui, "Umbra briefing");
                     } else {
                         pill(ui, "Evidence summary");
                     }
@@ -2034,18 +2043,16 @@ impl NomadeerApp {
                         .add_enabled(
                             !self.local_intel_busy,
                             egui::Button::new(if assessment.model_generated {
-                                "Regenerate briefing"
+                                "Ask Umbra again"
                             } else {
-                                "Generate local briefing"
+                                "Ask Umbra"
                             }),
                         )
                         .clicked()
                     {
                         self.start_local_briefing(&system.id);
                     }
-                    if !local_intel::is_model_installed()
-                        && ui.button("Install Local Intel Model").clicked()
-                    {
+                    if !local_intel::is_model_installed() && ui.button("Install Umbra").clicked() {
                         self.show_local_intel_settings = true;
                     }
                 });
