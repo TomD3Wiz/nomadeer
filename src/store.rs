@@ -1,7 +1,7 @@
 use crate::model::{
-    Account, AppData, CachedKillmail, Connection, EsiSettings, KillCounts, KillboardCoverage, Note,
-    Signature, SystemAssessment, SystemNode, SystemTrafficHistory, TrafficHour, TrafficReading,
-    TrafficRows, TrafficSample, VisitLog,
+    Account, AppData, AutoIntelSettings, CachedKillmail, Connection, EsiSettings, KillCounts,
+    KillboardCoverage, Note, Signature, SystemAssessment, SystemNode, SystemTrafficHistory,
+    TrafficHour, TrafficReading, TrafficRows, TrafficSample, VisitLog,
 };
 use crate::paths;
 use crate::util::{DAY_SECS, hour_start, now};
@@ -20,6 +20,8 @@ pub(crate) const KILLMAIL_RETENTION_SECS: u64 = 7 * DAY_SECS;
 /// A week of hourly traffic for baselines plus the current day.
 pub(crate) const TRAFFIC_RETENTION_SECS: u64 = 8 * DAY_SECS;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const GATHER_ON_ARRIVAL_KEY: &str = "gather_intel_on_arrival";
+const UMBRA_BRIEFS_AUTOMATICALLY_KEY: &str = "umbra_briefs_automatically";
 
 /// Handle to the SQLite database. Clones share schema setup and can be moved to
 /// background threads; each operation opens its own connection.
@@ -101,6 +103,19 @@ impl Store {
             params!["esi_scopes", data.esi_settings.scopes],
         )
         .map_err(|error| error.to_string())?;
+        for (key, enabled) in [
+            (GATHER_ON_ARRIVAL_KEY, data.auto_intel.gather_on_arrival),
+            (
+                UMBRA_BRIEFS_AUTOMATICALLY_KEY,
+                data.auto_intel.umbra_briefs_automatically,
+            ),
+        ] {
+            tx.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?1, ?2)",
+                params![key, if enabled { "1" } else { "0" }],
+            )
+            .map_err(|error| error.to_string())?;
+        }
 
         for account in &data.accounts {
             tx.execute(
@@ -894,8 +909,10 @@ impl Store {
     }
 
     fn load_all(&self, conn: &SqliteConnection) -> Result<AppData, String> {
+        let (esi_settings, auto_intel) = self.load_settings(conn)?;
         Ok(AppData {
-            esi_settings: self.load_esi_settings(conn)?,
+            esi_settings,
+            auto_intel,
             accounts: self.load_accounts(conn)?,
             systems: self.load_systems(conn)?,
             connections: self.load_connections(conn)?,
@@ -906,8 +923,14 @@ impl Store {
         })
     }
 
-    fn load_esi_settings(&self, conn: &SqliteConnection) -> Result<EsiSettings, String> {
+    /// Settings missing from the database, e.g. ones added after it was made, keep
+    /// their defaults.
+    fn load_settings(
+        &self,
+        conn: &SqliteConnection,
+    ) -> Result<(EsiSettings, AutoIntelSettings), String> {
         let mut settings = EsiSettings::default();
+        let mut auto_intel = AutoIntelSettings::default();
         let mut stmt = conn
             .prepare("SELECT key, value FROM app_settings")
             .map_err(|error| error.to_string())?;
@@ -925,11 +948,15 @@ impl Store {
                     settings.callback_port = value.parse().unwrap_or(settings.callback_port);
                 }
                 "esi_scopes" => settings.scopes = value,
+                GATHER_ON_ARRIVAL_KEY => auto_intel.gather_on_arrival = value != "0",
+                UMBRA_BRIEFS_AUTOMATICALLY_KEY => {
+                    auto_intel.umbra_briefs_automatically = value != "0";
+                }
                 _ => {}
             }
         }
 
-        Ok(settings)
+        Ok((settings, auto_intel))
     }
 
     fn load_accounts(&self, conn: &SqliteConnection) -> Result<Vec<Account>, String> {
@@ -1188,8 +1215,8 @@ fn traffic_kills(row: &Row<'_>, first_column: usize) -> rusqlite::Result<KillCou
 mod tests {
     use super::{KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS};
     use crate::model::{
-        AppData, CachedKillmail, KillCounts, KillboardCoverage, TrafficHour, TrafficReading,
-        TrafficRows, TrafficSample,
+        AppData, AutoIntelSettings, CachedKillmail, KillCounts, KillboardCoverage, TrafficHour,
+        TrafficReading, TrafficRows, TrafficSample,
     };
     use rusqlite::Connection as SqliteConnection;
     use std::path::PathBuf;
@@ -1586,6 +1613,43 @@ mod tests {
 
         assert_eq!(store.cached_killmails(1, 0).unwrap().len(), 1);
         assert_eq!(store.system_traffic(1, 0).unwrap().samples.len(), 1);
+    }
+
+    #[test]
+    fn auto_intel_settings_default_on_and_persist() {
+        let db = TestDb::new("auto-intel");
+        let store = db.store();
+        // A database saved before these settings existed has no rows for them.
+        store.save(&data_with_client_id("older")).unwrap();
+        {
+            let conn = SqliteConnection::open(&db.path).unwrap();
+            conn.execute("DELETE FROM app_settings WHERE key NOT LIKE 'esi_%'", [])
+                .unwrap();
+        }
+        assert_eq!(
+            store.load().unwrap().auto_intel,
+            AutoIntelSettings::default()
+        );
+        assert!(AutoIntelSettings::default().gather_on_arrival);
+        assert!(AutoIntelSettings::default().umbra_briefs_automatically);
+
+        let mut data = data_with_client_id("older");
+        data.auto_intel.gather_on_arrival = false;
+        store.save(&data).unwrap();
+        let loaded = store.load().unwrap().auto_intel;
+        assert!(!loaded.gather_on_arrival);
+        assert!(loaded.umbra_briefs_automatically);
+
+        data.auto_intel = AutoIntelSettings {
+            gather_on_arrival: true,
+            umbra_briefs_automatically: false,
+        };
+        store.save(&data).unwrap();
+        assert_eq!(store.load().unwrap().auto_intel, data.auto_intel);
+
+        // Legacy JSON without the settings turns both on.
+        let legacy: AppData = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.auto_intel, AutoIntelSettings::default());
     }
 
     #[test]

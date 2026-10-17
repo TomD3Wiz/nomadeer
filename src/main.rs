@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod auto_intel;
 mod chain_archive;
 mod config;
 mod esi;
@@ -41,6 +42,8 @@ fn main() -> eframe::Result<()> {
             1
         });
     }
+    // SAFETY: nothing has started another thread yet.
+    unsafe { local_intel::limit_cpu_threads() };
     #[cfg(windows)]
     show_main_thread_panics();
 
