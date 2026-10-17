@@ -10,8 +10,8 @@ use crate::widgets::pill;
 use eframe::egui::{self, Sense, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
 
-/// Her portrait: Aura's hologram half taken by Sleeper circuitry, rendered by
-/// assets/umbra/render_avatar.py. Square; larger art is scaled down on load.
+/// Her portrait: Aura's hologram half taken by Sleeper plating, one eye gone amber.
+/// Square; larger art is scaled down on load.
 const AVATAR_PNG: &[u8] = include_bytes!("../../assets/umbra/umbra-avatar.png");
 /// She is never drawn larger than 96 points, so twice that covers high-DPI screens.
 const AVATAR_TEXTURE_SIZE: u32 = 192;
