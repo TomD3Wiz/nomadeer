@@ -4,7 +4,26 @@ on:
   push:
     tags:
       - "v*"
+  # Build every package (without publishing) when a pull request changes how
+  # releases are built, so packaging breakages show up before a tag.
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+      - "assets/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "Makefile"
   workflow_dispatch:
+
+# A newer push to the same pull request supersedes an older package build.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
