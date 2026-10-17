@@ -744,6 +744,10 @@ fn shell_execute(_path: &Path, _parameters: &str, _elevate: bool) -> Result<(), 
 
 /// Starts the AppImage at `path` on its own, so it outlives this copy.
 pub(crate) fn relaunch_appimage(path: &Path) -> Result<(), String> {
+    // The new AppImage must not hold on to this copy's mount, or the old image
+    // stays mounted (and its replaced file on disk) while the new one runs.
+    #[cfg(target_os = "linux")]
+    keep_descriptors_from_children();
     let mut command = std::process::Command::new(path);
     // The AppImage runtime sets these for what it starts; the new one sets its own.
     for name in ["APPIMAGE", "APPDIR", "ARGV0", "OWD"] {
@@ -764,6 +768,41 @@ pub(crate) fn relaunch_appimage(path: &Path) -> Result<(), String> {
         command.process_group(0);
     }
     command.spawn().map(drop).map_err(|error| error.to_string())
+}
+
+/// The AppImage runtime leaves two descriptors open for everything the app
+/// starts: one end of the pipe it watches to know when the app has finished,
+/// and the mount folder itself (fd 1023). Either keeps this copy's image
+/// mounted for as long as whatever inherits it runs. Marks every descriptor but
+/// standard input, output and error close-on-exec, so the programs started from
+/// now on get none of them. Nomadeer's own descriptors already are.
+#[cfg(target_os = "linux")]
+fn keep_descriptors_from_children() {
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+
+    let Ok(entries) = fs::read_dir("/proc/self/fd") else {
+        return;
+    };
+    let open: Vec<i32> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .filter(|&fd| fd > 2)
+        .collect();
+    for fd in open {
+        // SAFETY: only reads and sets the close-on-exec flag of a descriptor
+        // number; one that has closed meanwhile fails harmlessly with EBADF.
+        unsafe {
+            let flags = fcntl(fd, F_GETFD);
+            if flags >= 0 {
+                fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1191,6 +1230,44 @@ mod tests {
             let mode = fs::metadata(&appimage).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o750);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_new_appimage_inherits_nothing_from_this_copy() {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_GETFD: i32 = 1;
+        const F_SETFD: i32 = 2;
+        const FD_CLOEXEC: i32 = 1;
+        // SAFETY: reads or sets the flags of descriptors the test holds open.
+        let inherited = |fd: i32| unsafe { fcntl(fd, F_GETFD) } & FD_CLOEXEC == 0;
+        let inherit = |fd: i32| unsafe { fcntl(fd, F_SETFD, 0) };
+
+        // Like the runtime's mount folder and keep-alive pipe, both start out
+        // inherited by whatever this process starts.
+        let mount = TempDir::new("mount");
+        fs::write(mount.path.join("AppRun"), b"x").unwrap();
+        let folder = File::open(&mount.path).unwrap();
+        let (pipe, _writer) = io::pipe().unwrap();
+        let descriptors = [folder.as_raw_fd(), pipe.as_raw_fd()];
+        for fd in descriptors {
+            assert_eq!(inherit(fd), 0);
+            assert!(inherited(fd));
+        }
+        let standard: Vec<bool> = (0..=2).map(inherited).collect();
+
+        keep_descriptors_from_children();
+        for fd in descriptors {
+            assert!(!inherited(fd), "fd {fd}");
+        }
+        let after: Vec<bool> = (0..=2).map(inherited).collect();
+        assert_eq!(
+            after, standard,
+            "standard input, output and error stay as they were"
+        );
     }
 
     #[test]
