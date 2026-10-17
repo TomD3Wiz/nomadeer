@@ -1,7 +1,7 @@
 use crate::model::{
-    Account, AppData, CachedKillmail, Connection, EsiSettings, KillCounts, Note, Signature,
-    SystemAssessment, SystemNode, SystemTrafficHistory, TrafficHour, TrafficReading, TrafficRows,
-    TrafficSample, VisitLog,
+    Account, AppData, CachedKillmail, Connection, EsiSettings, KillCounts, KillboardCoverage, Note,
+    Signature, SystemAssessment, SystemNode, SystemTrafficHistory, TrafficHour, TrafficReading,
+    TrafficRows, TrafficSample, VisitLog,
 };
 use crate::util::{DAY_SECS, hour_start, now};
 use rusqlite::{Connection as SqliteConnection, OptionalExtension, Row, params, types::Type};
@@ -294,10 +294,36 @@ impl Store {
             .map_err(|error| error.to_string())
     }
 
-    /// Upserts killmails by id and drops any older than the retention window.
+    /// How far back a system's cached killmails are known to be complete, if they have
+    /// been fetched since coverage was first recorded.
+    pub(crate) fn killboard_coverage(
+        &self,
+        solar_system_id: u64,
+    ) -> Result<Option<KillboardCoverage>, String> {
+        let conn = self.open()?;
+        conn.query_row(
+            "SELECT covered_since, covered_until FROM killboard_coverage
+             WHERE solar_system_id = ?1",
+            params![solar_system_id as i64],
+            |row| {
+                Ok(KillboardCoverage {
+                    solar_system_id,
+                    since: row.get::<_, i64>(0)? as u64,
+                    until: row.get::<_, i64>(1)? as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+    }
+
+    /// Upserts killmails by id and drops any older than the retention window. The
+    /// coverage, when given, is written in the same transaction so it never claims
+    /// kills that were not saved.
     pub(crate) fn store_killmails(
         &self,
         kills: &[CachedKillmail],
+        coverage: Option<&KillboardCoverage>,
         current_time: u64,
     ) -> Result<(), String> {
         let mut conn = self.open()?;
@@ -328,6 +354,19 @@ impl Store {
                 ])
                 .map_err(|error| error.to_string())?;
             }
+        }
+        if let Some(coverage) = coverage {
+            tx.execute(
+                "INSERT OR REPLACE INTO killboard_coverage (
+                    solar_system_id, covered_since, covered_until
+                 ) VALUES (?1, ?2, ?3)",
+                params![
+                    coverage.solar_system_id as i64,
+                    coverage.since as i64,
+                    coverage.until as i64,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
         }
         Self::prune_killmails(&tx, current_time)?;
         tx.commit().map_err(|error| error.to_string())
@@ -531,6 +570,11 @@ impl Store {
             "DELETE FROM cached_killmails WHERE killmail_time < ?1",
             params![cutoff as i64],
         )
+        .map_err(|error| error.to_string())?;
+        conn.execute(
+            "DELETE FROM killboard_coverage WHERE covered_until < ?1",
+            params![cutoff as i64],
+        )
         .map(|_| ())
         .map_err(|error| error.to_string())
     }
@@ -696,6 +740,11 @@ impl Store {
                  npc INTEGER NOT NULL DEFAULT 0,
                  attacker_ids TEXT NOT NULL DEFAULT '[]',
                  corporation_ids TEXT NOT NULL DEFAULT '[]'
+              );
+              CREATE TABLE IF NOT EXISTS killboard_coverage (
+                 solar_system_id INTEGER PRIMARY KEY,
+                 covered_since INTEGER NOT NULL,
+                 covered_until INTEGER NOT NULL
               );
               CREATE TABLE IF NOT EXISTS system_assessments (
                  system_id TEXT PRIMARY KEY,
@@ -1104,8 +1153,8 @@ fn traffic_kills(row: &Row<'_>, first_column: usize) -> rusqlite::Result<KillCou
 mod tests {
     use super::{KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS};
     use crate::model::{
-        AppData, CachedKillmail, KillCounts, TrafficHour, TrafficReading, TrafficRows,
-        TrafficSample,
+        AppData, CachedKillmail, KillCounts, KillboardCoverage, TrafficHour, TrafficReading,
+        TrafficRows, TrafficSample,
     };
     use rusqlite::Connection as SqliteConnection;
     use std::path::PathBuf;
@@ -1292,9 +1341,15 @@ mod tests {
                     killmail(1, 1, NOW - KILLMAIL_RETENTION_SECS - 1),
                     killmail(2, 1, NOW - 60),
                 ],
+                Some(&KillboardCoverage {
+                    solar_system_id: 1,
+                    since: NOW - KILLMAIL_RETENTION_SECS - 2 * HOUR,
+                    until: NOW - KILLMAIL_RETENTION_SECS - HOUR,
+                }),
                 NOW,
             )
             .unwrap();
+        assert_eq!(store.killboard_coverage(1).unwrap(), None);
         let ids = store
             .cached_killmails(1, 0)
             .unwrap()
@@ -1315,6 +1370,7 @@ mod tests {
                     killmail(2, 30_000_142, NOW - 60),
                     killmail(3, 30_002_187, NOW - 60),
                 ],
+                None,
                 NOW,
             )
             .unwrap();
@@ -1322,7 +1378,7 @@ mod tests {
         updated.total_value = 5.0;
         updated.attacker_ids = vec![7, 8];
         store
-            .store_killmails(std::slice::from_ref(&updated), NOW)
+            .store_killmails(std::slice::from_ref(&updated), None, NOW)
             .unwrap();
 
         let kills = store.cached_killmails(30_000_142, 0).unwrap();
@@ -1341,12 +1397,45 @@ mod tests {
     }
 
     #[test]
+    fn killboard_coverage_is_saved_with_its_killmails() {
+        let db = TestDb::new("coverage");
+        let store = db.store();
+        assert_eq!(store.killboard_coverage(30_000_142).unwrap(), None);
+        let first = KillboardCoverage {
+            solar_system_id: 30_000_142,
+            since: NOW - 6 * HOUR,
+            until: NOW - HOUR,
+        };
+        store
+            .store_killmails(
+                &[killmail(1, 30_000_142, NOW - 2 * HOUR)],
+                Some(&first),
+                NOW,
+            )
+            .unwrap();
+        let extended = KillboardCoverage {
+            until: NOW,
+            ..first
+        };
+        store
+            .store_killmails(&[killmail(2, 30_000_142, NOW - 60)], Some(&extended), NOW)
+            .unwrap();
+
+        assert_eq!(
+            store.killboard_coverage(30_000_142).unwrap(),
+            Some(extended)
+        );
+        assert_eq!(store.killboard_coverage(30_002_187).unwrap(), None);
+        assert_eq!(store.cached_killmails(30_000_142, 0).unwrap().len(), 2);
+    }
+
+    #[test]
     fn saving_app_data_keeps_killmails_and_traffic() {
         let db = TestDb::new("save");
         let store = db.store();
         store.load().unwrap();
         store
-            .store_killmails(&[killmail(1, 1, NOW - 60)], NOW)
+            .store_killmails(&[killmail(1, 1, NOW - 60)], None, NOW)
             .unwrap();
         store
             .record_traffic_hour(&jumps(NOW / HOUR * HOUR, &[(1, 5)]), NOW)

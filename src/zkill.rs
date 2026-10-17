@@ -1,4 +1,4 @@
-use crate::model::CachedKillmail;
+use crate::model::{CachedKillmail, KillboardCoverage};
 use crate::util::{DAY_SECS, HOUR_SECS, hour_start};
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -8,7 +8,16 @@ use std::time::Duration;
 
 const USER_AGENT: &str = "Nomadeer/0.1 private wormhole mapper";
 const ZKILL_PAGE_SIZE: usize = 200;
+/// Requests per refresh, so a busy system cannot keep the worker paging for long.
 const MAX_ZKILL_PAGES: usize = 10;
+const ZKILL_PAGE_DELAY: Duration = Duration::from_millis(150);
+/// zKillboard is asked for the last week of kills.
+const KILL_WINDOW_SECS: u64 = 7 * DAY_SECS;
+/// Kills can reach zKillboard a while after they happen, so a refresh reads back this
+/// far into the history it already holds before stopping.
+const ZKILL_REFRESH_OVERLAP_SECS: u64 = HOUR_SECS;
+/// A backfill resumes this many kills early, in case zKillboard's list has shifted.
+const ZKILL_RESUME_MARGIN: usize = 20;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ZkillReport {
@@ -16,6 +25,10 @@ pub(crate) struct ZkillReport {
     pub(crate) recent_kills: Vec<ZkillKill>,
     pub(crate) history: ZkillHistory,
     pub(crate) cached_killmails: Vec<CachedKillmail>,
+    /// How far back `cached_killmails` is complete after this refresh.
+    pub(crate) coverage: KillboardCoverage,
+    /// Set when zKillboard stopped answering partway through the refresh.
+    pub(crate) interrupted: Option<String>,
     pub(crate) total_value: f64,
     pub(crate) solo_kills: usize,
     pub(crate) npc_kills: usize,
@@ -39,6 +52,9 @@ pub(crate) struct ZkillHistory {
     pub(crate) unique_attackers_24h: usize,
     pub(crate) busiest_attacker_24h: usize,
     pub(crate) busiest_corporation_24h: usize,
+    /// Set when the history is only complete from this time on, because zKillboard
+    /// has not been read back through the whole week yet. Counts are then minimums.
+    pub(crate) partial_since: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,37 +177,47 @@ struct ApiName {
     name: String,
 }
 
+/// Refreshes a system's killboard. `cached_killmails` and `coverage` are what the cache
+/// already holds for the system; the report carries the merged cache and its new coverage.
 pub(crate) fn fetch_system_report(
     solar_system_id: u64,
     cached_killmails: Vec<CachedKillmail>,
+    coverage: Option<KillboardCoverage>,
+    current_time: u64,
 ) -> Result<ZkillReport, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| format!("Could not start zKill request: {error}"))?;
-    let oldest_cached = cached_killmails.iter().map(|kill| kill.killmail_time).min();
-    let mut kills = Vec::new();
-    for page in 1..=MAX_ZKILL_PAGES {
-        let page_kills = fetch_kill_page(&client, solar_system_id, page)?;
-        let page_len = page_kills.len();
-        let page_oldest = page_kills
-            .iter()
-            .filter_map(|kill| parse_killmail_time(&kill.killmail_time))
-            .min();
-        kills.extend(page_kills);
+    let mut requests = 0;
+    let paged = page_kills(
+        |page| {
+            if requests > 0 {
+                std::thread::sleep(ZKILL_PAGE_DELAY);
+            }
+            requests += 1;
+            fetch_kill_page(&client, solar_system_id, page)
+        },
+        &cached_killmails,
+        coverage,
+        current_time,
+    )?;
 
-        let reached_cache = oldest_cached
-            .zip(page_oldest)
-            .is_some_and(|(cached, fetched)| fetched <= cached);
-        if page_len < ZKILL_PAGE_SIZE || reached_cache {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(150));
-    }
-
-    let cached_killmails = merge_cached_killmails(solar_system_id, cached_killmails, &kills);
-    let history = summarize_history(&cached_killmails, crate::util::now());
-    let kills = kills.into_iter().take(10).collect::<Vec<_>>();
+    let cached_killmails = merge_cached_killmails(
+        solar_system_id,
+        cached_killmails,
+        &paged.kills,
+        current_time,
+    );
+    let mut history = summarize_history(&cached_killmails, current_time);
+    history.partial_since = partial_since(paged.complete_since, current_time);
+    let coverage = KillboardCoverage {
+        solar_system_id,
+        since: paged.complete_since,
+        until: current_time,
+    };
+    let interrupted = paged.interrupted;
+    let kills = paged.kills.into_iter().take(10).collect::<Vec<_>>();
     let names = fetch_eve_names(&client, zkill_name_ids(&kills)).unwrap_or_default();
 
     let recent_kills = kills
@@ -265,10 +291,122 @@ pub(crate) fn fetch_system_report(
         recent_kills,
         history,
         cached_killmails,
+        coverage,
+        interrupted,
         total_value,
         solo_kills,
         npc_kills,
     })
+}
+
+struct PagedKills {
+    /// Newest first, as zKillboard lists them. Pages skipped as already cached are absent.
+    kills: Vec<ApiKillmail>,
+    /// Start of the span, up to now, that the cache and `kills` together hold completely.
+    complete_since: u64,
+    /// The error that stopped paging after the first page, if one did.
+    interrupted: Option<String>,
+}
+
+/// Pages back through the week's kills, newest first, until the list ends or a page
+/// reaches kills the cache already holds. When the cache's history stops short of the
+/// week, paging skips the pages it holds and carries on from where it ends. A failure
+/// after the first page keeps what was fetched.
+fn page_kills(
+    mut fetch_page: impl FnMut(usize) -> Result<Vec<ApiKillmail>, String>,
+    cached_killmails: &[CachedKillmail],
+    coverage: Option<KillboardCoverage>,
+    current_time: u64,
+) -> Result<PagedKills, String> {
+    let window_start = current_time.saturating_sub(KILL_WINDOW_SECS);
+    // Coverage that ended before this week's window says nothing about it.
+    let coverage = coverage.filter(|coverage| coverage.until >= window_start);
+    let mut kills = Vec::new();
+    let mut complete_since = current_time;
+    let mut interrupted = None;
+    let mut joined_cache = false;
+    let mut skipped_pages = false;
+    let mut page = 1;
+    for request in 0..MAX_ZKILL_PAGES {
+        let page_kills = match fetch_page(page) {
+            Ok(page_kills) => page_kills,
+            Err(error) if request == 0 => return Err(error),
+            Err(error) => {
+                interrupted = Some(error);
+                break;
+            }
+        };
+        let is_last_page = page_kills.len() < ZKILL_PAGE_SIZE;
+        let times = page_kills
+            .iter()
+            .filter_map(|kill| parse_killmail_time(&kill.killmail_time))
+            .collect::<Vec<_>>();
+        kills.extend(page_kills);
+        if std::mem::take(&mut skipped_pages)
+            && times
+                .iter()
+                .max()
+                .is_none_or(|newest| *newest < complete_since)
+        {
+            // The skip went past the end of the cached history, leaving a gap.
+            break;
+        }
+        if is_last_page {
+            complete_since = window_start;
+            break;
+        }
+        let Some(oldest) = times.iter().min().copied() else {
+            break;
+        };
+        complete_since = complete_since.min(oldest + 1);
+
+        let reached_cache = !joined_cache
+            && coverage.is_some_and(|coverage| {
+                oldest <= coverage.until.saturating_sub(ZKILL_REFRESH_OVERLAP_SECS)
+            });
+        if let Some(coverage) = coverage.filter(|_| reached_cache) {
+            joined_cache = true;
+            complete_since = complete_since.min(coverage.since);
+            if complete_since <= window_start {
+                break;
+            }
+            let known = known_kill_count(cached_killmails, &kills, complete_since);
+            let resume_page = known.saturating_sub(ZKILL_RESUME_MARGIN) / ZKILL_PAGE_SIZE + 1;
+            skipped_pages = resume_page > page + 1;
+            page = resume_page.max(page + 1);
+        } else {
+            page += 1;
+        }
+    }
+
+    Ok(PagedKills {
+        kills,
+        complete_since,
+        interrupted,
+    })
+}
+
+/// Distinct kills at or after `since` across the cache and the fetched pages.
+fn known_kill_count(cached: &[CachedKillmail], fetched: &[ApiKillmail], since: u64) -> usize {
+    cached
+        .iter()
+        .filter(|kill| kill.killmail_time >= since)
+        .map(|kill| kill.killmail_id)
+        .chain(
+            fetched
+                .iter()
+                .filter(|kill| {
+                    parse_killmail_time(&kill.killmail_time).is_some_and(|time| time >= since)
+                })
+                .map(|kill| kill.killmail_id),
+        )
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// When the complete history starts inside the week, the time it starts from.
+fn partial_since(complete_since: u64, current_time: u64) -> Option<u64> {
+    (complete_since > current_time.saturating_sub(KILL_WINDOW_SECS)).then_some(complete_since)
 }
 
 fn fetch_kill_page(
@@ -282,7 +420,7 @@ fn fetch_kill_page(
         format!("page/{page}/")
     };
     let url = format!(
-        "https://zkillboard.com/api/kills/solarSystemID/{solar_system_id}/pastSeconds/604800/{page_suffix}"
+        "https://zkillboard.com/api/kills/solarSystemID/{solar_system_id}/pastSeconds/{KILL_WINDOW_SECS}/{page_suffix}"
     );
     let response = client
         .get(url)
@@ -310,8 +448,9 @@ fn merge_cached_killmails(
     solar_system_id: u64,
     cached_killmails: Vec<CachedKillmail>,
     fetched_kills: &[ApiKillmail],
+    current_time: u64,
 ) -> Vec<CachedKillmail> {
-    let cutoff = crate::util::now().saturating_sub(7 * 24 * 60 * 60);
+    let cutoff = current_time.saturating_sub(KILL_WINDOW_SECS);
     let mut merged = cached_killmails
         .into_iter()
         .filter(|kill| kill.solar_system_id == solar_system_id && kill.killmail_time >= cutoff)
@@ -558,9 +697,13 @@ fn parse_killmail_time(value: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::summarize_history;
-    use crate::model::CachedKillmail;
+    use super::{
+        ApiKillmail, KILL_WINDOW_SECS, MAX_ZKILL_PAGES, ZKILL_PAGE_SIZE, page_kills,
+        parse_killmail_time, partial_since, summarize_history,
+    };
+    use crate::model::{CachedKillmail, KillboardCoverage};
     use crate::util::{DAY_SECS, HOUR_SECS};
+    use std::cell::RefCell;
 
     /// Thirty minutes into an hour.
     const NOW: u64 = 20_000 * HOUR_SECS + 1_800;
@@ -611,5 +754,183 @@ mod tests {
         );
         assert_eq!(history.kills_1h, 1);
         assert_eq!(history.kills_current_hour_7d, 2);
+    }
+
+    /// Formats Unix seconds the way zKillboard writes killmail times.
+    fn zkill_time(timestamp: u64) -> String {
+        // Civil date from days since the Unix epoch (Hinnant's algorithm).
+        let days = (timestamp / DAY_SECS) as i64 + 719_468;
+        let era = days / 146_097;
+        let day_of_era = days - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_prime = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+        let month = if month_prime < 10 {
+            month_prime + 3
+        } else {
+            month_prime - 9
+        };
+        let year = year_of_era + era * 400 + i64::from(month <= 2);
+        let seconds = timestamp % DAY_SECS;
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            seconds / HOUR_SECS,
+            seconds % HOUR_SECS / 60,
+            seconds % 60
+        )
+    }
+
+    /// A week of kills as zKillboard lists them, newest first, one every `spacing`
+    /// seconds. Ids count down so newer kills have higher ids.
+    struct FakeKillboard {
+        kills: Vec<(u64, u64)>,
+        failing_page: Option<usize>,
+        requested: RefCell<Vec<usize>>,
+    }
+
+    impl FakeKillboard {
+        fn new(count: usize, spacing: u64) -> Self {
+            Self {
+                kills: (0..count as u64)
+                    .map(|index| (1_000_000 - index, NOW - 60 - index * spacing))
+                    .collect(),
+                failing_page: None,
+                requested: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn page(&self, page: usize) -> Result<Vec<ApiKillmail>, String> {
+            self.requested.borrow_mut().push(page);
+            if self.failing_page == Some(page) {
+                return Err("zKillboard returned 429 Too Many Requests".to_owned());
+            }
+            Ok(self
+                .kills
+                .iter()
+                .skip((page - 1) * ZKILL_PAGE_SIZE)
+                .take(ZKILL_PAGE_SIZE)
+                .map(|(killmail_id, time)| ApiKillmail {
+                    killmail_id: *killmail_id,
+                    killmail_time: zkill_time(*time),
+                    victim: None,
+                    attackers: Vec::new(),
+                    zkb: None,
+                })
+                .collect())
+        }
+
+        /// The cache a previous refresh left: the first `count` kills listed now,
+        /// skipping the newest `skip`.
+        fn cached(&self, skip: usize, count: usize) -> Vec<CachedKillmail> {
+            self.kills
+                .iter()
+                .skip(skip)
+                .take(count)
+                .map(|(killmail_id, time)| killmail(*killmail_id, *time, false))
+                .collect()
+        }
+
+        fn time_of(&self, index: usize) -> u64 {
+            self.kills[index].1
+        }
+
+        fn requested(&self) -> Vec<usize> {
+            self.requested.borrow().clone()
+        }
+    }
+
+    #[test]
+    fn killmail_times_round_trip() {
+        assert_eq!(zkill_time(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(parse_killmail_time(&zkill_time(NOW)), Some(NOW));
+    }
+
+    #[test]
+    fn first_refresh_reads_the_whole_week() {
+        let board = FakeKillboard::new(450, 600);
+        let paged = page_kills(|page| board.page(page), &[], None, NOW).unwrap();
+        assert_eq!(board.requested(), vec![1, 2, 3]);
+        assert_eq!(paged.kills.len(), 450);
+        assert_eq!(paged.complete_since, NOW - KILL_WINDOW_SECS);
+        assert_eq!(partial_since(paged.complete_since, NOW), None);
+        assert!(paged.interrupted.is_none());
+    }
+
+    #[test]
+    fn refresh_stops_once_it_reaches_the_cached_week() {
+        // 30 new kills since a refresh that read the whole week.
+        let board = FakeKillboard::new(900, 600);
+        let cached = board.cached(30, 870);
+        let coverage = KillboardCoverage {
+            solar_system_id: 31_002_238,
+            since: NOW - KILL_WINDOW_SECS,
+            until: board.time_of(30) + 60,
+        };
+        let paged = page_kills(|page| board.page(page), &cached, Some(coverage), NOW).unwrap();
+        assert_eq!(board.requested(), vec![1]);
+        assert_eq!(paged.complete_since, coverage.since);
+    }
+
+    #[test]
+    fn a_later_page_failure_keeps_the_pages_already_read() {
+        let mut board = FakeKillboard::new(900, 600);
+        board.failing_page = Some(3);
+        let paged = page_kills(|page| board.page(page), &[], None, NOW).unwrap();
+        assert_eq!(board.requested(), vec![1, 2, 3]);
+        assert_eq!(paged.kills.len(), 2 * ZKILL_PAGE_SIZE);
+        assert_eq!(paged.complete_since, board.time_of(399) + 1);
+        assert_eq!(
+            partial_since(paged.complete_since, NOW),
+            Some(paged.complete_since)
+        );
+        assert!(paged.interrupted.unwrap().contains("429"));
+
+        board.failing_page = Some(1);
+        assert!(page_kills(|page| board.page(page), &[], None, NOW).is_err());
+    }
+
+    #[test]
+    fn page_limit_leaves_the_week_partly_read() {
+        let board = FakeKillboard::new(2_500, 200);
+        let paged = page_kills(|page| board.page(page), &[], None, NOW).unwrap();
+        assert_eq!(board.requested().len(), MAX_ZKILL_PAGES);
+        assert_eq!(paged.kills.len(), MAX_ZKILL_PAGES * ZKILL_PAGE_SIZE);
+        let last_read = MAX_ZKILL_PAGES * ZKILL_PAGE_SIZE - 1;
+        assert_eq!(paged.complete_since, board.time_of(last_read) + 1);
+        assert!(partial_since(paged.complete_since, NOW).is_some());
+        assert!(paged.interrupted.is_none());
+    }
+
+    #[test]
+    fn partly_read_week_is_filled_in_from_where_the_cache_ends() {
+        // A refresh hit the page limit 50 kills ago, holding the 2000 kills it read.
+        let board = FakeKillboard::new(2_550, 200);
+        let cached = board.cached(50, 2_000);
+        let coverage = KillboardCoverage {
+            solar_system_id: 30_000_142,
+            since: board.time_of(2_049),
+            until: board.time_of(50) + 60,
+        };
+        let paged = page_kills(|page| board.page(page), &cached, Some(coverage), NOW).unwrap();
+        assert_eq!(board.requested(), vec![1, 11, 12, 13]);
+        assert_eq!(paged.complete_since, NOW - KILL_WINDOW_SECS);
+    }
+
+    #[test]
+    fn a_skip_past_the_cached_history_does_not_claim_the_gap() {
+        // The cache holds 300 kills zKillboard no longer lists, so the skip lands too far.
+        let board = FakeKillboard::new(2_550, 200);
+        let mut cached = board.cached(50, 2_000);
+        cached.extend((0..300).map(|index| killmail(index + 1, board.time_of(1_000), false)));
+        let coverage = KillboardCoverage {
+            solar_system_id: 30_000_142,
+            since: board.time_of(2_049),
+            until: board.time_of(50) + 60,
+        };
+        let paged = page_kills(|page| board.page(page), &cached, Some(coverage), NOW).unwrap();
+        assert_eq!(board.requested(), vec![1, 12]);
+        assert_eq!(paged.complete_since, coverage.since);
     }
 }
