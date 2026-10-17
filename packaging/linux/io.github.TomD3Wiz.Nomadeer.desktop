@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Nomadeer
+GenericName=Wormhole Companion
+Comment=Map wormhole chains, track your characters and read the local killboard for EVE Online
+Exec=nomadeer
+Icon=io.github.TomD3Wiz.Nomadeer
+Terminal=false
+Categories=Game;Utility;
+Keywords=EVE;EVE Online;wormhole;chain;mapper;killboard;intel;
+StartupNotify=true
+StartupWMClass=io.github.TomD3Wiz.Nomadeer
