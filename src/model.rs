@@ -19,10 +19,6 @@ pub(crate) struct AppData {
     #[serde(default)]
     pub(crate) notes: Vec<Note>,
     #[serde(default)]
-    pub(crate) activity_snapshots: Vec<SystemActivitySnapshot>,
-    #[serde(default)]
-    pub(crate) cached_killmails: Vec<CachedKillmail>,
-    #[serde(default)]
     pub(crate) system_assessments: Vec<SystemAssessment>,
 }
 
@@ -59,7 +55,7 @@ pub(crate) struct Account {
     pub(crate) updated_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SystemNode {
     pub(crate) id: String,
     #[serde(default)]
@@ -145,17 +141,68 @@ pub(crate) struct Note {
     pub(crate) created_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct SystemActivitySnapshot {
-    pub(crate) system_id: String,
-    pub(crate) captured_at: u64,
-    pub(crate) jumps_1h: u32,
-    pub(crate) ship_kills_1h: u32,
-    pub(crate) pod_kills_1h: u32,
-    pub(crate) npc_kills_1h: u32,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KillCounts {
+    pub(crate) ship_kills: u32,
+    pub(crate) pod_kills: u32,
+    pub(crate) npc_kills: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The two universe-wide ESI activity feeds. Each publishes its own hourly data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrafficFeed {
+    Jumps,
+    Kills,
+}
+
+impl TrafficFeed {
+    pub(crate) const ALL: [Self; 2] = [Self::Jumps, Self::Kills];
+}
+
+/// One ESI data hour of a universe-wide feed. Systems missing from `rows` had no activity.
+#[derive(Debug, Clone)]
+pub(crate) struct TrafficHour {
+    /// Start of the UTC hour ESI published the data in.
+    pub(crate) hour: u64,
+    /// ESI's Last-Modified time for the data.
+    pub(crate) data_time: u64,
+    pub(crate) rows: TrafficRows,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum TrafficRows {
+    Jumps(Vec<(u64, u32)>),
+    Kills(Vec<(u64, KillCounts)>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrafficReading<T> {
+    pub(crate) hour: u64,
+    pub(crate) data_time: u64,
+    pub(crate) value: T,
+}
+
+/// A system's activity for one captured ESI hour. A feed that was not captured that
+/// hour is `None`; a captured feed that did not list the system is zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrafficSample {
+    pub(crate) hour: u64,
+    pub(crate) jumps: Option<u32>,
+    pub(crate) kills: Option<KillCounts>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SystemTrafficHistory {
+    // The latest readings feed the scoring pass, which still reads the map node for now.
+    #[allow(dead_code)]
+    pub(crate) latest_jumps: Option<TrafficReading<u32>>,
+    #[allow(dead_code)]
+    pub(crate) latest_kills: Option<TrafficReading<KillCounts>>,
+    /// Captured hours in ascending order.
+    pub(crate) samples: Vec<TrafficSample>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CachedKillmail {
     pub(crate) killmail_id: u64,
     pub(crate) solar_system_id: u64,

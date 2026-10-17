@@ -1,4 +1,4 @@
-use crate::model::{SystemActivitySnapshot, SystemAssessment, SystemNode};
+use crate::model::{SystemAssessment, SystemNode, TrafficSample};
 use crate::util::now;
 use crate::zkill::ZkillReport;
 use candle_core::quantized::gguf_file;
@@ -106,7 +106,7 @@ pub(crate) fn remove_model() -> Result<(), String> {
 pub(crate) fn assess_system(
     system: &SystemNode,
     report: &ZkillReport,
-    snapshots: &[SystemActivitySnapshot],
+    traffic: &[TrafficSample],
 ) -> SystemAssessment {
     let history = &report.history;
     let is_wormhole = system.name.starts_with('J');
@@ -146,27 +146,32 @@ pub(crate) fn assess_system(
         (jump_activity + combat_activity + npc_activity).min(100.0)
     };
 
-    let system_snapshots = snapshots
-        .iter()
-        .filter(|snapshot| snapshot.system_id == system.id)
-        .collect::<Vec<_>>();
+    // Wormhole space has no jump feed, so its captured hours say nothing about traffic.
+    let jump_samples = if is_wormhole {
+        Vec::new()
+    } else {
+        traffic
+            .iter()
+            .filter_map(|sample| sample.jumps.map(|jumps| (sample.hour, jumps)))
+            .collect::<Vec<_>>()
+    };
     let assessment_time = now();
     let current_hour_start = assessment_time / 3_600 * 3_600;
     let current_utc_hour = current_hour_start / 3_600 % 24;
-    let historical_snapshots = system_snapshots
+    let historical_samples = jump_samples
         .iter()
         .copied()
-        .filter(|snapshot| snapshot.captured_at < current_hour_start)
+        .filter(|(hour, _)| *hour < current_hour_start)
         .collect::<Vec<_>>();
-    let same_hour_snapshots = historical_snapshots
+    let same_hour_samples = historical_samples
         .iter()
         .copied()
-        .filter(|snapshot| snapshot.captured_at / 3_600 % 24 == current_utc_hour)
+        .filter(|(hour, _)| hour / 3_600 % 24 == current_utc_hour)
         .collect::<Vec<_>>();
-    let baseline_source = if same_hour_snapshots.len() >= 2 {
-        &same_hour_snapshots
+    let baseline_source = if same_hour_samples.len() >= 2 {
+        &same_hour_samples
     } else {
-        &historical_snapshots
+        &historical_samples
     };
     let baseline_jumps = if baseline_source.is_empty() {
         None
@@ -174,7 +179,7 @@ pub(crate) fn assess_system(
         Some(
             baseline_source
                 .iter()
-                .map(|snapshot| snapshot.jumps_1h as f32)
+                .map(|(_, jumps)| *jumps as f32)
                 .sum::<f32>()
                 / baseline_source.len() as f32,
         )
@@ -191,9 +196,9 @@ pub(crate) fn assess_system(
 
     let threat_score = threat.clamp(0.0, 100.0).round() as u8;
     let activity_score = activity.clamp(0.0, 100.0).round() as u8;
-    let confidence = if system_snapshots.len() >= 24 {
+    let confidence = if jump_samples.len() >= 24 {
         "High"
-    } else if system_snapshots.len() >= 4 || history.kills_7d > 0 {
+    } else if jump_samples.len() >= 4 || history.kills_7d > 0 {
         "Medium"
     } else {
         "Low"
@@ -253,10 +258,10 @@ pub(crate) fn assess_system(
                 difference.abs(),
                 if difference >= 0.0 { "above" } else { "below" }
             ));
-            if same_hour_snapshots.len() >= 2 {
+            if same_hour_samples.len() >= 2 {
                 evidence.push(format!(
                     "Usual traffic is based on {} earlier samples at this time of day",
-                    same_hour_snapshots.len()
+                    same_hour_samples.len()
                 ));
             }
         }
