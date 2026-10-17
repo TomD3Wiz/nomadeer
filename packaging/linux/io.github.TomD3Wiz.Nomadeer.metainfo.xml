@@ -33,6 +33,12 @@
   <launchable type="desktop-id">io.github.TomD3Wiz.Nomadeer.desktop</launchable>
   <icon type="stock">io.github.TomD3Wiz.Nomadeer</icon>
 
+  <screenshots>
+    <screenshot type="default">
+      <caption>The chain map with wormhole and faction artwork, system intel and Umbra's briefings</caption>
+      <image>https://raw.githubusercontent.com/TomD3Wiz/nomadeer/main/docs/screenshots/nomadeer-chain-and-umbra.png</image>
+    </screenshot>
+  </screenshots>
   <url type="homepage">https://github.com/TomD3Wiz/nomadeer</url>
   <url type="bugtracker">https://github.com/TomD3Wiz/nomadeer/issues</url>
   <url type="vcs-browser">https://github.com/TomD3Wiz/nomadeer</url>
