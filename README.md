@@ -7,6 +7,7 @@ Nomadeer is a Rust application built with `egui`/`eframe`. Everything it stores 
 ## Features
 
 - Interactive chain map built from your characters' movement: zoom and pan around it, drag systems where you want them, and drag from one system to another to link them.
+- Systems you can read at a glance: wormholes swirl in their class colour (C1 cool blue through C6 red, with their own looks for Thera, shattered and Drifter systems), known space shows its security band, and a badge marks the NPC faction that holds it. Connections show their mass and end of life, and the map's **Legend** explains every look.
 - Character tracking through EVE single sign-on (loopback OAuth with PKCE, no client secret).
 - Save and restore historical chain snapshots.
 - Selected-system killboard history with detailed in-app kill reports.

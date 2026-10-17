@@ -2,9 +2,6 @@
 //! k-space systems. The tables are generated from CCP's Static Data Export by
 //! tools/data/gen_factions.py; rerun it after a map change rather than editing them.
 
-// Not drawn on the chain map yet.
-#![allow(dead_code)]
-
 /// Known-space solar system IDs. Wormhole, abyssal and other instanced space
 /// lies outside this range and belongs to no faction.
 const KSPACE_SYSTEMS: std::ops::RangeInclusive<u64> = 30_000_000..=30_999_999;
@@ -101,6 +98,8 @@ impl Faction {
 }
 
 /// The colour grouping for a system's owner; unclaimed space counts as `Other`.
+// The chain map gives unclaimed space no badge, so nothing asks yet.
+#[allow(dead_code)]
 pub(crate) fn empire_group(faction: Option<Faction>) -> EmpireGroup {
     faction.map_or(EmpireGroup::Other, Faction::empire_group)
 }
