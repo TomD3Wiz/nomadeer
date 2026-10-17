@@ -15,6 +15,11 @@ pub(crate) mod theme {
         Color32::from_rgb(126, 231, 135)
     }
 
+    /// A character who is logged in.
+    pub(crate) fn online() -> Color32 {
+        Color32::from_rgb(110, 224, 160)
+    }
+
     pub(crate) fn muted_text() -> Color32 {
         Color32::from_rgb(150, 180, 188)
     }

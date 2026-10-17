@@ -1,6 +1,5 @@
-//! Intel Nomadeer gathers on its own as characters move: killboard refreshes queued
-//! when a character arrives somewhere, and Umbra's briefing once the fresh
-//! assessment is in.
+//! Intel Nomadeer gathers on its own as recon pilots move: killboard refreshes queued
+//! when one arrives somewhere, and Umbra's briefing once the fresh assessment is in.
 
 use crate::local_intel;
 use crate::model::SystemAssessment;
@@ -26,18 +25,48 @@ pub(crate) fn assessment_is_stale(generated_at: u64, current_time: u64) -> bool 
     current_time.saturating_sub(generated_at) > ASSESSMENT_STALE_SECS
 }
 
-/// Whether a location update brings a character into a system: a jump (including one
-/// made while Nomadeer was closed) or a system that was not on the map before. A
-/// character found this session where they were last seen has not arrived anywhere,
-/// unless that is the system on screen, as the player opens Nomadeer to see it.
-pub(crate) fn is_arrival(
-    previous_system_id: &str,
-    system_id: &str,
-    first_fix_this_session: bool,
-    node_created: bool,
-    on_screen: bool,
-) -> bool {
-    node_created || previous_system_id != system_id || (first_fix_this_session && on_screen)
+/// Whether a character is logged in, as far as Nomadeer can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Presence {
+    Online,
+    Offline,
+    /// Their sign-in cannot read it, or ESI has not said.
+    Unknown,
+}
+
+/// A character's location as just reported by ESI.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocationFix<'a> {
+    pub(crate) previous_system_id: &'a str,
+    pub(crate) system_id: &'a str,
+    /// The character's first location since Nomadeer started.
+    pub(crate) first_fix_this_session: bool,
+    /// The system was not on the map before.
+    pub(crate) node_created: bool,
+    /// The system is the one selected on screen.
+    pub(crate) on_screen: bool,
+}
+
+/// Whether a location update brings a recon pilot into a system. Other characters
+/// never arrive anywhere as far as intel goes, and an offline pilot cannot move.
+///
+/// A jump (including one made while Nomadeer was closed) or a system new to the map is
+/// an arrival. So is an online pilot's system when Nomadeer starts, as that is where
+/// they are flying now. Without online status, a pilot found where they were last seen
+/// only counts for the system on screen, as the player opens Nomadeer to see it.
+pub(crate) fn is_arrival(recon: bool, presence: Presence, fix: &LocationFix<'_>) -> bool {
+    let moved = fix.node_created || fix.previous_system_id != fix.system_id;
+    recon
+        && match presence {
+            Presence::Offline => false,
+            Presence::Online => moved || fix.first_fix_this_session,
+            Presence::Unknown => moved || (fix.first_fix_this_session && fix.on_screen),
+        }
+}
+
+/// Whether a recon pilot logging in arrives in the system they logged off in.
+pub(crate) fn is_login_arrival(recon: bool, was_online: Option<bool>, online: bool) -> bool {
+    recon && online && was_online == Some(false)
 }
 
 /// Whether an arrival should gather intel: the system has never been assessed, or
@@ -271,8 +300,8 @@ impl AutoBriefings {
 #[cfg(test)]
 mod tests {
     use super::{
-        ASSESSMENT_STALE_SECS, AutoBriefings, IntelQueue, IntelRequest, is_arrival,
-        wants_intel_on_arrival,
+        ASSESSMENT_STALE_SECS, AutoBriefings, IntelQueue, IntelRequest, LocationFix, Presence,
+        is_arrival, is_login_arrival, wants_intel_on_arrival,
     };
     use crate::model::SystemAssessment;
     use std::collections::HashMap;
@@ -295,18 +324,85 @@ mod tests {
         order
     }
 
+    fn fix<'a>(
+        previous_system_id: &'a str,
+        system_id: &'a str,
+        first_fix_this_session: bool,
+        node_created: bool,
+        on_screen: bool,
+    ) -> LocationFix<'a> {
+        LocationFix {
+            previous_system_id,
+            system_id,
+            first_fix_this_session,
+            node_created,
+            on_screen,
+        }
+    }
+
     #[test]
-    fn arrivals_are_jumps_and_new_systems() {
-        assert!(is_arrival("", "sys_a", false, false, false));
-        assert!(is_arrival("sys_a", "sys_b", false, false, false));
+    fn arrivals_without_online_status_are_jumps_and_new_systems() {
+        let arrives = |fix: LocationFix<'_>| is_arrival(true, Presence::Unknown, &fix);
+        assert!(arrives(fix("", "sys_a", false, false, false)));
+        assert!(arrives(fix("sys_a", "sys_b", false, false, false)));
         // A jump made while Nomadeer was closed counts on the first fix.
-        assert!(is_arrival("sys_a", "sys_b", true, false, false));
-        assert!(is_arrival("sys_a", "sys_a", false, true, false));
+        assert!(arrives(fix("sys_a", "sys_b", true, false, false)));
+        assert!(arrives(fix("sys_a", "sys_a", false, true, false)));
         // On launch, only the system on screen counts for a character still there.
-        assert!(is_arrival("sys_a", "sys_a", true, false, true));
-        assert!(!is_arrival("sys_a", "sys_a", true, false, false));
+        assert!(arrives(fix("sys_a", "sys_a", true, false, true)));
+        assert!(!arrives(fix("sys_a", "sys_a", true, false, false)));
         // Sitting in the same system between location polls is not an arrival.
-        assert!(!is_arrival("sys_a", "sys_a", false, false, true));
+        assert!(!arrives(fix("sys_a", "sys_a", false, false, true)));
+    }
+
+    #[test]
+    fn only_recon_pilots_arrive() {
+        let jump = fix("sys_a", "sys_b", false, false, true);
+        for presence in [Presence::Online, Presence::Offline, Presence::Unknown] {
+            assert!(!is_arrival(false, presence, &jump));
+        }
+        assert!(!is_arrival(
+            false,
+            Presence::Online,
+            &fix("", "sys_a", true, true, true)
+        ));
+        assert!(is_arrival(true, Presence::Online, &jump));
+    }
+
+    #[test]
+    fn online_pilots_arrive_where_they_are_at_launch_and_offline_ones_never() {
+        let launch = fix("sys_a", "sys_a", true, false, false);
+        assert!(is_arrival(true, Presence::Online, &launch));
+        assert!(!is_arrival(true, Presence::Unknown, &launch));
+        // Between polls, sitting still is not an arrival even when online.
+        assert!(!is_arrival(
+            true,
+            Presence::Online,
+            &fix("sys_a", "sys_a", false, false, true)
+        ));
+        assert!(is_arrival(
+            true,
+            Presence::Online,
+            &fix("sys_a", "sys_b", false, false, false)
+        ));
+        // An offline pilot found somewhere new moved while logged off; nobody is there.
+        for offline in [
+            launch,
+            fix("sys_a", "sys_b", true, false, true),
+            fix("", "sys_a", true, true, true),
+        ] {
+            assert!(!is_arrival(true, Presence::Offline, &offline));
+        }
+    }
+
+    #[test]
+    fn recon_pilots_logging_in_arrive() {
+        assert!(is_login_arrival(true, Some(false), true));
+        assert!(!is_login_arrival(false, Some(false), true));
+        // The first answer of the session is judged by the launch rule instead.
+        assert!(!is_login_arrival(true, None, true));
+        assert!(!is_login_arrival(true, Some(true), true));
+        assert!(!is_login_arrival(true, Some(true), false));
     }
 
     #[test]
