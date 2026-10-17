@@ -5,6 +5,8 @@ use super::chain_art::{self, ConnectionStyle, Detail, Legend, NodeLook};
 use super::chain_view::{self, CONNECTION_PICK_DISTANCE, Camera, HANDLE_RADIUS, NODE_RADIUS};
 use super::{ChainMapTarget, NomadeerApp, umbra};
 use crate::config::theme;
+use crate::util::now;
+use crate::wormhole;
 use eframe::egui::{
     self, Align, Align2, Color32, CursorIcon, FontId, Layout, PointerButton, Pos2, Rect, Sense,
     Stroke, Vec2, pos2, vec2,
@@ -310,6 +312,7 @@ impl NomadeerApp {
 
         let name_alpha = chain_view::name_opacity(zoom);
         let detail_alpha = chain_view::detail_opacity(zoom);
+        let current_time = now();
         for connection in &self.data.connections {
             if let (Some(a), Some(b)) = (
                 positions.get(&connection.from_system),
@@ -323,14 +326,15 @@ impl NomadeerApp {
                 } else {
                     [screen(a), screen(b)]
                 };
+                // Wormhole codes stay readable as long as system names do.
                 chain_art::paint_connection(
                     painter,
                     endpoints,
-                    &ConnectionStyle::of(connection),
+                    &ConnectionStyle::of(connection, current_time),
                     line_scale,
                     zoom,
                     hovered_connection_id.as_deref() == Some(&connection.id),
-                    detail_alpha,
+                    name_alpha,
                 );
             }
         }
@@ -533,10 +537,20 @@ impl NomadeerApp {
                 .iter()
                 .find(|connection| connection.id == *connection_id)
                 .map(|connection| {
+                    let mut facts = Vec::new();
+                    if let Some(wormhole) = wormhole::label_type(connection) {
+                        facts.push(wormhole::type_summary(wormhole));
+                    }
+                    let state = wormhole::state_text(connection, current_time);
+                    if !state.is_empty() {
+                        facts.push(state);
+                    }
+                    facts.push("right-click for actions".to_owned());
                     format!(
-                        "{} ↔ {} · right-click for actions",
+                        "{} ↔ {}\n{}",
                         self.system_name(&connection.from_system),
-                        self.system_name(&connection.to_system)
+                        self.system_name(&connection.to_system),
+                        facts.join("\n")
                     )
                 }),
             (None, None, None) => None,
@@ -652,7 +666,7 @@ impl NomadeerApp {
             .unwrap_or(ChainMapTarget::Map);
         let mut select_system_id = None;
         let mut delete_system_id = None;
-        let mut delete_connection_id = None;
+        let mut connection_action = None;
         let mut clear_chain = false;
         response.context_menu(|ui| match &menu_target {
             ChainMapTarget::System(system_id) => {
@@ -668,26 +682,20 @@ impl NomadeerApp {
                 }
             }
             ChainMapTarget::Connection(connection_id) => {
-                if let Some(connection) = self
+                match self
                     .data
                     .connections
                     .iter()
                     .find(|connection| connection.id == *connection_id)
                 {
-                    ui.label(format!(
-                        "{} ↔ {}",
-                        self.system_name(&connection.from_system),
-                        self.system_name(&connection.to_system)
-                    ));
-                    if !connection.notes.is_empty() {
-                        ui.label(egui::RichText::new(&connection.notes).color(theme::muted_text()));
+                    Some(connection) => {
+                        if let Some(action) = self.connection_menu(ui, connection) {
+                            connection_action = Some((connection_id.clone(), action));
+                        }
                     }
-                } else {
-                    ui.label("Connection");
-                }
-                if ui.button("Delete connection").clicked() {
-                    delete_connection_id = Some(connection_id.clone());
-                    ui.close();
+                    None => {
+                        ui.label("This connection is gone");
+                    }
                 }
             }
             ChainMapTarget::Map => {
@@ -702,8 +710,8 @@ impl NomadeerApp {
         if let Some(system_id) = select_system_id {
             self.selected_system_id = system_id;
         }
-        if let Some(connection_id) = delete_connection_id {
-            self.delete_connection(&connection_id);
+        if let Some((connection_id, action)) = connection_action {
+            self.apply_connection_action(&connection_id, action);
         }
         if let Some(system_id) = delete_system_id {
             self.delete_system(&system_id);

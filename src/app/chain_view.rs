@@ -470,6 +470,7 @@ mod tests {
             ship_size: String::new(),
             notes: String::new(),
             created_at: 0,
+            ..Connection::default()
         }
     }
 

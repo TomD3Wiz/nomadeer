@@ -9,6 +9,8 @@ use crate::data::factions::{self, Faction};
 use crate::data::wormhole_types::WormholeType;
 use crate::local_intel;
 use crate::model::{Connection, SystemNode};
+pub(super) use crate::wormhole::MassState;
+use crate::wormhole::{self, LifeState};
 use eframe::egui::{
     Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, Vec2, pos2, vec2,
 };
@@ -747,34 +749,16 @@ pub(super) fn shadowed_text(
     painter.text(pos, align, text, font, color);
 }
 
-/// How much mass a wormhole has left, as the connection records it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MassState {
-    Unknown,
-    Stable,
-    Reduced,
-    Critical,
-}
-
-impl MassState {
-    pub(super) fn parse(status: &str) -> Self {
-        match normalized(status).as_str() {
-            "stable" | "fresh" => Self::Stable,
-            "reduced" | "destab" | "destabilized" | "destabilised" | "half" => Self::Reduced,
-            "critical" | "crit" => Self::Critical,
-            _ => Self::Unknown,
-        }
-    }
-}
-
 /// How a connection is drawn.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct ConnectionStyle {
     pub(super) mass: MassState,
     pub(super) end_of_life: bool,
-    /// The wormhole's type when known. Connections do not record one yet, so the
-    /// label slot stays empty until they do.
+    /// The wormhole's type when known: its own code, or K162 when only the exit
+    /// side is known.
     pub(super) wormhole: Option<&'static WormholeType>,
+    /// Hours left at most, once it is marked end of life with a time.
+    pub(super) eol_hours_left: Option<u64>,
 }
 
 /// A connection's line: its width at 100% zoom, colour, and dash and gap lengths
@@ -787,14 +771,15 @@ pub(super) struct EdgeStroke {
 }
 
 impl ConnectionStyle {
-    pub(super) fn of(connection: &Connection) -> Self {
+    pub(super) fn of(connection: &Connection, now: u64) -> Self {
+        let end_of_life = wormhole::life(connection) == LifeState::EndOfLife;
         Self {
-            mass: MassState::parse(&connection.mass_status),
-            end_of_life: matches!(
-                normalized(&connection.life_status).as_str(),
-                "eol" | "end of life" | "dying"
-            ),
-            wormhole: None,
+            mass: wormhole::mass(connection),
+            end_of_life,
+            wormhole: wormhole::label_type(connection),
+            eol_hours_left: end_of_life
+                .then(|| wormhole::hours_left(connection, now))
+                .flatten(),
         }
     }
 
@@ -814,18 +799,29 @@ impl ConnectionStyle {
         }
     }
 
-    /// The text in the label slot, e.g. "H296 → C5 · Large", or "K162" for an exit.
+    /// The text in the label slot, e.g. "H296 → C5 · Capital", "K162" for an exit,
+    /// with "EOL ~3h" once it is dying.
     pub(super) fn label(&self) -> Option<String> {
-        let wormhole = self.wormhole?;
-        Some(match wormhole.jump_mass_category() {
-            Some(size) => format!(
-                "{} → {} · {}",
-                wormhole.code,
-                wormhole.target.label(),
-                size.label()
-            ),
-            None => wormhole.code.to_owned(),
-        })
+        let wormhole = self
+            .wormhole
+            .map(|wormhole| match wormhole.jump_mass_category() {
+                Some(size) => format!(
+                    "{} → {} · {}",
+                    wormhole.code,
+                    wormhole.target.label(),
+                    size.label()
+                ),
+                None => wormhole.code.to_owned(),
+            });
+        let dying = self.end_of_life.then(|| match self.eol_hours_left {
+            Some(0) => "EOL · overdue".to_owned(),
+            Some(hours) => format!("EOL ~{hours}h"),
+            None => "EOL".to_owned(),
+        });
+        match (wormhole, dying) {
+            (Some(wormhole), Some(dying)) => Some(format!("{wormhole} · {dying}")),
+            (wormhole, dying) => wormhole.or(dying),
+        }
     }
 }
 
@@ -918,6 +914,7 @@ impl LegendIcon {
             mass,
             end_of_life,
             wormhole: None,
+            eol_hours_left: None,
         })
     }
 }
@@ -1184,10 +1181,6 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     )
 }
 
-fn normalized(status: &str) -> String {
-    status.trim().to_ascii_lowercase().replace(['_', '-'], " ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1256,6 +1249,7 @@ mod tests {
             ship_size: String::new(),
             notes: String::new(),
             created_at: 0,
+            ..Connection::default()
         }
     }
 
@@ -1428,34 +1422,78 @@ mod tests {
 
     #[test]
     fn connections_are_styled_by_mass_and_age() {
-        let style = ConnectionStyle::of(&connection("stable", "unknown"));
+        let style = ConnectionStyle::of(&connection("stable", "unknown"), 0);
         assert_eq!(style.mass, MassState::Stable);
         assert!(!style.end_of_life);
         assert_eq!(style.stroke().dash, None);
 
-        let reduced = ConnectionStyle::of(&connection("destab", "")).stroke();
-        let critical = ConnectionStyle::of(&connection("Critical", "")).stroke();
+        let reduced = ConnectionStyle::of(&connection("destab", ""), 0).stroke();
+        let critical = ConnectionStyle::of(&connection("Critical", ""), 0).stroke();
         assert!(style.stroke().width > reduced.width && reduced.width > critical.width);
         assert_ne!(reduced.color, critical.color);
         assert_eq!(
-            ConnectionStyle::of(&connection("unknown", "")).mass,
+            ConnectionStyle::of(&connection("unknown", ""), 0).mass,
             MassState::Unknown
         );
 
-        let dying = ConnectionStyle::of(&connection("", "end_of_life"));
+        let dying = ConnectionStyle::of(&connection("", "end_of_life"), 0);
         assert!(dying.end_of_life);
         assert!(dying.stroke().dash.is_some());
-        assert!(ConnectionStyle::of(&connection("", "EOL")).end_of_life);
+        assert!(ConnectionStyle::of(&connection("", "EOL"), 0).end_of_life);
     }
 
     #[test]
     fn the_label_slot_names_the_wormhole() {
-        let mut style = ConnectionStyle::of(&connection("", ""));
+        let mut style = ConnectionStyle::of(&connection("", ""), 0);
         assert_eq!(style.label(), None);
         style.wormhole = wormhole_types::by_code("H296");
         assert_eq!(style.label().as_deref(), Some("H296 → C5 · Capital"));
         style.wormhole = wormhole_types::by_code("K162");
         assert_eq!(style.label().as_deref(), Some("K162"));
+    }
+
+    #[test]
+    fn connections_show_their_type_and_time_left() {
+        const NOW: u64 = 1_760_000_000;
+        let mut marked = connection("reduced", "");
+        marked.created_at = NOW;
+        wormhole::set_type_on_side(&mut marked, "a", wormhole_types::by_code("B274").unwrap());
+        let style = ConnectionStyle::of(&marked, NOW);
+        assert_eq!(style.mass, MassState::Reduced);
+        assert_eq!(style.label().as_deref(), Some("B274 → High-sec · Large"));
+
+        wormhole::mark_eol(&mut marked, NOW);
+        let style = ConnectionStyle::of(&marked, NOW + 3_600 + 60);
+        assert!(style.end_of_life);
+        assert!(style.stroke().dash.is_some());
+        assert_eq!(
+            style.label().as_deref(),
+            Some("B274 → High-sec · Large · EOL ~3h")
+        );
+        assert_eq!(
+            ConnectionStyle::of(&marked, NOW + 5 * 3_600)
+                .label()
+                .as_deref(),
+            Some("B274 → High-sec · Large · EOL · overdue")
+        );
+
+        // Only the exit side known, or nothing but the mark.
+        wormhole::set_type_on_side(&mut marked, "a", wormhole_types::by_code("K162").unwrap());
+        assert_eq!(
+            ConnectionStyle::of(&marked, NOW).label().as_deref(),
+            Some("K162 · EOL ~4h")
+        );
+        wormhole::clear_type(&mut marked);
+        assert_eq!(
+            ConnectionStyle::of(&marked, NOW).label().as_deref(),
+            Some("EOL ~4h")
+        );
+        assert_eq!(
+            ConnectionStyle::of(&connection("", "eol"), NOW)
+                .label()
+                .as_deref(),
+            Some("EOL")
+        );
     }
 
     #[test]
@@ -1526,6 +1564,7 @@ mod tests {
                 mass: MassState::Critical,
                 end_of_life: true,
                 wormhole: crate::data::wormhole_types::by_code("H296"),
+                eol_hours_left: Some(2),
             };
             paint_connection(
                 &painter,

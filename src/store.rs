@@ -221,8 +221,9 @@ impl Store {
             tx.execute(
                 "INSERT INTO connections (
                     id, from_system, to_system, signature_from, signature_to,
-                    mass_status, life_status, ship_size, notes, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    mass_status, life_status, ship_size, notes, created_at,
+                    wormhole_code, wormhole_origin, eol_marked_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     connection.id,
                     connection.from_system,
@@ -234,6 +235,9 @@ impl Store {
                     connection.ship_size,
                     connection.notes,
                     connection.created_at as i64,
+                    connection.wormhole_code,
+                    connection.wormhole_origin,
+                    connection.eol_marked_at as i64,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -242,8 +246,9 @@ impl Store {
         for signature in &data.signatures {
             tx.execute(
                 "INSERT INTO signatures (
-                    id, system_id, code, sig_type, target, life, status, notes, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    id, system_id, code, sig_type, target, life, status, notes, created_at,
+                    scan_group, signal, updated_at, wormhole_code
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     signature.id,
                     signature.system_id,
@@ -254,6 +259,10 @@ impl Store {
                     signature.status,
                     signature.notes,
                     signature.created_at as i64,
+                    signature.scan_group,
+                    signature.signal,
+                    signature.updated_at as i64,
+                    signature.wormhole_code,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -870,7 +879,10 @@ impl Store {
                 life_status TEXT NOT NULL DEFAULT '',
                 ship_size TEXT NOT NULL DEFAULT '',
                 notes TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                wormhole_code TEXT NOT NULL DEFAULT '',
+                wormhole_origin TEXT NOT NULL DEFAULT '',
+                eol_marked_at INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS signatures (
                 id TEXT PRIMARY KEY,
@@ -881,7 +893,11 @@ impl Store {
                 life TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '',
                 notes TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                scan_group TEXT NOT NULL DEFAULT '',
+                signal REAL NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                wormhole_code TEXT NOT NULL DEFAULT ''
              );
              CREATE TABLE IF NOT EXISTS visits (
                 id TEXT PRIMARY KEY,
@@ -1038,6 +1054,23 @@ impl Store {
         // Where the player placed each system on the chain map; NULL until they do.
         self.add_missing_column(conn, "systems", "map_x", "REAL")?;
         self.add_missing_column(conn, "systems", "map_y", "REAL")?;
+        // Wormhole types and when each was marked end of life.
+        for (column, definition) in [
+            ("wormhole_code", "TEXT NOT NULL DEFAULT ''"),
+            ("wormhole_origin", "TEXT NOT NULL DEFAULT ''"),
+            ("eol_marked_at", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            self.add_missing_column(conn, "connections", column, definition)?;
+        }
+        // What pasted probe scans told us about each signature.
+        for (column, definition) in [
+            ("scan_group", "TEXT NOT NULL DEFAULT ''"),
+            ("signal", "REAL NOT NULL DEFAULT 0"),
+            ("updated_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("wormhole_code", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            self.add_missing_column(conn, "signatures", column, definition)?;
+        }
 
         Ok(())
     }
@@ -1222,7 +1255,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, from_system, to_system, signature_from, signature_to,
-                    mass_status, life_status, ship_size, notes, created_at
+                    mass_status, life_status, ship_size, notes, created_at,
+                    wormhole_code, wormhole_origin, eol_marked_at
              FROM connections ORDER BY created_at",
             )
             .map_err(|error| error.to_string())?;
@@ -1239,6 +1273,9 @@ impl Store {
                     ship_size: row.get(7)?,
                     notes: row.get(8)?,
                     created_at: row.get::<_, i64>(9)? as u64,
+                    wormhole_code: row.get(10)?,
+                    wormhole_origin: row.get(11)?,
+                    eol_marked_at: row.get::<_, i64>(12)?.max(0) as u64,
                 })
             })
             .map_err(|error| error.to_string())?;
@@ -1249,7 +1286,8 @@ impl Store {
     fn load_signatures(&self, conn: &SqliteConnection) -> Result<Vec<Signature>, String> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, system_id, code, sig_type, target, life, status, notes, created_at
+                "SELECT id, system_id, code, sig_type, target, life, status, notes, created_at,
+                    scan_group, signal, updated_at, wormhole_code
              FROM signatures ORDER BY system_id, code",
             )
             .map_err(|error| error.to_string())?;
@@ -1265,6 +1303,10 @@ impl Store {
                     status: row.get(6)?,
                     notes: row.get(7)?,
                     created_at: row.get::<_, i64>(8)? as u64,
+                    scan_group: row.get(9)?,
+                    signal: row.get::<_, f64>(10)? as f32,
+                    updated_at: row.get::<_, i64>(11)?.max(0) as u64,
+                    wormhole_code: row.get(12)?,
                 })
             })
             .map_err(|error| error.to_string())?;
@@ -1993,6 +2035,74 @@ mod tests {
                 .iter()
                 .all(|system| system.map_position.is_none())
         );
+    }
+
+    #[test]
+    fn wormhole_state_and_scans_survive_the_migration_and_persist() {
+        let db = TestDb::new("wormhole-state");
+        {
+            // Connections and signatures saved before wormhole types and probe scans.
+            let conn = SqliteConnection::open(&db.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE connections (
+                    id TEXT PRIMARY KEY,
+                    from_system TEXT NOT NULL,
+                    to_system TEXT NOT NULL,
+                    signature_from TEXT NOT NULL DEFAULT '',
+                    signature_to TEXT NOT NULL DEFAULT '',
+                    mass_status TEXT NOT NULL DEFAULT '',
+                    life_status TEXT NOT NULL DEFAULT '',
+                    ship_size TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE signatures (
+                    id TEXT PRIMARY KEY,
+                    system_id TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    sig_type TEXT NOT NULL DEFAULT '',
+                    target TEXT NOT NULL DEFAULT '',
+                    life TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL
+                 );
+                 INSERT INTO connections (id, from_system, to_system, mass_status, life_status, created_at)
+                    VALUES ('conn_a', 'sys_a', 'sys_b', 'destab', 'eol', 5);
+                 INSERT INTO signatures (id, system_id, code, sig_type, created_at)
+                    VALUES ('sig_a', 'sys_a', 'ABC-123', 'wormhole', 6);",
+            )
+            .unwrap();
+        }
+        let store = db.store();
+        let mut data = store.load().unwrap();
+        let connection = &data.connections[0];
+        assert_eq!(connection.mass_status, "destab");
+        assert_eq!(connection.life_status, "eol");
+        assert_eq!(connection.wormhole_code, "");
+        assert_eq!(connection.wormhole_origin, "");
+        assert_eq!(connection.eol_marked_at, 0);
+        let signature = &data.signatures[0];
+        assert_eq!(signature.code, "ABC-123");
+        assert_eq!(signature.scan_group, "");
+        assert_eq!(signature.signal, 0.0);
+        assert_eq!(signature.updated_at, 0);
+        // A second store over the same file re-runs the migration without errors.
+        db.store().load().unwrap();
+
+        let connection = &mut data.connections[0];
+        connection.wormhole_code = "B274".to_owned();
+        connection.wormhole_origin = "sys_a".to_owned();
+        connection.eol_marked_at = NOW;
+        let signature = &mut data.signatures[0];
+        signature.scan_group = "Cosmic Signature".to_owned();
+        signature.signal = 74.5;
+        signature.updated_at = NOW;
+        signature.wormhole_code = "K162".to_owned();
+        store.save(&data).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.connections, data.connections);
+        assert_eq!(loaded.signatures, data.signatures);
     }
 
     #[test]
