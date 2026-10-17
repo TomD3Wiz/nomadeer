@@ -4,6 +4,7 @@ use crate::esi::{self, AccountAuthorization, LocationSync, SystemIntel};
 use crate::forms::*;
 use crate::local_intel::{self, BriefingEvent, BriefingWorker, CoreStatus, DownloadProgress};
 use crate::model::*;
+use crate::paths;
 use crate::portrait;
 use crate::store::{KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS};
 use crate::util::{HOUR_SECS, clean, now, open_url};
@@ -11,13 +12,11 @@ use crate::widgets::{pill, record_frame};
 use crate::zkill::{self, ZkillKill, ZkillReport};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
-const CHAIN_ARCHIVE_DIR: &str = "data/chains";
 /// The assessment weighs the last hour most, so after an hour it no longer describes
 /// the system as it is now.
 const ASSESSMENT_STALE_SECS: u64 = HOUR_SECS;
@@ -184,7 +183,7 @@ pub(crate) struct NomadeerApp {
 
 impl NomadeerApp {
     pub(crate) fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let store = Store::new(PathBuf::from("data/nomadeer.sqlite3"));
+        let store = Store::new(paths::database_path()).with_legacy_dirs(paths::legacy_data_dirs());
         let (esi_tx, esi_rx) = mpsc::channel();
         let (zkill_tx, zkill_rx) = mpsc::channel();
         let (portrait_tx, portrait_rx) = mpsc::channel();
@@ -277,7 +276,7 @@ impl NomadeerApp {
     }
 
     fn refresh_chain_snapshots(&mut self) {
-        match chain_archive::list_snapshots(&PathBuf::from(CHAIN_ARCHIVE_DIR)) {
+        match chain_archive::list_snapshots(&paths::chain_archive_dir()) {
             Ok(snapshots) => self.chain_snapshots = snapshots,
             Err(error) => self.status = format!("Could not list saved chains: {error}"),
         }
@@ -673,7 +672,7 @@ impl NomadeerApp {
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.local_model_import_path)
-                                        .hint_text("Where you saved it"),
+                                        .hint_text(local_intel::import_path_hint()),
                                 );
                                 if ui
                                     .add_enabled(idle, egui::Button::new("Install from file"))
@@ -773,7 +772,7 @@ impl NomadeerApp {
         if self.umbra_task.is_some() {
             return;
         }
-        let path = PathBuf::from(clean(&self.local_model_import_path));
+        let path = local_intel::import_source_path(&self.local_model_import_path);
         if path.as_os_str().is_empty() {
             self.set_umbra_notice(
                 None,
@@ -1641,7 +1640,7 @@ impl NomadeerApp {
             notes: self.data.notes.clone(),
         };
 
-        match chain_archive::save_snapshot(&PathBuf::from(CHAIN_ARCHIVE_DIR), &snapshot) {
+        match chain_archive::save_snapshot(&paths::chain_archive_dir(), &snapshot) {
             Ok(_) => {
                 self.chain_snapshot_name = format!("Chain {}", now());
                 self.refresh_chain_snapshots();
@@ -1652,7 +1651,7 @@ impl NomadeerApp {
     }
 
     fn load_chain_snapshot(&mut self, file_name: &str) {
-        match chain_archive::load_snapshot(&PathBuf::from(CHAIN_ARCHIVE_DIR), file_name) {
+        match chain_archive::load_snapshot(&paths::chain_archive_dir(), file_name) {
             Ok(snapshot) => {
                 let name = snapshot.name.clone();
                 self.data.systems = snapshot.systems;
@@ -1672,7 +1671,7 @@ impl NomadeerApp {
     }
 
     fn delete_chain_snapshot(&mut self, file_name: &str) {
-        match chain_archive::delete_snapshot(&PathBuf::from(CHAIN_ARCHIVE_DIR), file_name) {
+        match chain_archive::delete_snapshot(&paths::chain_archive_dir(), file_name) {
             Ok(()) => {
                 self.refresh_chain_snapshots();
                 self.status = "Deleted saved chain".to_owned();

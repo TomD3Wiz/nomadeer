@@ -1,5 +1,6 @@
 use crate::model::{SystemAssessment, SystemNode, SystemTrafficHistory, TrafficSample};
-use crate::util::{DAY_SECS, HOUR_SECS};
+use crate::paths;
+use crate::util::{DAY_SECS, HOUR_SECS, replace_file};
 use crate::zkill::ZkillReport;
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
@@ -32,7 +33,6 @@ const TOKENIZER_FILE: &str = "tokenizer.json";
 const TOKENIZER_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/resolve/989aa7980e4cf806f80c7fef2b1adb7bc71aa306/tokenizer.json";
 const TOKENIZER_SHA256: &str = "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539";
 const TOKENIZER_SIZE: u64 = 7_031_645;
-const MODELS_ROOT: &str = "data/models";
 const MODEL_DIRECTORY_NAME: &str = "qwen2.5-1.5b-instruct-q4_k_m";
 /// Cores installed by older Nomadeer versions; nothing reads them any more.
 const LEGACY_MODEL_DIRECTORY_NAMES: &[&str] = &["qwen2-1.5b-instruct-q4"];
@@ -88,7 +88,7 @@ struct FileStamp {
 }
 
 fn model_directory() -> PathBuf {
-    Path::new(MODELS_ROOT).join(MODEL_DIRECTORY_NAME)
+    paths::models_dir().join(MODEL_DIRECTORY_NAME)
 }
 
 fn model_path() -> PathBuf {
@@ -147,7 +147,7 @@ fn mark_verified_in(directory: &Path, files: &[CoreFile]) -> Result<(), String> 
     let marker = directory.join(VERIFIED_MARKER_FILE);
     let part_path = marker.with_extension("part");
     fs::write(&part_path, marker_contents(files, &stamps)).map_err(|error| error.to_string())?;
-    fs::rename(part_path, marker).map_err(|error| error.to_string())
+    replace_file(&part_path, &marker).map_err(|error| error.to_string())
 }
 
 fn marker_contents(files: &[CoreFile], stamps: &[FileStamp]) -> String {
@@ -189,6 +189,34 @@ pub(crate) fn install_model(mut progress: impl FnMut(DownloadProgress)) -> Resul
     mark_verified_in(&directory, &CORE_FILES)?;
     remove_legacy_cores();
     Ok(())
+}
+
+/// An example of where a downloaded core might be, in the platform's path style.
+pub(crate) fn import_path_hint() -> String {
+    import_path_hint_for(std::env::consts::OS)
+}
+
+fn import_path_hint_for(os: &str) -> String {
+    match os {
+        "windows" => format!(r"C:\Users\you\Downloads\{MODEL_FILE}"),
+        "macos" => format!("/Users/you/Downloads/{MODEL_FILE}"),
+        _ => format!("/home/you/Downloads/{MODEL_FILE}"),
+    }
+}
+
+/// Reads a typed or pasted file location. Windows "Copy as path" and many file
+/// managers wrap it in quotes, which are not part of the name.
+pub(crate) fn import_source_path(input: &str) -> PathBuf {
+    let trimmed = input.trim();
+    let unquoted = ['"', '\'']
+        .into_iter()
+        .find_map(|quote| {
+            trimmed
+                .strip_prefix(quote)
+                .and_then(|rest| rest.strip_suffix(quote))
+        })
+        .unwrap_or(trimmed);
+    PathBuf::from(unquoted.trim())
 }
 
 /// Installs the core from a file the player already downloaded.
@@ -246,7 +274,7 @@ fn import_file(
     );
     match copied {
         Ok((bytes, hash)) if bytes == file.size && hash == file.sha256 => {
-            fs::rename(&part_path, destination).map_err(|error| error.to_string())
+            replace_file(&part_path, destination).map_err(|error| error.to_string())
         }
         Ok(_) => {
             let _ = fs::remove_file(&part_path);
@@ -261,20 +289,20 @@ fn import_file(
 
 /// Removes Umbra's core along with any left behind by older Nomadeer versions.
 pub(crate) fn remove_model() -> Result<(), String> {
-    remove_cores_in(Path::new(MODELS_ROOT))
+    remove_cores_in(&paths::models_dir())
 }
 
 /// True when an older Nomadeer left a core behind that only takes up space.
 pub(crate) fn has_legacy_cores() -> bool {
     LEGACY_MODEL_DIRECTORY_NAMES
         .iter()
-        .any(|name| Path::new(MODELS_ROOT).join(name).exists())
+        .any(|name| paths::models_dir().join(name).exists())
 }
 
 fn remove_legacy_cores() {
     for name in LEGACY_MODEL_DIRECTORY_NAMES {
         // Leftovers only cost disk space, and Remove Umbra tries again.
-        let _ = remove_directory_in(Path::new(MODELS_ROOT), name);
+        let _ = remove_directory_in(&paths::models_dir(), name);
     }
 }
 
@@ -1020,7 +1048,7 @@ fn download_verified(
         ));
     }
 
-    fs::rename(part_path, destination).map_err(|error| error.to_string())
+    replace_file(&part_path, destination).map_err(|error| error.to_string())
 }
 
 /// Streams `reader` into `path`, returning the byte count and SHA-256 of what was written.
@@ -1096,9 +1124,10 @@ mod tests {
     use super::{
         BriefingEvent, BriefingWorker, CoreFile, CoreStatus, LEGACY_MODEL_DIRECTORY_NAMES,
         LoadedCore, MODEL_DIRECTORY_NAME, VERIFIED_MARKER_FILE, assess_system, attach_briefing,
-        clean_briefing, core_status, core_status_in, fact_sheet, import_file, install_model,
-        is_wormhole_space, keep_briefing, numbers_in, remove_cores_in, remove_directory_in,
-        score_label, validate_briefing, verify_core, verify_core_in,
+        clean_briefing, core_status, core_status_in, fact_sheet, import_file, import_path_hint_for,
+        import_source_path, install_model, is_wormhole_space, keep_briefing, numbers_in,
+        remove_cores_in, remove_directory_in, score_label, validate_briefing, verify_core,
+        verify_core_in,
     };
     use crate::model::{
         KillCounts, KillboardCoverage, SystemAssessment, SystemNode, SystemTrafficHistory,
@@ -1649,6 +1678,36 @@ mod tests {
             numbers_in("3.4b ISK, 42% and 2140 jumps."),
             vec!["3.4", "42", "2140"]
         );
+    }
+
+    #[test]
+    fn import_hint_uses_the_platform_path_style() {
+        assert!(import_path_hint_for("windows").starts_with(r"C:\Users\"));
+        assert!(import_path_hint_for("windows").ends_with(r"\qwen2.5-1.5b-instruct-q4_k_m.gguf"));
+        assert!(import_path_hint_for("linux").starts_with("/home/"));
+        assert!(import_path_hint_for("macos").starts_with("/Users/"));
+    }
+
+    #[test]
+    fn import_paths_lose_surrounding_quotes_and_space() {
+        let expected = PathBuf::from(r"C:\Users\pilot\Downloads\core.gguf");
+        for input in [
+            r"C:\Users\pilot\Downloads\core.gguf",
+            r#"  "C:\Users\pilot\Downloads\core.gguf"  "#,
+            r"'C:\Users\pilot\Downloads\core.gguf'",
+        ] {
+            assert_eq!(import_source_path(input), expected, "{input}");
+        }
+        // A lone or mismatched quote may be part of the name.
+        assert_eq!(
+            import_source_path("/home/pilot/it's.gguf"),
+            PathBuf::from("/home/pilot/it's.gguf")
+        );
+        assert_eq!(
+            import_source_path("\"/home/pilot/core.gguf'"),
+            PathBuf::from("\"/home/pilot/core.gguf'")
+        );
+        assert_eq!(import_source_path("  "), PathBuf::new());
     }
 
     #[test]
