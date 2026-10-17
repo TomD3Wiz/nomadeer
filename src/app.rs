@@ -711,17 +711,33 @@ impl NomadeerApp {
     fn run_zkill_refresh(store: &Store, solar_system_id: u64) -> Result<ZkillTaskResult, String> {
         let current_time = now();
         let mut save_error = None;
-        let cached_killmails = store
-            .cached_killmails(
-                solar_system_id,
-                current_time.saturating_sub(KILLMAIL_RETENTION_SECS),
-            )
-            .unwrap_or_else(|error| {
+        let cached = store.cached_killmails(
+            solar_system_id,
+            current_time.saturating_sub(KILLMAIL_RETENTION_SECS),
+        );
+        // Without the cached kills, their coverage would let paging stop short.
+        let (cached_killmails, coverage) = match cached {
+            Ok(kills) => {
+                let coverage = store
+                    .killboard_coverage(solar_system_id)
+                    .unwrap_or_else(|error| {
+                        save_error = Some(error);
+                        None
+                    });
+                (kills, coverage)
+            }
+            Err(error) => {
                 save_error = Some(error);
-                Vec::new()
-            });
-        let mut report = zkill::fetch_system_report(solar_system_id, cached_killmails)?;
-        if let Err(error) = store.store_killmails(&report.cached_killmails, current_time) {
+                (Vec::new(), None)
+            }
+        };
+        let mut report =
+            zkill::fetch_system_report(solar_system_id, cached_killmails, coverage, current_time)?;
+        if let Err(error) = store.store_killmails(
+            &report.cached_killmails,
+            Some(&report.coverage),
+            current_time,
+        ) {
             save_error.get_or_insert(error);
         }
         // The merged killmails now live in the database; the report keeps its summary.
@@ -811,12 +827,20 @@ impl NomadeerApp {
                             save_error.get_or_insert(error);
                         }
                     }
+                    self.status = match (save_error, &report.interrupted) {
+                        (Some(error), _) => {
+                            format!("Intel loaded, but it could not be saved: {error}")
+                        }
+                        (None, Some(error)) => format!(
+                            "Loaded {kill_count} kills before zKillboard stopped answering: {error}"
+                        ),
+                        (None, None) if report.history.partial_since.is_some() => format!(
+                            "Loaded the latest {kill_count} kills; older kills from this week will be read on later refreshes"
+                        ),
+                        (None, None) => format!("Loaded {kill_count} kills from the last 7 days"),
+                    };
                     self.zkill_busy_system_id = None;
                     self.zkill_reports.insert(report.solar_system_id, report);
-                    self.status = match save_error {
-                        None => format!("Loaded {kill_count} kills from the last 7 days"),
-                        Some(error) => format!("Intel loaded, but it could not be saved: {error}"),
-                    };
                 }
                 Ok(Err(error)) => {
                     self.zkill_busy_system_id = None;
@@ -829,6 +853,16 @@ impl NomadeerApp {
                     break;
                 }
             }
+        }
+    }
+
+    /// Player and NPC kills over the week, marked "+" when the week is not fully read.
+    fn killboard_kill_count(report: &ZkillReport) -> String {
+        let count = report.history.kills_7d + report.history.npc_kills_7d;
+        if report.history.partial_since.is_some() {
+            format!("{count}+")
+        } else {
+            count.to_string()
         }
     }
 
@@ -2122,7 +2156,7 @@ impl NomadeerApp {
         let total_value = report.total_value;
         let solo_kills = report.solo_kills;
         let npc_kills = report.npc_kills;
-        let history_kills = report.history.kills_7d + report.history.npc_kills_7d;
+        let history_kills = Self::killboard_kill_count(report);
         let assessment = self.system_assessments.get(&system.id).cloned();
 
         if let Some(assessment) = assessment {

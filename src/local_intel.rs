@@ -210,15 +210,27 @@ pub(crate) fn assess_system(
             (Some(_), Some(baseline)) if baseline.samples >= 4 => "Medium",
             _ => "Low",
         }
+    };
+    // Kill counts from a week that has not been fully read are only minimums.
+    let killboard_hours = history
+        .partial_since
+        .map(|since| current_time.saturating_sub(since) / HOUR_SECS);
+    let confidence = match killboard_hours {
+        Some(hours) if hours < 24 => "Low",
+        Some(_) if confidence == "High" => "Medium",
+        Some(_) => "Low",
+        None => confidence,
     }
     .to_owned();
+    let at_least = |partial: bool| if partial { "At least " } else { "" };
 
     let mut evidence = Vec::new();
     evidence.push(if history.kills_24h == 0 {
         "No kills in the last 24 hours".to_owned()
     } else {
         format!(
-            "{} in the last hour, {} in the last 4 hours and {} in the last 24 hours",
+            "{}{} in the last hour, {} in the last 4 hours and {} in the last 24 hours",
+            at_least(killboard_hours.is_some_and(|hours| hours < 24)),
             count_label(history.kills_1h, "kill"),
             history.kills_4h,
             history.kills_24h
@@ -228,10 +240,24 @@ pub(crate) fn assess_system(
         "No kills in the last 7 days".to_owned()
     } else {
         format!(
-            "{} in the last 7 days",
+            "{}{} in the last 7 days",
+            at_least(killboard_hours.is_some()),
             count_label(history.kills_7d, "kill")
         )
     });
+    if let Some(hours) = killboard_hours {
+        evidence.push(if hours < 48 {
+            format!(
+                "Killboard history is only complete for the last {}",
+                count_label(hours as usize, "hour")
+            )
+        } else {
+            format!(
+                "Killboard history is only complete for the last {}",
+                count_label((hours / 24) as usize, "day")
+            )
+        });
+    }
     if history.kills_current_hour_7d > 0 {
         evidence.push(format!(
             "{} at this time of day over the last 7 days",
@@ -656,8 +682,8 @@ mod tests {
         is_model_installed, is_wormhole_space, numbers_in, score_label, validate_briefing,
     };
     use crate::model::{
-        KillCounts, SystemAssessment, SystemNode, SystemTrafficHistory, TrafficReading,
-        TrafficSample,
+        KillCounts, KillboardCoverage, SystemAssessment, SystemNode, SystemTrafficHistory,
+        TrafficReading, TrafficSample,
     };
     use crate::util::{DAY_SECS, HOUR_SECS};
     use crate::zkill::{ZkillHistory, ZkillReport};
@@ -701,6 +727,12 @@ mod tests {
             recent_kills: Vec::new(),
             history,
             cached_killmails: Vec::new(),
+            coverage: KillboardCoverage {
+                solar_system_id: 0,
+                since: 0,
+                until: NOW,
+            },
+            interrupted: None,
             total_value: 0.0,
             solo_kills: 0,
             npc_kills: 0,
@@ -882,8 +914,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn usual_traffic_prefers_the_same_hour_of_day() {
+    /// 200 jumps this hour against 100 at this hour on each of the last 3 days.
+    fn traffic_with_same_hour_baseline() -> SystemTrafficHistory {
         let mut history = traffic(200, player_kills(0, 0), 600);
         let latest_hour = history.samples[0].hour;
         let mut samples = (1..=3)
@@ -901,11 +933,15 @@ mod tests {
         samples.sort_by_key(|sample| sample.hour);
         samples.extend(history.samples);
         history.samples = samples;
+        history
+    }
 
+    #[test]
+    fn usual_traffic_prefers_the_same_hour_of_day() {
         let assessment = assess_system(
             &system(30_002_187, "Amamake"),
             &report(ZkillHistory::default()),
-            &history,
+            &traffic_with_same_hour_baseline(),
             NOW,
         );
         assert!(
@@ -917,6 +953,41 @@ mod tests {
             &"Usual traffic is based on 3 earlier samples at this time of day".to_owned()
         ));
         assert_eq!(assessment.confidence, "High");
+    }
+
+    #[test]
+    fn partly_read_killboard_lowers_confidence() {
+        let traffic = traffic_with_same_hour_baseline();
+        let history = ZkillHistory {
+            partial_since: Some(NOW - 3 * DAY_SECS - 600),
+            ..kills_in_last_hour(5)
+        };
+        let assessment = assess_system(&system(JITA, "Jita"), &report(history), &traffic, NOW);
+        assert_eq!(assessment.confidence, "Medium");
+        assert!(
+            assessment
+                .evidence
+                .contains(&"At least 5 kills in the last 7 days".to_owned())
+        );
+        assert!(
+            assessment
+                .evidence
+                .contains(&"Killboard history is only complete for the last 3 days".to_owned())
+        );
+        assert!(assessment.evidence[0].starts_with("5 kills in the last hour"));
+
+        let history = ZkillHistory {
+            partial_since: Some(NOW - 10 * HOUR_SECS),
+            ..kills_in_last_hour(5)
+        };
+        let assessment = assess_system(&system(JITA, "Jita"), &report(history), &traffic, NOW);
+        assert_eq!(assessment.confidence, "Low");
+        assert!(assessment.evidence[0].starts_with("At least 5 kills in the last hour"));
+        assert!(
+            assessment
+                .evidence
+                .contains(&"Killboard history is only complete for the last 10 hours".to_owned())
+        );
     }
 
     #[test]

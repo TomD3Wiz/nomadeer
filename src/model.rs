@@ -211,6 +211,15 @@ pub(crate) struct CachedKillmail {
     pub(crate) corporation_ids: Vec<u64>,
 }
 
+/// The span, `since` to `until` in Unix seconds, over which a system's cached
+/// killmails hold every kill zKillboard listed when it was last fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KillboardCoverage {
+    pub(crate) solar_system_id: u64,
+    pub(crate) since: u64,
+    pub(crate) until: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SystemAssessment {
     pub(crate) system_id: String,
