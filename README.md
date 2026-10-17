@@ -112,7 +112,7 @@ Nomadeer embeds the inference runtime but does not include model weights in the 
 
 Umbra's core is Qwen2.5 1.5B Instruct Q4_K_M from Hugging Face (Apache 2.0, approximately 1.1 GB), pinned to a specific repository revision. Downloads are SHA-256 verified. After installation, briefings run entirely on your computer without an AI service or account.
 
-Umbra is a fan creation. Aura, Sleepers and Anoikis belong to the EVE Online universe by CCP Games; Nomadeer is not affiliated with or endorsed by CCP Games.
+Umbra's portrait was generated for Nomadeer with Figma AI. Umbra is a fan creation. Aura, Sleepers and Anoikis belong to the EVE Online universe by CCP Games; Nomadeer is not affiliated with or endorsed by CCP Games.
 
 ## Build from source
 
