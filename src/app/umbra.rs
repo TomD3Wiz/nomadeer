@@ -678,6 +678,7 @@ mod tests {
             owner: String::new(),
             notes: String::new(),
             created_at: 0,
+            map_position: None,
         }
     }
 
