@@ -10,8 +10,8 @@ Nomadeer is a Rust application built with `egui`/`eframe`. Everything it stores 
 - Character tracking through EVE single sign-on (loopback OAuth with PKCE, no client secret).
 - Save and restore historical chain snapshots.
 - Selected-system killboard history with detailed in-app kill reports.
-- Threat, activity and confidence scores for every system, built from recent kills, live jump traffic and the system's usual traffic at this time of day.
-- Umbra, an optional on-device intel companion who turns that evidence into short briefings.
+- Threat, activity and confidence scores for every system, built from recent kills, live jump traffic and the system's usual traffic at this time of day. Intel is gathered automatically when a character arrives somewhere new.
+- Umbra, an optional on-device intel companion who briefs you on each new system as soon as its intel is in.
 
 ## Downloads
 
@@ -35,9 +35,11 @@ Nomadeer is built twice. Both editions have the same features; the optimized edi
 |---|---|---|
 | CPU | 64-bit x86 with the x86-64-v3 instruction set (AVX2, FMA, BMI1/2, F16C, MOVBE, LZCNT): Intel Core 4th generation (Haswell, 2013) or newer, AMD Ryzen or newer | Any 64-bit x86 CPU |
 | Waking Umbra up (once per session)* | about 3 seconds | about 3 seconds |
-| Each briefing* | about 15–30 seconds | about 35–55 seconds |
+| Each briefing* | about 10–20 seconds | about 40–60 seconds |
 
-\* Measured on a 6-core Intel Core i5-9400F with the EVE Online client running at the same time. Briefings are quicker on an otherwise idle computer (about 8–13 seconds on the optimized edition).
+\* Measured on a 6-core Intel Core i5-9400F with the EVE Online client running at the same time.
+
+Umbra leaves processor cores free for the game: she uses about half of your processor threads, minus one (at least one). To change that, set `CANDLE_NUM_THREADS` and `RAYON_NUM_THREADS` before starting Nomadeer.
 
 The Windows installer, the AppImage and the Flatpak contain both editions and choose automatically. The portable zip and the tarballs make you choose; the optimized edition checks the CPU before anything else runs and, on an older CPU, explains that you need the compatible edition instead of crashing.
 
@@ -60,7 +62,7 @@ Windows builds link the C runtime statically, so no Visual C++ Redistributable i
 
 1. Install and start Nomadeer.
 2. Choose **Add character** and sign in through the EVE login page that opens in your browser. Nomadeer includes its own registered EVE application, so there is nothing to configure.
-3. Nomadeer follows your character's location and builds the chain as you jump. Select a system on the map to see its kills, scores and Umbra's briefing.
+3. Nomadeer follows your character's location and builds the chain as you jump. When a character arrives in a system without recent intel, Nomadeer gathers it automatically and, if Umbra is installed, she briefs you as soon as it is in. Select any system on the map to see its kills, scores and Umbra's briefing. Both can be switched off: **Gather intel on arrival** in the selected system's Intel section and **Umbra briefs automatically** in Umbra's window.
 
 Using your own EVE application instead is optional: create one at <https://developers.eveonline.com/> with this callback URL, then paste its Client ID under **ESI settings** (leave the field empty to go back to Nomadeer's app):
 
