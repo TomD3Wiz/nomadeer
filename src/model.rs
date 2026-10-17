@@ -68,16 +68,20 @@ impl Default for AutoIntelSettings {
     }
 }
 
-/// How the area under the chain map is shared between the dashboard tabs and Umbra.
+/// How the dashboard is shared: the chain map above, and under it the dashboard tabs
+/// beside Umbra.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DashboardLayout {
     /// The tabs' share of the width; Umbra has the rest.
     pub(crate) tabs_fraction: f32,
+    /// The chain map's share of the height; the tabs and Umbra have the rest.
+    pub(crate) map_fraction: f32,
 }
 
 impl DashboardLayout {
     pub(crate) const DEFAULT_TABS_FRACTION: f32 = 1.0 / 3.0;
+    pub(crate) const DEFAULT_MAP_FRACTION: f32 = 0.45;
 
     /// A stored share is kept only when it leaves both sides some room.
     pub(crate) fn is_valid_fraction(fraction: f32) -> bool {
@@ -89,6 +93,7 @@ impl Default for DashboardLayout {
     fn default() -> Self {
         Self {
             tabs_fraction: Self::DEFAULT_TABS_FRACTION,
+            map_fraction: Self::DEFAULT_MAP_FRACTION,
         }
     }
 }
@@ -150,33 +155,87 @@ pub(crate) struct SystemNode {
     pub(crate) owner: String,
     pub(crate) notes: String,
     pub(crate) created_at: u64,
+    /// Where the player placed the system on the chain map, in map units. Systems
+    /// never placed by hand are arranged automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) map_position: Option<MapPosition>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A point on the chain map, in map units: before zooming, a system is 76 units across.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MapPosition {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+}
+
+impl MapPosition {
+    /// A position only counts when both coordinates are real numbers.
+    pub(crate) fn finite(x: Option<f32>, y: Option<f32>) -> Option<Self> {
+        match (x, y) {
+            (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Some(Self { x, y }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Connection {
     pub(crate) id: String,
     pub(crate) from_system: String,
     pub(crate) to_system: String,
+    /// The signature ID of this wormhole in `from_system`, e.g. "ABC-123".
     pub(crate) signature_from: String,
+    /// The signature ID of this wormhole in `to_system`.
     pub(crate) signature_to: String,
+    /// "stable", "reduced", "critical" or "unknown"; see `wormhole::MassState`.
     pub(crate) mass_status: String,
+    /// "fresh", "eol" or "unknown"; see `wormhole::LifeState`.
     pub(crate) life_status: String,
     pub(crate) ship_size: String,
     pub(crate) notes: String,
     pub(crate) created_at: u64,
+    /// The wormhole's type code on the side it spawned, e.g. "B274"; empty when not
+    /// known. The other side is always a K162.
+    #[serde(default)]
+    pub(crate) wormhole_code: String,
+    /// The system the wormhole spawned in, i.e. the side showing `wormhole_code`;
+    /// empty when not known.
+    #[serde(default)]
+    pub(crate) wormhole_origin: String,
+    /// When the player marked it end of life, in Unix seconds; 0 when not marked.
+    #[serde(default)]
+    pub(crate) eol_marked_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Signature {
     pub(crate) id: String,
     pub(crate) system_id: String,
+    /// The in-game signature ID, e.g. "ABC-123".
     pub(crate) code: String,
+    /// The probe scanner's Type column, e.g. "Wormhole" or "Data Site"; empty until
+    /// scanned far enough.
     pub(crate) sig_type: String,
+    /// The site's name, e.g. "Unstable Wormhole".
     pub(crate) target: String,
     pub(crate) life: String,
     pub(crate) status: String,
     pub(crate) notes: String,
+    /// When it was first recorded.
     pub(crate) created_at: u64,
+    /// The probe scanner's Group column, e.g. "Cosmic Signature".
+    #[serde(default)]
+    pub(crate) scan_group: String,
+    /// The best signal strength scanned, 0 to 100.
+    #[serde(default)]
+    pub(crate) signal: f32,
+    /// When a scan last told Nomadeer something new about it; 0 if never.
+    #[serde(default)]
+    pub(crate) updated_at: u64,
+    /// The wormhole type code the player read off it, e.g. "B274" or "K162", while
+    /// it is not linked to a connection.
+    #[serde(default)]
+    pub(crate) wormhole_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,4 +371,23 @@ pub(crate) struct UmbraBriefing {
     pub(crate) briefed_at: u64,
     /// She wrote it on her own rather than when the player asked.
     pub(crate) auto: bool,
+}
+
+/// A character's corporation and alliance, as ESI's affiliation lookup gives them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CharacterAffiliation {
+    pub(crate) character_id: u64,
+    pub(crate) corporation_id: u64,
+    /// 0 when the corporation is in no alliance.
+    pub(crate) alliance_id: u64,
+}
+
+/// An item type with its group and category, for reading d-scans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EveType {
+    pub(crate) type_id: u32,
+    pub(crate) name: String,
+    pub(crate) group_id: u32,
+    pub(crate) group_name: String,
+    pub(crate) category_id: u32,
 }

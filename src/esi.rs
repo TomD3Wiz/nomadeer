@@ -1,5 +1,6 @@
 use crate::model::{
-    Account, EsiSettings, KillCounts, TrafficFeed, TrafficHour, TrafficReading, TrafficRows,
+    Account, CharacterAffiliation, EsiSettings, KillCounts, TrafficFeed, TrafficHour,
+    TrafficReading, TrafficRows,
 };
 use crate::util::{HOUR_SECS, hour_start, now, open_url, parse_http_date};
 use base64::Engine;
@@ -765,11 +766,245 @@ fn get_response(url: &str, access_token: Option<&str>) -> Result<HttpResponse, S
     Ok(response)
 }
 
+// ---------------------------------------------------------------------------------
+// Name and type lookups for pasted local and d-scans. Requests are batched to ESI's
+// limits, and every lookup steps back while ESI's error budget is nearly spent or it
+// has asked Nomadeer to slow down.
+
+/// Names per `/universe/ids/` request.
+pub(crate) const MAX_NAMES_PER_ID_LOOKUP: usize = 500;
+/// Character IDs per `/characters/affiliation/` request.
+pub(crate) const MAX_IDS_PER_AFFILIATION: usize = 1000;
+/// IDs per `/universe/names/` request.
+pub(crate) const MAX_IDS_PER_NAME_LOOKUP: usize = 1000;
+/// Lookups pause once ESI's error budget is down to this many errors.
+const ERROR_LIMIT_MARGIN: u32 = 20;
+/// How long lookups pause when ESI throttles without saying for how long.
+const DEFAULT_LOOKUP_PAUSE_SECS: u64 = 60;
+/// ESI caches affiliations for an hour; Nomadeer keeps them between a minute and
+/// six hours, whatever its headers say.
+const DEFAULT_AFFILIATION_SECS: u64 = 60 * 60;
+const MAX_AFFILIATION_SECS: u64 = 6 * 60 * 60;
+
+/// Until when lookups wait, in Unix seconds; 0 when they need not.
+static LOOKUPS_PAUSED_UNTIL: Mutex<u64> = Mutex::new(0);
+static LOOKUP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct IdAndName {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+}
+
+/// What `/universe/ids/` matched; categories Nomadeer does not ask about are dropped.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct UniverseIds {
+    #[serde(default)]
+    pub(crate) characters: Vec<IdAndName>,
+    #[serde(default)]
+    pub(crate) inventory_types: Vec<IdAndName>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AffiliationResponse {
+    character_id: u64,
+    corporation_id: u64,
+    alliance_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct NamedEntity {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) category: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TypeResponse {
+    name: String,
+    group_id: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupResponse {
+    name: String,
+    category_id: u32,
+}
+
+/// Exact-name matches for up to [`MAX_NAMES_PER_ID_LOOKUP`] names.
+pub(crate) fn universe_ids(names: &[String]) -> Result<UniverseIds, String> {
+    if names.is_empty() {
+        return Ok(UniverseIds::default());
+    }
+    let url = format!("{ESI_BASE_URL}/universe/ids/?datasource=tranquility&language=en");
+    let response = send_lookup(lookup_client().post(url).json(names))?;
+    lookup_json(response)
+}
+
+/// Corporations and alliances of up to [`MAX_IDS_PER_AFFILIATION`] characters, and
+/// until when they can be reused.
+pub(crate) fn character_affiliations(
+    character_ids: &[u64],
+) -> Result<(Vec<CharacterAffiliation>, u64), String> {
+    if character_ids.is_empty() {
+        return Ok((Vec::new(), now()));
+    }
+    let url = format!("{ESI_BASE_URL}/characters/affiliation/?datasource=tranquility");
+    let response = send_lookup(lookup_client().post(url).json(character_ids))?;
+    let lifetime = affiliation_lifetime(
+        header_time(&response, DATE),
+        header_time(&response, EXPIRES),
+    );
+    let affiliations = lookup_json::<Vec<AffiliationResponse>>(response)?
+        .into_iter()
+        .map(|affiliation| CharacterAffiliation {
+            character_id: affiliation.character_id,
+            corporation_id: affiliation.corporation_id,
+            alliance_id: affiliation.alliance_id.unwrap_or_default(),
+        })
+        .collect();
+    Ok((affiliations, now() + lifetime))
+}
+
+/// Names of up to [`MAX_IDS_PER_NAME_LOOKUP`] IDs. ESI refuses the whole request
+/// when one ID is unknown, so a refused batch is split until the bad IDs are found
+/// and left out.
+pub(crate) fn universe_names(ids: &[u64]) -> Result<Vec<NamedEntity>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = format!("{ESI_BASE_URL}/universe/names/?datasource=tranquility");
+    let response = send_lookup(lookup_client().post(url).json(ids))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        if ids.len() == 1 {
+            return Ok(Vec::new());
+        }
+        let (first, second) = ids.split_at(ids.len() / 2);
+        let mut names = universe_names(first)?;
+        names.extend(universe_names(second)?);
+        return Ok(names);
+    }
+    lookup_json(response)
+}
+
+/// An item type's name and group.
+pub(crate) fn type_and_group(type_id: u32) -> Result<(String, u32), String> {
+    let url =
+        format!("{ESI_BASE_URL}/universe/types/{type_id}/?datasource=tranquility&language=en");
+    let response = lookup_json::<TypeResponse>(send_lookup(lookup_client().get(url))?)?;
+    Ok((response.name, response.group_id))
+}
+
+/// An item group's name and category.
+pub(crate) fn group_and_category(group_id: u32) -> Result<(String, u32), String> {
+    let url =
+        format!("{ESI_BASE_URL}/universe/groups/{group_id}/?datasource=tranquility&language=en");
+    let response = lookup_json::<GroupResponse>(send_lookup(lookup_client().get(url))?)?;
+    Ok((response.name, response.category_id))
+}
+
+fn lookup_client() -> &'static Client {
+    LOOKUP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    })
+}
+
+/// Sends a lookup unless ESI asked Nomadeer to wait, and notes how much of ESI's
+/// error budget is left. Any answer but a throttle comes back for the caller to read.
+fn send_lookup(request: reqwest::blocking::RequestBuilder) -> Result<HttpResponse, String> {
+    let current_time = now();
+    let paused_until = LOOKUPS_PAUSED_UNTIL.lock().map_or(0, |until| *until);
+    if paused_until > current_time {
+        return Err(format!(
+            "ESI asked Nomadeer to slow down; lookups resume in {}s",
+            paused_until - current_time
+        ));
+    }
+    let response = request
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .map_err(|error| format!("ESI request failed: {error}"))?;
+    let header_number = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    };
+    let pause = lookup_pause(
+        response.status().as_u16(),
+        header_number("x-esi-error-limit-remain"),
+        header_number("x-esi-error-limit-reset"),
+        header_number("retry-after"),
+    );
+    if let Some(pause) = pause
+        && let Ok(mut until) = LOOKUPS_PAUSED_UNTIL.lock()
+    {
+        *until = (*until).max(current_time + pause);
+    }
+    if matches!(response.status().as_u16(), 420 | 429) {
+        return Err("ESI asked Nomadeer to slow down; try again in a minute".to_owned());
+    }
+    Ok(response)
+}
+
+/// How long lookups should pause after a response, if at all: when ESI throttles
+/// (420 for the error limit, 429 for rate limits), or when its error budget is
+/// nearly spent.
+fn lookup_pause(
+    status: u16,
+    error_limit_remain: Option<u64>,
+    error_limit_reset: Option<u64>,
+    retry_after: Option<u64>,
+) -> Option<u64> {
+    if matches!(status, 420 | 429) {
+        return Some(
+            retry_after
+                .or(error_limit_reset)
+                .unwrap_or(DEFAULT_LOOKUP_PAUSE_SECS)
+                .max(1),
+        );
+    }
+    match error_limit_remain {
+        Some(remain) if remain <= u64::from(ERROR_LIMIT_MARGIN) => Some(
+            error_limit_reset
+                .unwrap_or(DEFAULT_LOOKUP_PAUSE_SECS)
+                .max(1),
+        ),
+        _ => None,
+    }
+}
+
+fn lookup_json<T>(response: HttpResponse) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("ESI lookup returned {status}"));
+    }
+    response
+        .json::<T>()
+        .map_err(|error| format!("Could not parse ESI response: {error}"))
+}
+
+/// How long ESI's affiliation answer holds, from its own Date and Expires headers.
+fn affiliation_lifetime(date: Option<u64>, expires: Option<u64>) -> u64 {
+    match (date, expires) {
+        (Some(date), Some(expires)) => expires.saturating_sub(date),
+        _ => DEFAULT_AFFILIATION_SECS,
+    }
+    .clamp(60, MAX_AFFILIATION_SECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ONLINE_SCOPE, feed_times, online_cache_lifetime, token_has_scope, token_scopes,
-        traffic_next_poll_delay, traffic_retry_delay, with_scope,
+        ONLINE_SCOPE, affiliation_lifetime, feed_times, lookup_pause, online_cache_lifetime,
+        token_has_scope, token_scopes, traffic_next_poll_delay, traffic_retry_delay, with_scope,
     };
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -873,5 +1108,28 @@ mod tests {
         assert_eq!(traffic_retry_delay(4), Duration::from_secs(480));
         assert_eq!(traffic_retry_delay(5), Duration::from_secs(900));
         assert_eq!(traffic_retry_delay(40), Duration::from_secs(900));
+    }
+
+    #[test]
+    fn lookups_pause_when_esi_throttles_or_errors_run_low() {
+        // Throttled: as long as ESI says, else until the error window resets.
+        assert_eq!(lookup_pause(420, Some(0), Some(37), None), Some(37));
+        assert_eq!(lookup_pause(429, None, None, Some(5)), Some(5));
+        assert_eq!(lookup_pause(429, None, None, None), Some(60));
+        // A healthy budget, even after an error, needs no pause.
+        assert_eq!(lookup_pause(200, Some(100), Some(40), None), None);
+        assert_eq!(lookup_pause(404, Some(99), Some(40), None), None);
+        assert_eq!(lookup_pause(200, None, None, None), None);
+        // Nearly spent: wait out the window.
+        assert_eq!(lookup_pause(200, Some(20), Some(12), None), Some(12));
+        assert_eq!(lookup_pause(502, Some(3), None, None), Some(60));
+    }
+
+    #[test]
+    fn affiliations_are_kept_as_long_as_esi_says_within_limits() {
+        assert_eq!(affiliation_lifetime(Some(1_000), Some(4_600)), 3_600);
+        assert_eq!(affiliation_lifetime(None, Some(4_600)), 3_600);
+        assert_eq!(affiliation_lifetime(Some(1_000), Some(1_010)), 60);
+        assert_eq!(affiliation_lifetime(Some(1_000), Some(100_000)), 21_600);
     }
 }

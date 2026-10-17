@@ -130,8 +130,70 @@ fn slugify_snapshot_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_snapshot_path;
+    use super::{ChainSnapshot, safe_snapshot_path};
+    use crate::model::MapPosition;
     use std::path::Path;
+
+    #[test]
+    fn snapshots_keep_hand_placed_systems_and_older_ones_still_load() {
+        // Saved before systems could be placed by hand.
+        let older: ChainSnapshot = serde_json::from_str(
+            r#"{"name": "Home", "created_at": 1, "systems": [{
+                "id": "sys_a", "name": "J123456", "class": "C3", "effect": "",
+                "status": "home", "owner": "", "notes": "", "created_at": 1
+            }]}"#,
+        )
+        .unwrap();
+        assert_eq!(older.systems[0].map_position, None);
+
+        let mut placed = older.clone();
+        placed.systems[0].map_position = Some(MapPosition { x: 40.0, y: -12.5 });
+        let json = serde_json::to_string(&placed).unwrap();
+        let loaded: ChainSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.systems[0].map_position,
+            placed.systems[0].map_position
+        );
+        // Systems without a place write nothing for it, as older versions did.
+        assert!(
+            !serde_json::to_string(&older)
+                .unwrap()
+                .contains("map_position")
+        );
+    }
+
+    #[test]
+    fn snapshots_keep_wormhole_state_and_older_ones_still_load() {
+        // Saved before wormhole types, end-of-life times and probe scans.
+        let older: ChainSnapshot = serde_json::from_str(
+            r#"{"name": "Home", "created_at": 1,
+                "connections": [{
+                    "id": "conn_a", "from_system": "sys_a", "to_system": "sys_b",
+                    "signature_from": "ABC-123", "signature_to": "", "mass_status": "destab",
+                    "life_status": "eol", "ship_size": "", "notes": "", "created_at": 2
+                }],
+                "signatures": [{
+                    "id": "sig_a", "system_id": "sys_a", "code": "ABC-123",
+                    "sig_type": "wormhole", "target": "", "life": "", "status": "",
+                    "notes": "", "created_at": 3
+                }]}"#,
+        )
+        .unwrap();
+        assert_eq!(older.connections[0].wormhole_code, "");
+        assert_eq!(older.connections[0].eol_marked_at, 0);
+        assert_eq!(older.signatures[0].scan_group, "");
+
+        let mut marked = older.clone();
+        marked.connections[0].wormhole_code = "B274".to_owned();
+        marked.connections[0].wormhole_origin = "sys_a".to_owned();
+        marked.connections[0].eol_marked_at = 1_760_000_000;
+        marked.signatures[0].scan_group = "Cosmic Signature".to_owned();
+        marked.signatures[0].signal = 100.0;
+        let json = serde_json::to_string(&marked).unwrap();
+        let loaded: ChainSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.connections, marked.connections);
+        assert_eq!(loaded.signatures, marked.signatures);
+    }
 
     #[test]
     fn snapshot_names_stay_inside_the_archive() {

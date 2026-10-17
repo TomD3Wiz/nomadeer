@@ -3,6 +3,7 @@ use crate::chain_archive::{self, ChainSnapshot, ChainSnapshotMeta};
 use crate::config::theme;
 use crate::esi::{self, AccountAuthorization, LocationSync, ONLINE_SCOPE, OnlineSync, SystemIntel};
 use crate::forms::*;
+use crate::live_intel;
 use crate::local_intel::{self, BriefingEvent, BriefingWorker, CoreStatus, DownloadProgress};
 use crate::model::*;
 use crate::paths;
@@ -12,14 +13,20 @@ use crate::store::{KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS};
 use crate::util::{clean, now, open_url};
 use crate::widgets::{pill, record_frame};
 use crate::zkill::{self, ZkillKill, ZkillReport};
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
-use std::collections::{HashMap, HashSet, VecDeque};
+use eframe::egui::{self, Color32, Sense, Stroke, Vec2};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod chain_art;
+mod chain_map;
+mod chain_view;
 mod layout;
+mod live;
+mod scan;
 mod umbra;
+mod wormholes;
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const WARNING_TEXT: Color32 = Color32::from_rgb(255, 194, 87);
@@ -47,6 +54,8 @@ enum ZkillTaskResult {
     Report {
         report: ZkillReport,
         traffic: SystemTrafficHistory,
+        /// The system's cached week of kills, for checking pasted local against.
+        killmails: Option<Vec<CachedKillmail>>,
         save_error: Option<String>,
     },
 }
@@ -197,8 +206,23 @@ pub(crate) struct NomadeerApp {
     online_poll_in_flight: Option<String>,
     auto_briefings: AutoBriefings,
     zkill_reports: HashMap<u64, ZkillReport>,
-    /// The latest traffic readings each killboard refresh found, by solar system ID.
+    /// The traffic each killboard refresh read, by solar system ID, for showing and
+    /// for re-assessing the system when live intel is pasted.
     refreshed_traffic: HashMap<u64, SystemTrafficHistory>,
+    /// Each system's cached week of kills, by solar system ID, for checking pasted
+    /// local against.
+    system_killmails: HashMap<u64, live_intel::SystemKills>,
+    /// The latest pasted local and d-scan of each system, by map system ID.
+    live_intel: HashMap<String, live_intel::SystemLiveIntel>,
+    /// Pastes being read: the system and what was pasted.
+    live_reading: Vec<(String, live::LiveKind)>,
+    live_tx: Sender<live::LiveTaskResult>,
+    live_rx: Receiver<live::LiveTaskResult>,
+    /// When the live intel in each system's assessment runs out, so it is
+    /// re-assessed without it.
+    live_expiry: HashMap<String, u64>,
+    /// The selected system's local paste, checked against its kills.
+    local_check: Option<live::LocalCheck>,
     selected_zkill_kill: Option<ZkillKill>,
     system_assessments: HashMap<String, SystemAssessment>,
     umbra_task: Option<UmbraTask>,
@@ -221,7 +245,20 @@ pub(crate) struct NomadeerApp {
     chain_snapshot_name: String,
     chain_snapshots: Vec<ChainSnapshotMeta>,
     chain_context_target: Option<ChainMapTarget>,
-    chain_drag_start_system_id: Option<String>,
+    /// The chain map's view this session; None until it is next fitted to the chain.
+    chain_camera: Option<chain_view::Camera>,
+    chain_drag: Option<chain_map::ChainDrag>,
+    /// The player pressed Reset layout and has not yet confirmed.
+    chain_confirm_reset_layout: bool,
+    /// The key to the chain map's artwork is open.
+    chain_show_legend: bool,
+    /// Where the legend and the corner controls covered the map last frame, so a
+    /// connection is never dropped on a system hidden under them.
+    chain_overlays: Vec<egui::Rect>,
+    /// What the last pasted probe scan did, shown beside the system's signatures.
+    scan_notice: Option<scan::ScanNotice>,
+    /// When the Paste scan button asked for the clipboard, until it arrives.
+    paste_requested: Option<Instant>,
     next_auto_sync: Instant,
     auto_sync_index: usize,
 }
@@ -234,6 +271,7 @@ impl NomadeerApp {
         let (portrait_tx, portrait_rx) = mpsc::channel();
         let (local_intel_tx, local_intel_rx) = mpsc::channel();
         let (traffic_tx, traffic_rx) = mpsc::channel();
+        let (live_tx, live_rx) = mpsc::channel();
         let mut app = Self {
             data: AppData::default(),
             store,
@@ -273,6 +311,13 @@ impl NomadeerApp {
             auto_briefings: AutoBriefings::default(),
             zkill_reports: HashMap::new(),
             refreshed_traffic: HashMap::new(),
+            system_killmails: HashMap::new(),
+            live_intel: HashMap::new(),
+            live_reading: Vec::new(),
+            local_check: None,
+            live_tx,
+            live_rx,
+            live_expiry: HashMap::new(),
             selected_zkill_kill: None,
             system_assessments: HashMap::new(),
             umbra_task: None,
@@ -290,7 +335,13 @@ impl NomadeerApp {
             chain_snapshot_name: String::new(),
             chain_snapshots: Vec::new(),
             chain_context_target: None,
-            chain_drag_start_system_id: None,
+            chain_camera: None,
+            chain_drag: None,
+            chain_confirm_reset_layout: false,
+            chain_show_legend: false,
+            chain_overlays: Vec::new(),
+            scan_notice: None,
+            paste_requested: None,
             next_auto_sync: Instant::now() + Duration::from_secs(5),
             auto_sync_index: 0,
         };
@@ -312,6 +363,7 @@ impl NomadeerApp {
                     .cloned()
                     .map(|assessment| (assessment.system_id.clone(), assessment))
                     .collect();
+                self.load_live_intel();
                 self.sync_esi_settings_form();
                 self.reconcile_selected_system();
                 self.refresh_chain_snapshots();
@@ -1283,9 +1335,16 @@ impl NomadeerApp {
                 save_error.get_or_insert(error);
                 SystemTrafficHistory::default()
             });
+        let killmails = store
+            .cached_killmails(
+                solar_system_id,
+                current_time.saturating_sub(KILLMAIL_RETENTION_SECS),
+            )
+            .ok();
         Ok(ZkillTaskResult::Report {
             report,
             traffic,
+            killmails,
             save_error,
         })
     }
@@ -1341,6 +1400,7 @@ impl NomadeerApp {
                 Ok(Ok(ZkillTaskResult::Report {
                     report,
                     traffic,
+                    killmails,
                     save_error,
                 })) => {
                     let background = self
@@ -1349,12 +1409,22 @@ impl NomadeerApp {
                         .is_some_and(|(_, request)| request == IntelRequest::Arrival);
                     self.intel_errors.remove(&report.solar_system_id);
                     let kill_count = report.history.kills_7d + report.history.npc_kills_7d;
+                    if let Some(killmails) = killmails {
+                        self.keep_latest_kills(
+                            report.solar_system_id,
+                            live_intel::SystemKills {
+                                killmails,
+                                coverage: Some(report.coverage),
+                            },
+                        );
+                    }
                     let assessment = self
                         .data
                         .systems
                         .iter()
                         .find(|system| system.solar_system_id == report.solar_system_id)
-                        .map(|system| local_intel::assess_system(system, &report, &traffic, now()));
+                        .cloned()
+                        .map(|system| self.assess(&system, &report, &traffic, now()));
                     let mut save_error = save_error;
                     if let Some(mut assessment) = assessment {
                         if let Some(previous) = self.system_assessments.get(&assessment.system_id) {
@@ -1391,13 +1461,8 @@ impl NomadeerApp {
                     if let Some(status) = status {
                         self.status = status;
                     }
-                    self.refreshed_traffic.insert(
-                        report.solar_system_id,
-                        SystemTrafficHistory {
-                            samples: Vec::new(),
-                            ..traffic
-                        },
-                    );
+                    self.refreshed_traffic
+                        .insert(report.solar_system_id, traffic);
                     self.zkill_reports.insert(report.solar_system_id, report);
                 }
                 Ok(Err(error)) => {
@@ -1521,6 +1586,8 @@ impl NomadeerApp {
             }
             CoreStatus::Ready => {}
         }
+        // The chain may have changed since the assessment, e.g. a hole marked EOL.
+        self.refresh_chain_facts(system_id);
         let Some(assessment) = self.system_assessments.get(system_id).cloned() else {
             self.set_umbra_notice(
                 Some(system_id.to_owned()),
@@ -1987,6 +2054,7 @@ impl NomadeerApp {
             owner: String::new(),
             notes: format!("Solar system ID {}", intel.solar_system_id),
             created_at: now(),
+            map_position: None,
         };
         Self::apply_system_intel(&mut system, intel);
         self.data.systems.push(system);
@@ -2045,6 +2113,7 @@ impl NomadeerApp {
             ship_size: String::new(),
             notes: format!("Inferred from {character_name} movement"),
             created_at: now(),
+            ..Connection::default()
         });
     }
 
@@ -2077,6 +2146,7 @@ impl NomadeerApp {
             ship_size: String::new(),
             notes: "Linked on chain map".to_owned(),
             created_at: now(),
+            ..Connection::default()
         });
         self.save();
         self.status = format!("Linked {from_name} to {to_name}");
@@ -2120,6 +2190,7 @@ impl NomadeerApp {
                 self.data.visits = snapshot.visits;
                 self.data.notes = snapshot.notes;
                 self.selected_system_id = snapshot.selected_system_id;
+                self.forget_chain_view();
                 self.clear_account_locations_outside_chain();
                 self.retain_assessments_in_chain();
                 self.reconcile_selected_system();
@@ -2147,6 +2218,7 @@ impl NomadeerApp {
         self.data.visits.clear();
         self.data.notes.clear();
         self.selected_system_id.clear();
+        self.forget_chain_view();
         for account in &mut self.data.accounts {
             account.last_system_id.clear();
             account.last_system_name.clear();
@@ -2154,6 +2226,15 @@ impl NomadeerApp {
         self.retain_assessments_in_chain();
         self.save();
         self.status = "Cleared current chain".to_owned();
+    }
+
+    /// A different chain is fitted into view afresh, and nothing held on the old one
+    /// carries over.
+    fn forget_chain_view(&mut self) {
+        self.chain_camera = None;
+        self.chain_drag = None;
+        self.chain_confirm_reset_layout = false;
+        self.chain_context_target = None;
     }
 
     /// Assessments belong to map nodes, so drop any whose node is no longer mapped.
@@ -2226,6 +2307,7 @@ impl NomadeerApp {
             .retain(|assessment| assessment.system_id != system_id);
         self.system_assessments.remove(system_id);
         self.zkill_reports.remove(&solar_system_id);
+        self.forget_live_intel(system_id);
         for account in &mut self.data.accounts {
             if account.last_system_id == system_id {
                 account.last_system_id.clear();
@@ -2274,24 +2356,61 @@ impl NomadeerApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.heading("Chain map");
-                ui.label("Select, right-click, or drag between systems");
+                ui.label(chain_map::CHAIN_MAP_HINT);
             });
-            self.chain_map(ui);
-            ui.separator();
-            self.dashboard_panes(ui);
+            let area = ui.available_rect_before_wrap();
+            let split = self.map_divider(ui, area);
+            self.chain_map(ui, split.map);
+            self.dashboard_panes(ui, split.below);
         });
+    }
+
+    /// The divider under the chain map. Dragging moves it, a double-click puts it back;
+    /// the new height is saved when the player lets go. Returns where everything sits.
+    fn map_divider(&mut self, ui: &mut egui::Ui, area: egui::Rect) -> layout::MapSplit {
+        let split = layout::map_split(area, self.data.dashboard_layout.map_fraction);
+        let response = Self::divider_response(ui, "map_divider", split.divider);
+        let mut moved = false;
+        if response.dragged()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let fraction = layout::map_fraction_at(pointer.y, area);
+            if fraction != self.data.dashboard_layout.map_fraction {
+                self.data.dashboard_layout.map_fraction = fraction;
+                moved = true;
+            }
+        }
+        if response.drag_stopped() {
+            self.save_quietly();
+        }
+        if response.double_clicked() {
+            self.data.dashboard_layout.map_fraction = DashboardLayout::DEFAULT_MAP_FRACTION;
+            self.save_quietly();
+            moved = true;
+        }
+
+        let split = if moved {
+            layout::map_split(area, self.data.dashboard_layout.map_fraction)
+        } else {
+            split
+        };
+        Self::paint_divider(ui, split.divider, response.hovered() || response.dragged());
+        split
     }
 
     /// The tabs on the left and Umbra on the right, under the chain map and down to
     /// the bottom of the window; stacked when the window is too narrow for both.
-    fn dashboard_panes(&mut self, ui: &mut egui::Ui) {
-        let mut area = ui.available_rect_before_wrap();
+    fn dashboard_panes(&mut self, ui: &mut egui::Ui, mut area: egui::Rect) {
         area.set_height(area.height().max(MIN_DASHBOARD_PANES_HEIGHT));
         let mut panes = layout::dashboard_panes(area, self.data.dashboard_layout.tabs_fraction);
-        if let Some(divider) = panes.divider
-            && self.dashboard_divider(ui, area, divider)
-        {
-            panes = layout::dashboard_panes(area, self.data.dashboard_layout.tabs_fraction);
+        if let Some(divider) = panes.divider {
+            let response = Self::divider_response(ui, "dashboard_divider", divider);
+            if self.drag_dashboard_divider(&response, area) {
+                panes = layout::dashboard_panes(area, self.data.dashboard_layout.tabs_fraction);
+            }
+            if let Some(divider) = panes.divider {
+                Self::paint_divider(ui, divider, response.hovered() || response.dragged());
+            }
         }
 
         let mut tabs_ui = Self::pane_ui(ui, "dashboard_tabs_pane", panes.tabs);
@@ -2302,7 +2421,7 @@ impl NomadeerApp {
             .auto_shrink([false, false])
             .show(&mut tabs_ui, |ui| match self.active_tab {
                 DashboardTab::Movement => self.recent_movements(ui),
-                DashboardTab::Connections => self.inferred_connections(ui),
+                DashboardTab::Connections => self.connections_tab(ui),
                 DashboardTab::Systems => self.systems_overview(ui),
                 DashboardTab::Intel => self.selected_system_intel(ui),
                 DashboardTab::Chain => self.chain_management(ui),
@@ -2326,25 +2445,9 @@ impl NomadeerApp {
         child
     }
 
-    /// The divider between the tabs and Umbra. Dragging moves it, a double-click puts it
-    /// back; the new split is saved when the player lets go. Returns whether it moved.
-    fn dashboard_divider(
-        &mut self,
-        ui: &mut egui::Ui,
-        area: egui::Rect,
-        divider: egui::Rect,
-    ) -> bool {
-        let response = ui
-            .interact(
-                divider,
-                ui.id().with("dashboard_divider"),
-                Sense::click_and_drag(),
-            )
-            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-        if response.dragged() {
-            // Off the divider mid-drag, the cursor still shows what the drag does.
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-        }
+    /// Follows a drag on the divider between the tabs and Umbra; a double-click puts it
+    /// back, and the new split is saved when the player lets go. Returns whether it moved.
+    fn drag_dashboard_divider(&mut self, response: &egui::Response, area: egui::Rect) -> bool {
         let mut moved = false;
         if response.dragged()
             && let Some(pointer) = response.interact_pointer_pos()
@@ -2359,27 +2462,58 @@ impl NomadeerApp {
             self.save_quietly();
         }
         if response.double_clicked() {
-            self.data.dashboard_layout = DashboardLayout::default();
+            self.data.dashboard_layout.tabs_fraction = DashboardLayout::DEFAULT_TABS_FRACTION;
             self.save_quietly();
             moved = true;
         }
+        moved
+    }
 
-        let active = response.hovered() || response.dragged();
+    /// A divider the player drags to resize the panes either side of it, showing the
+    /// resize cursor while hovered or held, even once the pointer slips off it.
+    fn divider_response(ui: &egui::Ui, id: &str, divider: egui::Rect) -> egui::Response {
+        let cursor = if divider.height() >= divider.width() {
+            egui::CursorIcon::ResizeHorizontal
+        } else {
+            egui::CursorIcon::ResizeVertical
+        };
+        let response = ui
+            .interact(divider, ui.id().with(id), Sense::click_and_drag())
+            .on_hover_cursor(cursor);
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(cursor);
+        }
+        response
+    }
+
+    /// A divider's line with its grip in the middle, lit while hovered or held.
+    fn paint_divider(ui: &egui::Ui, divider: egui::Rect, active: bool) {
         let color = if active {
             theme::accent()
         } else {
             theme::panel_stroke()
         };
         let painter = ui.painter();
-        let center_x = divider.center().x;
-        painter.line_segment(
-            [
-                egui::pos2(center_x, divider.top() + 4.0),
-                egui::pos2(center_x, divider.bottom() - 4.0),
-            ],
-            Stroke::new(if active { 2.0_f32 } else { 1.0 }, color),
-        );
-        let grip = egui::Rect::from_center_size(divider.center(), Vec2::new(8.0, 26.0));
+        let center = divider.center();
+        let (line, grip_size) = if divider.height() >= divider.width() {
+            (
+                [
+                    egui::pos2(center.x, divider.top() + 4.0),
+                    egui::pos2(center.x, divider.bottom() - 4.0),
+                ],
+                Vec2::new(8.0, 26.0),
+            )
+        } else {
+            (
+                [
+                    egui::pos2(divider.left() + 4.0, center.y),
+                    egui::pos2(divider.right() - 4.0, center.y),
+                ],
+                Vec2::new(26.0, 8.0),
+            )
+        };
+        painter.line_segment(line, Stroke::new(if active { 2.0_f32 } else { 1.0 }, color));
+        let grip = egui::Rect::from_center_size(center, grip_size);
         painter.rect_filled(grip, 4.0, theme::panel_background());
         painter.rect_stroke(
             grip,
@@ -2390,429 +2524,6 @@ impl NomadeerApp {
         for dot in layout::grip_dots(divider) {
             painter.circle_filled(dot, 1.5, color);
         }
-        moved
-    }
-
-    fn chain_map(&mut self, ui: &mut egui::Ui) {
-        let desired = Vec2::new(ui.available_width(), 360.0);
-        let (rect, response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 12.0, theme::panel_background());
-        painter.rect_stroke(
-            rect,
-            12.0,
-            Stroke::new(1.0_f32, theme::panel_stroke()),
-            egui::StrokeKind::Inside,
-        );
-
-        if self.data.systems.is_empty() {
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                "Sync a character location to start mapping the chain",
-                FontId::proportional(18.0),
-                theme::muted_text(),
-            );
-            return;
-        }
-
-        let positions = self.chain_positions(rect);
-        let pointer_pos = ui
-            .ctx()
-            .input(|input| input.pointer.hover_pos())
-            .filter(|pos| rect.contains(*pos));
-        let hovered_system_id = pointer_pos.and_then(|pos| self.chain_system_at(&positions, pos));
-        let hovered_connection_id = if hovered_system_id.is_none() {
-            pointer_pos.and_then(|pos| self.chain_connection_at(&positions, pos))
-        } else {
-            None
-        };
-
-        for connection in &self.data.connections {
-            if let (Some(a), Some(b)) = (
-                positions.get(&connection.from_system),
-                positions.get(&connection.to_system),
-            ) {
-                let color = match connection.mass_status.as_str() {
-                    "critical" => Color32::from_rgb(255, 91, 112),
-                    "destab" => Color32::from_rgb(255, 194, 87),
-                    _ => Color32::from_rgb(93, 242, 255),
-                };
-                let delta = *b - *a;
-                let distance = delta.length();
-                let endpoints = if distance > 76.0 {
-                    let offset = delta / distance * 38.0;
-                    [*a + offset, *b - offset]
-                } else {
-                    [*a, *b]
-                };
-                let is_hovered = hovered_connection_id.as_deref() == Some(&connection.id);
-                painter.line_segment(
-                    endpoints,
-                    Stroke::new(
-                        if is_hovered { 4.0_f32 } else { 2.0_f32 },
-                        if is_hovered { Color32::WHITE } else { color },
-                    ),
-                );
-            }
-        }
-
-        for system in &self.data.systems {
-            if let Some(pos) = positions.get(&system.id) {
-                let is_hovered = hovered_system_id.as_deref() == Some(&system.id);
-                let is_drag_start = self.chain_drag_start_system_id.as_deref() == Some(&system.id);
-                let fill = match system.status.as_str() {
-                    "home" => Color32::from_rgb(20, 89, 82),
-                    "hostile" => Color32::from_rgb(92, 31, 43),
-                    "farmable" => Color32::from_rgb(37, 75, 42),
-                    "rolled" => Color32::from_rgb(45, 48, 56),
-                    _ => Color32::from_rgb(16, 41, 50),
-                };
-                painter.circle_filled(*pos, 38.0, fill);
-                let stroke = if system.id == self.selected_system_id {
-                    Stroke::new(4.0_f32, theme::character_text())
-                } else if is_drag_start {
-                    Stroke::new(4.0_f32, Color32::from_rgb(255, 194, 87))
-                } else if is_hovered {
-                    Stroke::new(4.0_f32, Color32::WHITE)
-                } else {
-                    Stroke::new(2.0_f32, theme::accent())
-                };
-                painter.circle_stroke(*pos, 38.0, stroke);
-                painter.text(
-                    *pos + Vec2::new(0.0, -6.0),
-                    Align2::CENTER_CENTER,
-                    &system.name,
-                    FontId::proportional(14.0),
-                    Color32::WHITE,
-                );
-                painter.text(
-                    *pos + Vec2::new(0.0, 12.0),
-                    Align2::CENTER_CENTER,
-                    Self::inferred_system_class(system),
-                    FontId::proportional(12.0),
-                    theme::muted_text(),
-                );
-            }
-        }
-
-        if let Some(start_system_id) = &self.chain_drag_start_system_id
-            && let (Some(start_pos), Some(pointer_pos)) = (
-                positions.get(start_system_id),
-                ui.ctx().input(|input| input.pointer.hover_pos()),
-            )
-        {
-            painter.line_segment(
-                [*start_pos, pointer_pos],
-                Stroke::new(3.0_f32, Color32::from_rgb(255, 194, 87)),
-            );
-        }
-
-        if let Some(pos) = pointer_pos {
-            if let Some(system_id) = &hovered_system_id {
-                if let Some(system) = self.system_by_id(system_id) {
-                    painter.text(
-                        pos + Vec2::new(14.0, 14.0),
-                        Align2::LEFT_TOP,
-                        format!("{} · right-click for actions", system.name),
-                        FontId::proportional(13.0),
-                        Color32::WHITE,
-                    );
-                }
-            } else if let Some(connection_id) = &hovered_connection_id
-                && let Some(connection) = self
-                    .data
-                    .connections
-                    .iter()
-                    .find(|connection| connection.id == *connection_id)
-            {
-                painter.text(
-                    pos + Vec2::new(14.0, 14.0),
-                    Align2::LEFT_TOP,
-                    format!(
-                        "{} ↔ {} · right-click for actions",
-                        self.system_name(&connection.from_system),
-                        self.system_name(&connection.to_system)
-                    ),
-                    FontId::proportional(13.0),
-                    Color32::WHITE,
-                );
-            }
-        }
-
-        if response.clicked()
-            && let Some(pointer_pos) = response.interact_pointer_pos()
-            && let Some(system_id) = self.chain_system_at(&positions, pointer_pos)
-        {
-            self.selected_system_id = system_id;
-        }
-
-        if response.drag_started()
-            && let Some(pointer_pos) = response.interact_pointer_pos()
-        {
-            self.chain_drag_start_system_id = self.chain_system_at(&positions, pointer_pos);
-        }
-
-        if response.drag_stopped() {
-            let start_system_id = self.chain_drag_start_system_id.take();
-            if let Some(from_system_id) = start_system_id
-                && let Some(pointer_pos) = response.interact_pointer_pos()
-            {
-                if let Some(to_system_id) = self.chain_system_at(&positions, pointer_pos) {
-                    self.create_manual_connection(&from_system_id, &to_system_id);
-                } else {
-                    self.status = "Drop on another system to make a connection".to_owned();
-                }
-            }
-        }
-
-        if response.secondary_clicked()
-            && let Some(pointer_pos) = response.interact_pointer_pos()
-        {
-            self.chain_context_target = self
-                .chain_system_at(&positions, pointer_pos)
-                .map(ChainMapTarget::System)
-                .or_else(|| {
-                    self.chain_connection_at(&positions, pointer_pos)
-                        .map(ChainMapTarget::Connection)
-                })
-                .or(Some(ChainMapTarget::Map));
-        }
-
-        let menu_target = self
-            .chain_context_target
-            .clone()
-            .unwrap_or(ChainMapTarget::Map);
-        let mut select_system_id = None;
-        let mut delete_system_id = None;
-        let mut delete_connection_id = None;
-        let mut clear_chain = false;
-        response.context_menu(|ui| match &menu_target {
-            ChainMapTarget::System(system_id) => {
-                let system_name = self.system_name(system_id);
-                ui.label(egui::RichText::new(&system_name).color(theme::system_text()));
-                if ui.button("Select system").clicked() {
-                    select_system_id = Some(system_id.clone());
-                    ui.close();
-                }
-                if ui.button("Delete system").clicked() {
-                    delete_system_id = Some(system_id.clone());
-                    ui.close();
-                }
-            }
-            ChainMapTarget::Connection(connection_id) => {
-                if let Some(connection) = self
-                    .data
-                    .connections
-                    .iter()
-                    .find(|connection| connection.id == *connection_id)
-                {
-                    ui.label(format!(
-                        "{} ↔ {}",
-                        self.system_name(&connection.from_system),
-                        self.system_name(&connection.to_system)
-                    ));
-                    if !connection.notes.is_empty() {
-                        ui.label(egui::RichText::new(&connection.notes).color(theme::muted_text()));
-                    }
-                } else {
-                    ui.label("Connection");
-                }
-                if ui.button("Delete connection").clicked() {
-                    delete_connection_id = Some(connection_id.clone());
-                    ui.close();
-                }
-            }
-            ChainMapTarget::Map => {
-                ui.label("Chain map");
-                if ui.button("Clear current chain").clicked() {
-                    clear_chain = true;
-                    ui.close();
-                }
-            }
-        });
-
-        if let Some(system_id) = select_system_id {
-            self.selected_system_id = system_id;
-        }
-        if let Some(connection_id) = delete_connection_id {
-            self.delete_connection(&connection_id);
-        }
-        if let Some(system_id) = delete_system_id {
-            self.delete_system(&system_id);
-        }
-        if clear_chain {
-            self.clear_chain();
-        }
-    }
-
-    fn chain_system_at(
-        &self,
-        positions: &HashMap<String, Pos2>,
-        pointer_pos: Pos2,
-    ) -> Option<String> {
-        self.data
-            .systems
-            .iter()
-            .find(|system| {
-                positions
-                    .get(&system.id)
-                    .is_some_and(|pos| pos.distance(pointer_pos) <= 38.0)
-            })
-            .map(|system| system.id.clone())
-    }
-
-    fn chain_connection_at(
-        &self,
-        positions: &HashMap<String, Pos2>,
-        pointer_pos: Pos2,
-    ) -> Option<String> {
-        self.data
-            .connections
-            .iter()
-            .filter_map(|connection| {
-                let a = positions.get(&connection.from_system)?;
-                let b = positions.get(&connection.to_system)?;
-                let distance = Self::distance_to_segment(pointer_pos, *a, *b);
-                (distance <= 8.0).then_some((connection.id.clone(), distance))
-            })
-            .min_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(id, _)| id)
-    }
-
-    fn distance_to_segment(point: Pos2, a: Pos2, b: Pos2) -> f32 {
-        let ab = b - a;
-        let length_squared = ab.length_sq();
-        if length_squared <= f32::EPSILON {
-            return point.distance(a);
-        }
-
-        let ap = point - a;
-        let t = (ap.dot(ab) / length_squared).clamp(0.0, 1.0);
-        point.distance(a + ab * t)
-    }
-
-    fn chain_positions(&self, rect: egui::Rect) -> HashMap<String, Pos2> {
-        let mut positions = HashMap::<String, Pos2>::new();
-        if self.data.systems.is_empty() {
-            return positions;
-        }
-
-        let node_margin = 54.0;
-        let inner = rect.shrink(node_margin);
-        let system_order = self
-            .data
-            .systems
-            .iter()
-            .enumerate()
-            .map(|(index, system)| (system.id.clone(), index))
-            .collect::<HashMap<_, _>>();
-        let system_ids = self
-            .data
-            .systems
-            .iter()
-            .map(|system| system.id.clone())
-            .collect::<HashSet<_>>();
-        let mut adjacency = self
-            .data
-            .systems
-            .iter()
-            .map(|system| (system.id.clone(), Vec::<String>::new()))
-            .collect::<HashMap<_, _>>();
-
-        for connection in &self.data.connections {
-            if connection.from_system == connection.to_system
-                || !system_ids.contains(&connection.from_system)
-                || !system_ids.contains(&connection.to_system)
-            {
-                continue;
-            }
-
-            if let Some(neighbors) = adjacency.get_mut(&connection.from_system) {
-                neighbors.push(connection.to_system.clone());
-            }
-            if let Some(neighbors) = adjacency.get_mut(&connection.to_system) {
-                neighbors.push(connection.from_system.clone());
-            }
-        }
-
-        for neighbors in adjacency.values_mut() {
-            neighbors.sort_by_key(|id| system_order.get(id).copied().unwrap_or(usize::MAX));
-            neighbors.dedup();
-        }
-
-        let mut visited = HashSet::<String>::new();
-        let mut components = Vec::<Vec<Vec<String>>>::new();
-        while visited.len() < self.data.systems.len() {
-            let Some(root) = self
-                .data
-                .systems
-                .iter()
-                .filter(|system| !visited.contains(&system.id))
-                .max_by_key(|system| {
-                    (
-                        adjacency.get(&system.id).map_or(0, Vec::len),
-                        std::cmp::Reverse(system_order.get(&system.id).copied().unwrap_or(0)),
-                    )
-                })
-                .map(|system| system.id.clone())
-            else {
-                break;
-            };
-
-            let mut levels = Vec::<Vec<String>>::new();
-            let mut queue = VecDeque::from([(root.clone(), 0_usize)]);
-            visited.insert(root);
-
-            while let Some((system_id, depth)) = queue.pop_front() {
-                if levels.len() <= depth {
-                    levels.push(Vec::new());
-                }
-                levels[depth].push(system_id.clone());
-
-                for neighbor in adjacency.get(&system_id).into_iter().flatten() {
-                    if visited.insert(neighbor.clone()) {
-                        queue.push_back((neighbor.clone(), depth + 1));
-                    }
-                }
-            }
-
-            components.push(levels);
-        }
-
-        let max_depth = components.iter().map(Vec::len).max().unwrap_or(1).max(1);
-        let component_gap = usize::from(components.len() > 1);
-        let total_slots = components
-            .iter()
-            .map(|levels| levels.iter().map(Vec::len).max().unwrap_or(1).max(1))
-            .sum::<usize>()
-            + component_gap * components.len().saturating_sub(1);
-
-        let mut slot_cursor = 0_usize;
-        for levels in components {
-            let component_slots = levels.iter().map(Vec::len).max().unwrap_or(1).max(1);
-            for (depth, nodes) in levels.iter().enumerate() {
-                let x = if max_depth == 1 {
-                    inner.center().x
-                } else {
-                    inner.left() + inner.width() * depth as f32 / (max_depth - 1) as f32
-                };
-                let level_offset = (component_slots.saturating_sub(nodes.len())) as f32 / 2.0;
-
-                for (index, system_id) in nodes.iter().enumerate() {
-                    let slot = slot_cursor as f32 + level_offset + index as f32;
-                    let y = if total_slots <= 1 {
-                        inner.center().y
-                    } else {
-                        inner.top() + inner.height() * (slot + 0.5) / total_slots as f32
-                    };
-                    positions.insert(system_id.clone(), Pos2::new(x, y));
-                }
-            }
-            slot_cursor += component_slots + component_gap;
-        }
-
-        positions
     }
 
     fn selected_system_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -2954,6 +2665,8 @@ impl NomadeerApp {
                 self.delete_system(&system_id);
             }
         });
+        record_frame(ui, |ui| self.signatures_section(ui, &system_id));
+        record_frame(ui, |ui| self.live_intel_section(ui, &system_id));
     }
 
     /// What is under way for a system's intel: its killboard refresh and, with
@@ -3347,7 +3060,7 @@ impl NomadeerApp {
                         assessment.activity_score,
                         local_intel::score_label(assessment.activity_score)
                     ),
-                    format!("{} confidence", assessment.confidence),
+                    local_intel::confidence_label(&assessment.confidence),
                 ] {
                     ui.label(egui::RichText::new(text).color(score_color));
                 }
@@ -3829,52 +3542,6 @@ impl NomadeerApp {
             });
         }
     }
-
-    fn inferred_connections(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Inferred connections");
-        let mut connections = self.data.connections.clone();
-        connections.sort_by_key(|connection| std::cmp::Reverse(connection.created_at));
-
-        if connections.is_empty() {
-            ui.label("No movement-derived connections yet.");
-            return;
-        }
-
-        let mut delete_id = None;
-        for connection in connections.into_iter().take(12) {
-            record_frame(ui, |ui| {
-                let from_system = self.system_by_id(&connection.from_system);
-                let to_system = self.system_by_id(&connection.to_system);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(self.system_name(&connection.from_system))
-                            .color(theme::system_text()),
-                    );
-                    ui.label(egui::RichText::new("→").color(theme::muted_text()));
-                    ui.label(
-                        egui::RichText::new(self.system_name(&connection.to_system))
-                            .color(theme::system_text()),
-                    );
-                });
-                if let Some(system) = from_system {
-                    ui.label(self.system_intel_summary(system));
-                }
-                if let Some(system) = to_system {
-                    ui.label(self.system_intel_summary(system));
-                }
-                if !connection.notes.is_empty() {
-                    ui.label(&connection.notes);
-                }
-                if ui.small_button("Delete connection").clicked() {
-                    delete_id = Some(connection.id.clone());
-                }
-            });
-        }
-
-        if let Some(id) = delete_id {
-            self.delete_connection(&id);
-        }
-    }
 }
 
 impl eframe::App for NomadeerApp {
@@ -3884,13 +3551,16 @@ impl eframe::App for NomadeerApp {
         self.poll_traffic_tasks();
         self.poll_portrait_tasks(ctx);
         self.poll_local_intel_tasks();
+        self.poll_live_tasks();
         self.maybe_request_portraits();
         self.maybe_poll_online();
         self.maybe_auto_sync();
         self.maybe_poll_traffic();
         self.maybe_check_umbra_core();
         self.maybe_start_intel();
+        self.maybe_expire_live_intel();
         self.maybe_start_auto_briefing();
+        self.handle_paste(ctx);
         self.top_bar(ctx);
         self.esi_settings_window(ctx);
         self.local_intel_settings_window(ctx);
@@ -3961,6 +3631,7 @@ mod tests {
             owner: String::new(),
             notes: String::new(),
             created_at: 1,
+            map_position: None,
         }
     }
 

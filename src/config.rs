@@ -15,6 +15,11 @@ pub(crate) mod theme {
         Color32::from_rgb(126, 231, 135)
     }
 
+    /// Wormhole signatures and types, so they stand out from other sites.
+    pub(crate) fn wormhole() -> Color32 {
+        Color32::from_rgb(196, 160, 255)
+    }
+
     /// A character who is logged in.
     pub(crate) fn online() -> Color32 {
         Color32::from_rgb(110, 224, 160)
