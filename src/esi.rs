@@ -5,7 +5,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use std::time::Instant;
 use tiny_http::{Response, Server, StatusCode};
 use url::Url;
 
@@ -14,6 +17,13 @@ const TOKEN_URL: &str = "https://login.eveonline.com/v2/oauth/token";
 const VERIFY_URL: &str = "https://login.eveonline.com/oauth/verify";
 const ESI_BASE_URL: &str = "https://esi.evetech.net/latest";
 const USER_AGENT: &str = "Nomadeer/0.1 private wormhole mapper";
+const SYSTEM_INTEL_CACHE_TIME: Duration = Duration::from_secs(60 * 60);
+
+type TimedListCache<T> = OnceLock<Mutex<Option<(Instant, Vec<T>)>>>;
+
+static SYSTEM_INTEL_CACHE: OnceLock<Mutex<HashMap<u64, (Instant, SystemIntel)>>> = OnceLock::new();
+static SYSTEM_JUMPS_CACHE: TimedListCache<SystemJumpResponse> = OnceLock::new();
+static SYSTEM_KILLS_CACHE: TimedListCache<SystemKillResponse> = OnceLock::new();
 
 #[derive(Debug)]
 pub(crate) struct AccountAuthorization {
@@ -104,13 +114,13 @@ struct RegionResponse {
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SystemJumpResponse {
     system_id: u64,
     ship_jumps: u32,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct SystemKillResponse {
     system_id: u64,
     ship_kills: u32,
@@ -340,13 +350,21 @@ fn fetch_system(solar_system_id: u64) -> Result<SystemResponse, String> {
 }
 
 fn fetch_system_intel(solar_system_id: u64) -> Result<SystemIntel, String> {
+    let cache = SYSTEM_INTEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some((cached_at, intel)) = cache.get(&solar_system_id)
+        && cached_at.elapsed() < SYSTEM_INTEL_CACHE_TIME
+    {
+        return Ok(intel.clone());
+    }
+
     let system = fetch_system(solar_system_id)?;
     let constellation = fetch_constellation(system.constellation_id)?;
     let region = fetch_region(constellation.region_id)?;
     let jumps = fetch_system_jumps(solar_system_id).unwrap_or_default();
     let kills = fetch_system_kills(solar_system_id).unwrap_or_default();
 
-    Ok(SystemIntel {
+    let intel = SystemIntel {
         solar_system_id,
         name: system.name,
         security_class: system
@@ -373,7 +391,12 @@ fn fetch_system_intel(solar_system_id: u64) -> Result<SystemIntel, String> {
         ship_kills_1h: kills.ship_kills,
         pod_kills_1h: kills.pod_kills,
         npc_kills_1h: kills.npc_kills,
-    })
+    };
+
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(solar_system_id, (Instant::now(), intel.clone()));
+    }
+    Ok(intel)
 }
 
 fn fetch_constellation(constellation_id: u64) -> Result<ConstellationResponse, String> {
@@ -389,10 +412,25 @@ fn fetch_region(region_id: u64) -> Result<RegionResponse, String> {
 }
 
 fn fetch_system_jumps(solar_system_id: u64) -> Result<u32, String> {
-    let jumps: Vec<SystemJumpResponse> = get_json(
-        &format!("{ESI_BASE_URL}/universe/system_jumps/?datasource=tranquility"),
-        None,
-    )?;
+    let cache = SYSTEM_JUMPS_CACHE.get_or_init(|| Mutex::new(None));
+    let cached = cache.lock().ok().and_then(|cache| {
+        cache
+            .as_ref()
+            .filter(|(cached_at, _)| cached_at.elapsed() < SYSTEM_INTEL_CACHE_TIME)
+            .map(|(_, jumps)| jumps.clone())
+    });
+    let jumps = if let Some(jumps) = cached {
+        jumps
+    } else {
+        let jumps: Vec<SystemJumpResponse> = get_json(
+            &format!("{ESI_BASE_URL}/universe/system_jumps/?datasource=tranquility"),
+            None,
+        )?;
+        if let Ok(mut cache) = cache.lock() {
+            *cache = Some((Instant::now(), jumps.clone()));
+        }
+        jumps
+    };
     Ok(jumps
         .into_iter()
         .find(|jump| jump.system_id == solar_system_id)
@@ -401,10 +439,25 @@ fn fetch_system_jumps(solar_system_id: u64) -> Result<u32, String> {
 }
 
 fn fetch_system_kills(solar_system_id: u64) -> Result<SystemKillResponse, String> {
-    let kills: Vec<SystemKillResponse> = get_json(
-        &format!("{ESI_BASE_URL}/universe/system_kills/?datasource=tranquility"),
-        None,
-    )?;
+    let cache = SYSTEM_KILLS_CACHE.get_or_init(|| Mutex::new(None));
+    let cached = cache.lock().ok().and_then(|cache| {
+        cache
+            .as_ref()
+            .filter(|(cached_at, _)| cached_at.elapsed() < SYSTEM_INTEL_CACHE_TIME)
+            .map(|(_, kills)| kills.clone())
+    });
+    let kills = if let Some(kills) = cached {
+        kills
+    } else {
+        let kills: Vec<SystemKillResponse> = get_json(
+            &format!("{ESI_BASE_URL}/universe/system_kills/?datasource=tranquility"),
+            None,
+        )?;
+        if let Ok(mut cache) = cache.lock() {
+            *cache = Some((Instant::now(), kills.clone()));
+        }
+        kills
+    };
     Ok(kills
         .into_iter()
         .find(|kill| kill.system_id == solar_system_id)

@@ -1,7 +1,8 @@
 use crate::model::{
-    Account, AppData, Connection, EsiSettings, Note, Signature, SystemNode, VisitLog,
+    Account, AppData, CachedKillmail, Connection, EsiSettings, Note, Signature,
+    SystemActivitySnapshot, SystemAssessment, SystemNode, VisitLog,
 };
-use rusqlite::{Connection as SqliteConnection, params};
+use rusqlite::{Connection as SqliteConnection, params, types::Type};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -45,7 +46,10 @@ impl Store {
              DELETE FROM connections;
              DELETE FROM signatures;
              DELETE FROM visits;
-             DELETE FROM notes;",
+             DELETE FROM notes;
+             DELETE FROM system_activity_snapshots;
+             DELETE FROM cached_killmails;
+             DELETE FROM system_assessments;",
         )
         .map_err(|error| error.to_string())?;
 
@@ -205,6 +209,69 @@ impl Store {
             .map_err(|error| error.to_string())?;
         }
 
+        for snapshot in &data.activity_snapshots {
+            tx.execute(
+                "INSERT INTO system_activity_snapshots (
+                    system_id, captured_at, jumps_1h, ship_kills_1h, pod_kills_1h, npc_kills_1h
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    snapshot.system_id,
+                    snapshot.captured_at as i64,
+                    snapshot.jumps_1h as i64,
+                    snapshot.ship_kills_1h as i64,
+                    snapshot.pod_kills_1h as i64,
+                    snapshot.npc_kills_1h as i64,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
+        for kill in &data.cached_killmails {
+            let attacker_ids =
+                serde_json::to_string(&kill.attacker_ids).map_err(|error| error.to_string())?;
+            let corporation_ids =
+                serde_json::to_string(&kill.corporation_ids).map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO cached_killmails (
+                    killmail_id, solar_system_id, killmail_time, total_value, solo, npc,
+                    attacker_ids, corporation_ids
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    kill.killmail_id as i64,
+                    kill.solar_system_id as i64,
+                    kill.killmail_time as i64,
+                    kill.total_value,
+                    i64::from(kill.solo),
+                    i64::from(kill.npc),
+                    attacker_ids,
+                    corporation_ids,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
+        for assessment in &data.system_assessments {
+            let evidence =
+                serde_json::to_string(&assessment.evidence).map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO system_assessments (
+                    system_id, threat_score, activity_score, confidence, evidence, briefing,
+                    model_generated, generated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    assessment.system_id,
+                    assessment.threat_score as i64,
+                    assessment.activity_score as i64,
+                    assessment.confidence,
+                    evidence,
+                    assessment.briefing,
+                    i64::from(assessment.model_generated),
+                    assessment.generated_at as i64,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -311,16 +378,49 @@ impl Store {
                 notes TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS notes (
+              CREATE TABLE IF NOT EXISTS notes (
                 id TEXT PRIMARY KEY,
                 system_id TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL DEFAULT '',
                 body TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_signatures_system_id ON signatures(system_id);
-             CREATE INDEX IF NOT EXISTS idx_visits_system_id ON visits(system_id);
-             CREATE INDEX IF NOT EXISTS idx_notes_system_id ON notes(system_id);",
+                 created_at INTEGER NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS system_activity_snapshots (
+                 system_id TEXT NOT NULL,
+                 captured_at INTEGER NOT NULL,
+                 jumps_1h INTEGER NOT NULL DEFAULT 0,
+                 ship_kills_1h INTEGER NOT NULL DEFAULT 0,
+                 pod_kills_1h INTEGER NOT NULL DEFAULT 0,
+                 npc_kills_1h INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (system_id, captured_at)
+              );
+              CREATE TABLE IF NOT EXISTS cached_killmails (
+                 killmail_id INTEGER PRIMARY KEY,
+                 solar_system_id INTEGER NOT NULL,
+                 killmail_time INTEGER NOT NULL,
+                 total_value REAL NOT NULL DEFAULT 0,
+                 solo INTEGER NOT NULL DEFAULT 0,
+                 npc INTEGER NOT NULL DEFAULT 0,
+                 attacker_ids TEXT NOT NULL DEFAULT '[]',
+                 corporation_ids TEXT NOT NULL DEFAULT '[]'
+              );
+              CREATE TABLE IF NOT EXISTS system_assessments (
+                 system_id TEXT PRIMARY KEY,
+                 threat_score INTEGER NOT NULL,
+                 activity_score INTEGER NOT NULL,
+                 confidence TEXT NOT NULL,
+                 evidence TEXT NOT NULL DEFAULT '[]',
+                 briefing TEXT NOT NULL DEFAULT '',
+                 model_generated INTEGER NOT NULL DEFAULT 0,
+                 generated_at INTEGER NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS idx_signatures_system_id ON signatures(system_id);
+              CREATE INDEX IF NOT EXISTS idx_visits_system_id ON visits(system_id);
+              CREATE INDEX IF NOT EXISTS idx_notes_system_id ON notes(system_id);
+              CREATE INDEX IF NOT EXISTS idx_activity_system_time
+                 ON system_activity_snapshots(system_id, captured_at);
+              CREATE INDEX IF NOT EXISTS idx_killmails_system_time
+                 ON cached_killmails(solar_system_id, killmail_time);",
         )
         .map_err(|error| error.to_string())?;
 
@@ -434,6 +534,9 @@ impl Store {
             signatures: self.load_signatures(conn)?,
             visits: self.load_visits(conn)?,
             notes: self.load_notes(conn)?,
+            activity_snapshots: self.load_activity_snapshots(conn)?,
+            cached_killmails: self.load_cached_killmails(conn)?,
+            system_assessments: self.load_system_assessments(conn)?,
         })
     }
 
@@ -637,6 +740,107 @@ impl Store {
             .map_err(|error| error.to_string())
     }
 
+    fn load_activity_snapshots(
+        &self,
+        conn: &SqliteConnection,
+    ) -> Result<Vec<SystemActivitySnapshot>, String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT system_id, captured_at, jumps_1h, ship_kills_1h,
+                        pod_kills_1h, npc_kills_1h
+                 FROM system_activity_snapshots
+                 ORDER BY captured_at",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SystemActivitySnapshot {
+                    system_id: row.get(0)?,
+                    captured_at: row.get::<_, i64>(1)? as u64,
+                    jumps_1h: row.get::<_, i64>(2)? as u32,
+                    ship_kills_1h: row.get::<_, i64>(3)? as u32,
+                    pod_kills_1h: row.get::<_, i64>(4)? as u32,
+                    npc_kills_1h: row.get::<_, i64>(5)? as u32,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    fn load_cached_killmails(
+        &self,
+        conn: &SqliteConnection,
+    ) -> Result<Vec<CachedKillmail>, String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT killmail_id, solar_system_id, killmail_time, total_value, solo, npc,
+                        attacker_ids, corporation_ids
+                 FROM cached_killmails
+                 ORDER BY killmail_time DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                let attacker_ids_json = row.get::<_, String>(6)?;
+                let corporation_ids_json = row.get::<_, String>(7)?;
+                let attacker_ids = serde_json::from_str(&attacker_ids_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(error))
+                })?;
+                let corporation_ids =
+                    serde_json::from_str(&corporation_ids_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(7, Type::Text, Box::new(error))
+                    })?;
+                Ok(CachedKillmail {
+                    killmail_id: row.get::<_, i64>(0)? as u64,
+                    solar_system_id: row.get::<_, i64>(1)? as u64,
+                    killmail_time: row.get::<_, i64>(2)? as u64,
+                    total_value: row.get(3)?,
+                    solo: row.get::<_, i64>(4)? != 0,
+                    npc: row.get::<_, i64>(5)? != 0,
+                    attacker_ids,
+                    corporation_ids,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    fn load_system_assessments(
+        &self,
+        conn: &SqliteConnection,
+    ) -> Result<Vec<SystemAssessment>, String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT system_id, threat_score, activity_score, confidence, evidence,
+                        briefing, model_generated, generated_at
+                 FROM system_assessments
+                 ORDER BY generated_at DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                let evidence_json = row.get::<_, String>(4)?;
+                let evidence = serde_json::from_str(&evidence_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(error))
+                })?;
+                Ok(SystemAssessment {
+                    system_id: row.get(0)?,
+                    threat_score: row.get::<_, i64>(1)? as u8,
+                    activity_score: row.get::<_, i64>(2)? as u8,
+                    confidence: row.get(3)?,
+                    evidence,
+                    briefing: row.get(5)?,
+                    model_generated: row.get::<_, i64>(6)? != 0,
+                    generated_at: row.get::<_, i64>(7)? as u64,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     fn is_empty(&self, data: &AppData) -> bool {
         data.accounts.is_empty()
             && data.esi_settings.client_id.is_empty()
@@ -645,6 +849,9 @@ impl Store {
             && data.signatures.is_empty()
             && data.visits.is_empty()
             && data.notes.is_empty()
+            && data.activity_snapshots.is_empty()
+            && data.cached_killmails.is_empty()
+            && data.system_assessments.is_empty()
     }
 
     fn import_legacy_json(&self) -> Result<Option<AppData>, String> {

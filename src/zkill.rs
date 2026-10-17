@@ -1,3 +1,4 @@
+use crate::model::CachedKillmail;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -5,14 +6,34 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const USER_AGENT: &str = "Nomadeer/0.1 private wormhole mapper";
+const ZKILL_PAGE_SIZE: usize = 200;
+const MAX_ZKILL_PAGES: usize = 10;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ZkillReport {
     pub(crate) solar_system_id: u64,
     pub(crate) recent_kills: Vec<ZkillKill>,
+    pub(crate) history: ZkillHistory,
+    pub(crate) cached_killmails: Vec<CachedKillmail>,
     pub(crate) total_value: f64,
     pub(crate) solo_kills: usize,
     pub(crate) npc_kills: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ZkillHistory {
+    pub(crate) kills_1h: usize,
+    pub(crate) kills_4h: usize,
+    pub(crate) kills_8h: usize,
+    pub(crate) kills_24h: usize,
+    pub(crate) kills_7d: usize,
+    pub(crate) kills_current_hour_7d: usize,
+    pub(crate) solo_24h: usize,
+    pub(crate) npc_24h: usize,
+    pub(crate) isk_destroyed_24h: f64,
+    pub(crate) unique_attackers_24h: usize,
+    pub(crate) busiest_attacker_24h: usize,
+    pub(crate) busiest_corporation_24h: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -135,36 +156,36 @@ struct ApiName {
     name: String,
 }
 
-pub(crate) fn fetch_system_report(solar_system_id: u64) -> Result<ZkillReport, String> {
-    let url = format!("https://zkillboard.com/api/kills/solarSystemID/{solar_system_id}/");
+pub(crate) fn fetch_system_report(
+    solar_system_id: u64,
+    cached_killmails: Vec<CachedKillmail>,
+) -> Result<ZkillReport, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| format!("Could not start zKill request: {error}"))?;
-    let response = client
-        .get(url)
-        .header("User-Agent", USER_AGENT)
-        .send()
-        .map_err(|error| format!("Could not reach zKillboard: {error}"))?;
+    let oldest_cached = cached_killmails.iter().map(|kill| kill.killmail_time).min();
+    let mut kills = Vec::new();
+    for page in 1..=MAX_ZKILL_PAGES {
+        let page_kills = fetch_kill_page(&client, solar_system_id, page)?;
+        let page_len = page_kills.len();
+        let page_oldest = page_kills
+            .iter()
+            .filter_map(|kill| parse_killmail_time(&kill.killmail_time))
+            .min();
+        kills.extend(page_kills);
 
-    let status = response.status();
-    let body = response
-        .text()
-        .map_err(|error| format!("Could not read zKillboard response: {error}"))?;
-
-    if !status.is_success() {
-        return Err(format!("zKillboard returned {status}: {body}"));
+        let reached_cache = oldest_cached
+            .zip(page_oldest)
+            .is_some_and(|(cached, fetched)| fetched <= cached);
+        if page_len < ZKILL_PAGE_SIZE || reached_cache {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(150));
     }
 
-    let json = serde_json::from_str::<Value>(&body)
-        .map_err(|error| format!("Could not parse zKillboard response: {error}"))?;
-    if let Some(message) = json.get("error").and_then(Value::as_str) {
-        return Err(format!("zKillboard says: {message}"));
-    }
-
-    let kills = serde_json::from_value::<Vec<ApiKillmail>>(json)
-        .map_err(|error| format!("Could not read zKillboard kills: {error}"))?;
-
+    let cached_killmails = merge_cached_killmails(solar_system_id, cached_killmails, &kills);
+    let history = summarize_history(&cached_killmails);
     let kills = kills.into_iter().take(10).collect::<Vec<_>>();
     let names = fetch_eve_names(&client, zkill_name_ids(&kills)).unwrap_or_default();
 
@@ -237,10 +258,148 @@ pub(crate) fn fetch_system_report(solar_system_id: u64) -> Result<ZkillReport, S
     Ok(ZkillReport {
         solar_system_id,
         recent_kills,
+        history,
+        cached_killmails,
         total_value,
         solo_kills,
         npc_kills,
     })
+}
+
+fn fetch_kill_page(
+    client: &Client,
+    solar_system_id: u64,
+    page: usize,
+) -> Result<Vec<ApiKillmail>, String> {
+    let page_suffix = if page == 1 {
+        String::new()
+    } else {
+        format!("page/{page}/")
+    };
+    let url = format!(
+        "https://zkillboard.com/api/kills/solarSystemID/{solar_system_id}/pastSeconds/604800/{page_suffix}"
+    );
+    let response = client
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .map_err(|error| format!("Could not reach zKillboard: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| format!("Could not read zKillboard response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("zKillboard returned {status}: {body}"));
+    }
+
+    let json = serde_json::from_str::<Value>(&body)
+        .map_err(|error| format!("Could not parse zKillboard response: {error}"))?;
+    if let Some(message) = json.get("error").and_then(Value::as_str) {
+        return Err(format!("zKillboard says: {message}"));
+    }
+    serde_json::from_value::<Vec<ApiKillmail>>(json)
+        .map_err(|error| format!("Could not read zKillboard kills: {error}"))
+}
+
+fn merge_cached_killmails(
+    solar_system_id: u64,
+    cached_killmails: Vec<CachedKillmail>,
+    fetched_kills: &[ApiKillmail],
+) -> Vec<CachedKillmail> {
+    let cutoff = crate::util::now().saturating_sub(7 * 24 * 60 * 60);
+    let mut merged = cached_killmails
+        .into_iter()
+        .filter(|kill| kill.solar_system_id == solar_system_id && kill.killmail_time >= cutoff)
+        .map(|kill| (kill.killmail_id, kill))
+        .collect::<HashMap<_, _>>();
+
+    for kill in fetched_kills {
+        let Some(killmail_time) = parse_killmail_time(&kill.killmail_time) else {
+            continue;
+        };
+        let attacker_ids = kill
+            .attackers
+            .iter()
+            .filter_map(|attacker| attacker.character_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let corporation_ids = kill
+            .attackers
+            .iter()
+            .filter_map(|attacker| attacker.corporation_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let (total_value, solo, npc) = kill
+            .zkb
+            .as_ref()
+            .map(|zkb| (zkb.total_value, zkb.solo, zkb.npc))
+            .unwrap_or_default();
+        merged.insert(
+            kill.killmail_id,
+            CachedKillmail {
+                killmail_id: kill.killmail_id,
+                solar_system_id,
+                killmail_time,
+                total_value,
+                solo,
+                npc,
+                attacker_ids,
+                corporation_ids,
+            },
+        );
+    }
+
+    let mut kills = merged.into_values().collect::<Vec<_>>();
+    kills.sort_by_key(|kill| std::cmp::Reverse(kill.killmail_time));
+    kills
+}
+
+fn summarize_history(kills: &[CachedKillmail]) -> ZkillHistory {
+    let current_time = crate::util::now();
+    let current_utc_hour = current_time / 3_600 % 24;
+    let mut history = ZkillHistory::default();
+    let mut attackers = HashSet::new();
+    let mut attacker_kills = HashMap::<u64, usize>::new();
+    let mut corporation_kills = HashMap::<u64, usize>::new();
+
+    for kill in kills {
+        let age = current_time.saturating_sub(kill.killmail_time);
+        if age <= 7 * 24 * 60 * 60 {
+            history.kills_7d += 1;
+            if kill.killmail_time / 3_600 % 24 == current_utc_hour {
+                history.kills_current_hour_7d += 1;
+            }
+        }
+        if age <= 24 * 60 * 60 {
+            history.kills_24h += 1;
+            history.isk_destroyed_24h += kill.total_value;
+            history.solo_24h += usize::from(kill.solo);
+            history.npc_24h += usize::from(kill.npc);
+            for id in &kill.attacker_ids {
+                attackers.insert(*id);
+                *attacker_kills.entry(*id).or_default() += 1;
+            }
+            for id in &kill.corporation_ids {
+                *corporation_kills.entry(*id).or_default() += 1;
+            }
+        }
+        if age <= 8 * 60 * 60 {
+            history.kills_8h += 1;
+        }
+        if age <= 4 * 60 * 60 {
+            history.kills_4h += 1;
+        }
+        if age <= 60 * 60 {
+            history.kills_1h += 1;
+        }
+    }
+
+    history.unique_attackers_24h = attackers.len();
+    history.busiest_attacker_24h = attacker_kills.values().copied().max().unwrap_or(0);
+    history.busiest_corporation_24h = corporation_kills.values().copied().max().unwrap_or(0);
+    history
 }
 
 fn zkill_name_ids(kills: &[ApiKillmail]) -> Vec<u64> {
@@ -349,4 +508,36 @@ fn resolved_items(items: &[ApiItem], names: &HashMap<u64, String>) -> Vec<ZkillI
 
 fn resolved_name(id: Option<u64>, names: &HashMap<u64, String>) -> Option<String> {
     id.and_then(|id| names.get(&id).cloned())
+}
+
+fn parse_killmail_time(value: &str) -> Option<u64> {
+    if value.len() < 20 {
+        return None;
+    }
+
+    let year = value.get(0..4)?.parse::<i64>().ok()?;
+    let month = value.get(5..7)?.parse::<i64>().ok()?;
+    let day = value.get(8..10)?.parse::<i64>().ok()?;
+    let hour = value.get(11..13)?.parse::<i64>().ok()?;
+    let minute = value.get(14..16)?.parse::<i64>().ok()?;
+    let second = value.get(17..19)?.parse::<i64>().ok()?;
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let timestamp = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    u64::try_from(timestamp).ok()
 }

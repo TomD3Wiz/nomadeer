@@ -3,6 +3,7 @@ mod chain_archive;
 mod config;
 mod esi;
 mod forms;
+mod local_intel;
 mod model;
 mod portrait;
 mod store;

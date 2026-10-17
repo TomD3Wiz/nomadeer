@@ -1,7 +1,14 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Candle currently depends on zip 8.6 for optional NPZ/PyTorch readers. Nomadeer only
+# loads checksum-verified GGUF files and never calls zip extraction APIs, so these
+# extraction-only advisories are not reachable in the application.
+ignore = [
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
+]
 unmaintained = "none"
 
 [licenses]
