@@ -13,6 +13,15 @@
 ;
 ; Setup also accepts /EDITION=optimized or /EDITION=compatible to override
 ; the processor check.
+;
+; Nomadeer's Update button runs Setup as
+;   /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /SP-
+;   /CURRENTUSER or /ALLUSERS  /EDITION=<the running edition>
+;   /DIR=<the running install> /LOG=<temp>\nomadeer-updates\setup.log /RELAUNCH
+; after checking it against its .sha256 (see src/self_update.rs). /RELAUNCH
+; starts Nomadeer again once a silent install is done. Passing the running
+; edition keeps a compatible edition the player chose on a processor that
+; could run the optimized one; otherwise it is what the check would pick.
 
 #if Ver < EncodeVer(6, 3, 0)
   #error Inno Setup 6.3 or newer is required
@@ -94,6 +103,13 @@ Name: "{autodesktop}\Nomadeer"; Filename: "{app}\Nomadeer.exe"; WorkingDir: "{ap
 
 [Run]
 Filename: "{app}\Nomadeer.exe"; Description: "{cm:LaunchProgram,Nomadeer}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+; Updates from inside Nomadeer start it again once the new version is in.
+Filename: "{app}\Nomadeer.exe"; WorkingDir: "{app}"; Flags: nowait runasoriginaluser; Check: RelaunchAsPlayer
+; Nomadeer starts an all-users update through Windows' permission prompt, so
+; Setup itself is elevated and has no unelevated user to fall back on.
+; Explorer hands the start to the player's desktop, so Nomadeer does not run
+; with administrator rights.
+Filename: "{win}\explorer.exe"; Parameters: """{app}\Nomadeer.exe"""; Flags: nowait; Check: RelaunchThroughDesktop
 
 [Code]
 const
@@ -161,6 +177,33 @@ end;
 function UseOptimizedEdition(): Boolean;
 begin
   Result := OptimizedEdition;
+end;
+
+// /RELAUNCH comes from Nomadeer's Update button and only counts when silent;
+// a normal install offers to launch Nomadeer on its last page instead.
+function RelaunchRequested(): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if not WizardSilent() then
+    Exit;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/RELAUNCH') = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function RelaunchAsPlayer(): Boolean;
+begin
+  Result := RelaunchRequested() and not IsAdminInstallMode();
+end;
+
+function RelaunchThroughDesktop(): Boolean;
+begin
+  Result := RelaunchRequested() and IsAdminInstallMode();
 end;
 
 function EditionDescription(): String;

@@ -18,6 +18,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "Makefile"
+      - "tools/release.py"
   workflow_dispatch:
 
 # A newer push to the same pull request supersedes an older package build.
@@ -29,8 +30,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A release tag must name the version being built, and that version needs
+  # its metainfo <release> and CHANGELOG.md section (make bump VERSION=x.y.z
+  # adds both). Untagged runs check the files agree with Cargo.toml.
+  verify:
+    name: Check release version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check version, metainfo and changelog
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            python3 tools/release.py check --tag "${GITHUB_REF_NAME}"
+          else
+            python3 tools/release.py check
+          fi
+
   build:
     name: Build ${{ matrix.variant }}
+    needs: verify
     runs-on: ubuntu-latest
     # Built on Ubuntu 22.04 so the binaries, and the AppImage that bundles
     # them, run on glibc 2.35 or newer rather than the runner's own glibc.
@@ -128,18 +149,21 @@ jobs:
           pattern: linux-bin-*
           path: target/linux
 
-      # appimagetool needs file, and validates the desktop entry and metainfo
-      # when the other two are installed.
-      - name: Install validators
+      # appimagetool needs file, validates the desktop entry and metainfo
+      # when appstream and desktop-file-utils are installed, and writes the
+      # .zsync file AppImage updaters use with zsync's zsyncmake.
+      - name: Install packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y appstream desktop-file-utils file
+          sudo apt-get install -y appstream desktop-file-utils file zsync
 
       - name: Build AppImage
         id: package
         env:
           # Fail if a build needs a newer glibc than Ubuntu 22.04's.
           APPIMAGE_MAX_GLIBC: "2.35"
+          APPIMAGE_REQUIRE_ZSYNC: "1"
+          APPIMAGE_REQUIRE_APPSTREAM: "1"
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           packaging/linux/appimage/build-appimage.sh "${version}" \
@@ -198,6 +222,7 @@ jobs:
 
   windows-build:
     name: Build Windows ${{ matrix.variant }}
+    needs: verify
     runs-on: windows-latest
     strategy:
       matrix:
@@ -289,15 +314,20 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Creates a draft release to look over and publish by hand. Players, the
+  # in-app update check and AppImage updaters only see it once published.
   publish:
-    name: Publish GitHub release
-    needs: [build, appimage, flatpak, windows-package]
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Draft GitHub release
+    needs: [verify, build, appimage, flatpak, windows-package]
+    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -306,12 +336,24 @@ jobs:
           pattern: nomadeer-*
           merge-multiple: true
 
-      - name: Create release
+      # The in-app updater finds its download by these exact names.
+      - name: Check release files
+        run: python3 tools/release.py assets --check dist "${GITHUB_REF_NAME#v}"
+
+      - name: Write release notes
+        run: python3 tools/release.py notes --downloads "${GITHUB_REF_NAME#v}" > release-notes.md
+
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${GITHUB_REF_NAME}"
-          --repo "${GITHUB_REPOSITORY}"
-          --title "Nomadeer ${GITHUB_REF_NAME}"
-          --generate-notes
-          dist/*
+        run: |
+          prerelease=
+          case "${GITHUB_REF_NAME}" in *-*) prerelease=--prerelease ;; esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft \
+            --verify-tag \
+            ${prerelease} \
+            --title "Nomadeer ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            dist/*
