@@ -41,6 +41,19 @@ pub(crate) fn classify(text: &str) -> Paste {
     Paste::Unrecognised
 }
 
+/// Whether pasted names can be the local member list. That list always holds the
+/// pilot who copied it, so a lone name only counts when it is one of the player's
+/// characters: a single word copied from chat is not taken for local.
+pub(crate) fn could_be_local(names: &[String], own_characters: &[&str]) -> bool {
+    match names {
+        [] => false,
+        [name] => own_characters
+            .iter()
+            .any(|own| own.trim().eq_ignore_ascii_case(name.trim())),
+        _ => true,
+    }
+}
+
 /// Pilot names are 3 to 37 letters, digits, spaces, dashes, dots and apostrophes.
 fn is_pilot_name(line: &str) -> bool {
     let length = line.chars().count();
@@ -52,7 +65,7 @@ fn is_pilot_name(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Paste, classify};
+    use super::{Paste, classify, could_be_local};
 
     fn kind(text: &str) -> &'static str {
         match classify(text) {
@@ -127,5 +140,17 @@ mod tests {
             "unrecognised"
         );
         assert_eq!(kind("Pilot <url=showinfo:1377//123>"), "unrecognised");
+    }
+
+    #[test]
+    fn a_lone_name_is_local_only_when_it_is_yours() {
+        let names = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
+        let own = ["My Scout", "Other Alt"];
+        assert!(could_be_local(&names("Some Pilot\nMy Scout"), &own));
+        assert!(could_be_local(&names("Some Pilot\nAnother Pilot"), &own));
+        assert!(could_be_local(&names("my scout"), &own));
+        assert!(!could_be_local(&names("J123456"), &own));
+        assert!(!could_be_local(&names("Jita"), &[]));
+        assert!(!could_be_local(&[], &own));
     }
 }

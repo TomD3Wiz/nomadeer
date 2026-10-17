@@ -248,7 +248,7 @@ impl NomadeerApp {
                         format!("{name}: {}", mass.label().to_lowercase())
                     }
                     ConnectionAction::Reset => {
-                        wormhole::reset_state(connection);
+                        wormhole::reset_state(connection, current_time);
                         format!("{name}: mass and age reset")
                     }
                     ConnectionAction::SetType { system_id, code } => {

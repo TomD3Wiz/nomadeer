@@ -105,11 +105,13 @@ pub(crate) fn mark_eol(connection: &mut Connection, now: u64) {
     connection.life_status = LifeState::EndOfLife.as_str().to_owned();
 }
 
-/// Forgets its mass and age, e.g. after the player rolled it and found a new one.
-pub(crate) fn reset_state(connection: &mut Connection) {
+/// Forgets its mass and age, e.g. after the player rolled it and found a new one:
+/// its lifetime then counts from `now`, as for a hole just mapped.
+pub(crate) fn reset_state(connection: &mut Connection, now: u64) {
     connection.mass_status = MassState::Unknown.as_str().to_owned();
     connection.life_status = LifeState::Unknown.as_str().to_owned();
     connection.eol_marked_at = 0;
+    connection.created_at = now;
 }
 
 /// The wormhole's own type, on the side it spawned.
@@ -527,7 +529,7 @@ mod tests {
 
         set_mass(&mut connection, MassState::Critical);
         assert_eq!(mass(&connection), MassState::Critical);
-        reset_state(&mut connection);
+        reset_state(&mut connection, NOW);
         assert_eq!(mass(&connection), MassState::Unknown);
         assert_eq!(life(&connection), LifeState::Unknown);
         assert_eq!(connection.eol_marked_at, 0);
@@ -563,6 +565,14 @@ mod tests {
         // Unless the type's lifetime runs out first.
         connection.created_at = NOW - 22 * HOUR;
         assert_eq!(hours_left(&connection, NOW), Some(2));
+
+        // Rolled and found again, it has its whole lifetime ahead.
+        reset_state(&mut connection, NOW);
+        assert_eq!(hours_left(&connection, NOW), Some(24));
+        assert_eq!(
+            expiry_text(&connection, NOW + 23 * HOUR).as_deref(),
+            Some("at most ~1h left")
+        );
     }
 
     #[test]

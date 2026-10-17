@@ -15,7 +15,7 @@ pub(super) const ZOOM_STEP: f32 = 1.25;
 const MAX_FIT_ZOOM: f32 = 1.0;
 /// Pixels kept between the chain and the edge of the map when fitting.
 const FIT_MARGIN: f32 = 24.0;
-/// Pixels of the chain that panning always leaves on screen.
+/// Pixels of a system that panning always leaves on screen.
 const KEEP_VISIBLE: f32 = 48.0;
 /// Room around each system's centre for its art, its glow and the name beneath it,
 /// in map units.
@@ -25,7 +25,8 @@ const COLUMN_SPACING: f32 = 190.0;
 const ROW_SPACING: f32 = 110.0;
 /// Systems closer than this to one already placed are moved along.
 const MIN_SPACING: f32 = 2.0 * NODE_RADIUS + 12.0;
-/// The connector handle's radius, in pixels whatever the zoom.
+/// The connector handle's radius in pixels, unless the systems are drawn too small
+/// for it; see [`handle_radius`].
 pub(super) const HANDLE_RADIUS: f32 = 7.0;
 /// How near a connection the pointer must be to pick it, in pixels.
 pub(super) const CONNECTION_PICK_DISTANCE: f32 = 8.0;
@@ -90,9 +91,15 @@ impl Camera {
         }
     }
 
-    /// Pulls the view back until at least a little of `bounds` is on screen, so the
-    /// chain can never be panned out of sight.
+    /// Pulls the view back until at least a little of the chain is on screen, so it
+    /// can never be panned out of sight. `bounds` comes from [`chain_bounds`]; only
+    /// the systems themselves count, not the room left around them for names, which
+    /// would be all that showed at high zoom.
     pub(super) fn kept_in_view(self, view: Rect, bounds: Rect) -> Self {
+        let bounds = Rect::from_center_size(
+            bounds.center(),
+            (bounds.size() - Vec2::splat(2.0 * (NODE_EXTENT - NODE_RADIUS))).max(Vec2::ZERO),
+        );
         let slack = ((view.size() / 2.0 - Vec2::splat(KEEP_VISIBLE)) / self.zoom).max(Vec2::ZERO);
         let x = self
             .center
@@ -138,6 +145,19 @@ pub(super) fn connector_handle(system: Pos2) -> Pos2 {
     system + vec2(1.0, -1.0).normalized() * NODE_RADIUS
 }
 
+/// The connector handle's radius on screen: fixed, but shrinking with small systems
+/// so it never covers much of one.
+pub(super) fn handle_radius(zoom: f32) -> f32 {
+    HANDLE_RADIUS.min(0.3 * NODE_RADIUS * zoom)
+}
+
+/// How near its handle a press must be to pick it, in pixels: a little beyond the
+/// handle, but never more than a third of a system's radius, so that pressing on a
+/// small system moves it rather than drawing a connection out of it.
+fn handle_pick_radius(zoom: f32) -> f32 {
+    (handle_radius(zoom) + 2.0).min(0.35 * NODE_RADIUS * zoom)
+}
+
 /// The system under a map point; the one drawn last wins where two overlap.
 pub(super) fn system_at(
     systems: &[SystemNode],
@@ -155,8 +175,36 @@ pub(super) fn system_at(
         .map(|system| system.id.clone())
 }
 
+/// The system under the pointer, in screen pixels, and whether the pointer is on its
+/// connector handle. A system's own body comes before another's handle, so the
+/// handle shown on hover and the connection a drag then draws belong to one system.
+pub(super) fn target_at(
+    systems: &[SystemNode],
+    positions: &HashMap<String, Pos2>,
+    camera: Camera,
+    view: Rect,
+    pointer: Pos2,
+) -> Option<(String, bool)> {
+    match system_at(systems, positions, camera.to_map(view, pointer)) {
+        Some(system_id) => {
+            let on_handle = positions
+                .get(&system_id)
+                .is_some_and(|pos| on_handle(*pos, camera, view, pointer));
+            Some((system_id, on_handle))
+        }
+        None => handle_at(systems, positions, camera, view, pointer).map(|id| (id, true)),
+    }
+}
+
+fn on_handle(system: Pos2, camera: Camera, view: Rect, pointer: Pos2) -> bool {
+    camera
+        .to_screen(view, connector_handle(system))
+        .distance(pointer)
+        <= handle_pick_radius(camera.zoom)
+}
+
 /// The system whose connector handle is under the pointer, in screen pixels.
-pub(super) fn handle_at(
+fn handle_at(
     systems: &[SystemNode],
     positions: &HashMap<String, Pos2>,
     camera: Camera,
@@ -167,12 +215,9 @@ pub(super) fn handle_at(
         .iter()
         .rev()
         .find(|system| {
-            positions.get(&system.id).is_some_and(|pos| {
-                camera
-                    .to_screen(view, connector_handle(*pos))
-                    .distance(pointer)
-                    <= HANDLE_RADIUS + 2.0
-            })
+            positions
+                .get(&system.id)
+                .is_some_and(|pos| on_handle(*pos, camera, view, pointer))
         })
         .map(|system| system.id.clone())
 }
@@ -409,7 +454,7 @@ mod tests {
     use super::{
         COLUMN_SPACING, Camera, HANDLE_RADIUS, MAX_ZOOM, MIN_SPACING, MIN_ZOOM, NODE_RADIUS,
         chain_bounds, connection_at, connector_handle, detail_opacity, distance_to_segment,
-        handle_at, layout, name_opacity, system_at,
+        handle_at, handle_radius, layout, name_opacity, system_at, target_at,
     };
     use crate::model::{Connection, MapPosition, SystemNode};
     use eframe::egui::{Pos2, Rect, pos2, vec2};
@@ -567,6 +612,32 @@ mod tests {
             zoom: 0.8,
         };
         assert_eq!(fine.kept_in_view(view(), bounds), fine);
+
+        // Zoomed in, what stays on screen is part of a system, not the empty room
+        // around it.
+        let node = pos2(0.0, 0.0);
+        let bounds = chain_bounds([&node]).unwrap();
+        for (zoom, far) in [
+            (3.0, vec2(-1e5, 0.0)),
+            (2.0, vec2(0.0, 1e5)),
+            (0.25, vec2(1e5, 1e5)),
+        ] {
+            let camera = Camera {
+                center: node + far,
+                zoom,
+            }
+            .kept_in_view(view(), bounds);
+            let center = camera.to_screen(view(), node);
+            let nearest = pos2(
+                center.x.clamp(view().left(), view().right()),
+                center.y.clamp(view().top(), view().bottom()),
+            );
+            let inside = NODE_RADIUS * zoom - center.distance(nearest);
+            assert!(
+                inside >= 40.0_f32.min(NODE_RADIUS * zoom),
+                "{zoom}: {inside}"
+            );
+        }
     }
 
     #[test]
@@ -627,6 +698,74 @@ mod tests {
             );
         }
         assert!((connector_handle(Pos2::ZERO).distance(Pos2::ZERO) - NODE_RADIUS).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_hovered_system_and_the_handle_it_shows_are_the_one_a_drag_starts_from() {
+        // "a" is drawn over "b"'s handle.
+        let systems = vec![system("b"), system("a")];
+        let b_handle = connector_handle(pos2(0.0, 0.0));
+        let positions = HashMap::from([
+            ("b".to_owned(), pos2(0.0, 0.0)),
+            ("a".to_owned(), b_handle + vec2(20.0, 0.0)),
+        ]);
+        let camera = Camera::default();
+        let on_b_handle = camera.to_screen(view(), b_handle);
+        assert_eq!(
+            handle_at(&systems, &positions, camera, view(), on_b_handle).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            target_at(&systems, &positions, camera, view(), on_b_handle),
+            Some(("a".to_owned(), false))
+        );
+        let a_handle = camera.to_screen(view(), connector_handle(positions["a"]));
+        assert_eq!(
+            target_at(&systems, &positions, camera, view(), a_handle),
+            Some(("a".to_owned(), true))
+        );
+        // Just off "b"'s rim, the handle is still "b"'s.
+        let outside = camera.to_screen(view(), b_handle + vec2(4.0, -4.0));
+        assert_eq!(
+            target_at(&[system("b")], &positions, camera, view(), outside),
+            Some(("b".to_owned(), true))
+        );
+        assert_eq!(
+            target_at(&systems, &positions, camera, view(), pos2(0.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_small_system_is_mostly_body_not_handle() {
+        let systems = vec![system("a")];
+        let positions = HashMap::from([("a".to_owned(), pos2(0.0, 0.0))]);
+        for zoom in [MIN_ZOOM, 0.35, 0.5] {
+            let camera = Camera {
+                center: Pos2::ZERO,
+                zoom,
+            };
+            assert!(handle_radius(zoom) <= NODE_RADIUS * zoom * 0.3 + 1e-3);
+            let center = camera.to_screen(view(), pos2(0.0, 0.0));
+            let radius = NODE_RADIUS * zoom;
+            // Pressing between the centre and the rim moves it.
+            for offset in [
+                vec2(0.0, 0.0),
+                vec2(1.0, -1.0) * radius * 0.3,
+                vec2(radius * 0.6, 0.0),
+            ] {
+                assert_eq!(
+                    target_at(&systems, &positions, camera, view(), center + offset),
+                    Some(("a".to_owned(), false)),
+                    "{zoom} {offset:?}"
+                );
+            }
+            let handle = camera.to_screen(view(), connector_handle(pos2(0.0, 0.0)));
+            assert_eq!(
+                target_at(&systems, &positions, camera, view(), handle),
+                Some(("a".to_owned(), true))
+            );
+        }
     }
 
     #[test]

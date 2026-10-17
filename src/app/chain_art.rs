@@ -735,6 +735,13 @@ pub(super) fn paint_count_badge(painter: &Painter, center: Pos2, size: f32, coun
     );
 }
 
+/// A font for text that scales with the zoom, rounded to half a point. Each size
+/// egui sees is kept for the session, so smooth zooming must not make a new one
+/// every frame.
+pub(super) fn label_font(size: f32) -> FontId {
+    FontId::proportional(((size * 2.0).round() / 2.0).max(1.0))
+}
+
 /// Text with a dark shadow, so it reads over the art.
 pub(super) fn shadowed_text(
     painter: &Painter,
@@ -784,10 +791,11 @@ impl ConnectionStyle {
     }
 
     /// Thick and bright while stable, thinner and hotter as mass goes, broken into
-    /// dashes at end of life.
+    /// dashes at end of life. A hole nobody has checked is thinner and grey, so it is
+    /// never taken for a stable one.
     pub(super) fn stroke(&self) -> EdgeStroke {
         let (width, color) = match self.mass {
-            MassState::Unknown => (2.4, theme::accent().gamma_multiply(0.75)),
+            MassState::Unknown => (2.0, theme::muted_text().gamma_multiply(0.8)),
             MassState::Stable => (3.0, theme::accent()),
             MassState::Reduced => (2.2, Color32::from_rgb(255, 180, 70)),
             MassState::Critical => (1.6, Color32::from_rgb(255, 75, 95)),
@@ -864,7 +872,7 @@ pub(super) fn paint_connection(
     {
         let galley = painter.layout_no_wrap(
             label,
-            FontId::proportional(11.0 * text_scale),
+            label_font(11.0 * text_scale),
             Color32::WHITE.gamma_multiply(label_opacity),
         );
         let pill = Rect::from_center_size(a.lerp(b, 0.5), galley.size() + vec2(8.0, 4.0));
@@ -931,6 +939,10 @@ const LEGEND: &[(LegendIcon, &str)] = &[
         LegendIcon::wormhole(WormholeClass::Drifter(0)),
         "Drifter C14-18",
     ),
+    (
+        LegendIcon::wormhole(WormholeClass::Unclassified),
+        "Class not known",
+    ),
     (LegendIcon::Heading, "Known space"),
     (LegendIcon::known_space(SecurityBand::High), "High-sec"),
     (LegendIcon::known_space(SecurityBand::Low), "Low-sec"),
@@ -949,6 +961,10 @@ const LEGEND: &[(LegendIcon, &str)] = &[
     (LegendIcon::Badge(Faction::Concord), "CONCORD"),
     (LegendIcon::Badge(Faction::Ore), "Other NPCs"),
     (LegendIcon::Heading, "Connections"),
+    (
+        LegendIcon::edge(MassState::Unknown, false),
+        "Mass not checked",
+    ),
     (LegendIcon::edge(MassState::Stable, false), "Stable"),
     (LegendIcon::edge(MassState::Reduced, false), "Reduced"),
     (LegendIcon::edge(MassState::Critical, false), "Critical"),
@@ -1431,10 +1447,15 @@ mod tests {
         let critical = ConnectionStyle::of(&connection("Critical", ""), 0).stroke();
         assert!(style.stroke().width > reduced.width && reduced.width > critical.width);
         assert_ne!(reduced.color, critical.color);
-        assert_eq!(
-            ConnectionStyle::of(&connection("unknown", ""), 0).mass,
-            MassState::Unknown
-        );
+        let unknown = ConnectionStyle::of(&connection("unknown", ""), 0);
+        assert_eq!(unknown.mass, MassState::Unknown);
+        // A hole nobody checked does not pass for a stable one, and has a legend line.
+        assert!(unknown.stroke().width < style.stroke().width);
+        assert_ne!(unknown.stroke().color, style.stroke().color);
+        assert!(LEGEND.contains(&(
+            LegendIcon::edge(MassState::Unknown, false),
+            "Mass not checked"
+        )));
 
         let dying = ConnectionStyle::of(&connection("", "end_of_life"), 0);
         assert!(dying.end_of_life);
@@ -1582,6 +1603,14 @@ mod tests {
                 legend.paint(&painter, Rect::from_min_size(Pos2::ZERO, legend.size));
             }
         });
+    }
+
+    #[test]
+    fn zoomed_text_comes_in_a_few_sizes() {
+        assert_eq!(label_font(12.0 * 1.01), label_font(12.0 * 1.015));
+        assert_eq!(label_font(12.24).size, 12.0);
+        assert_eq!(label_font(12.3).size, 12.5);
+        assert!(label_font(0.0).size > 0.0);
     }
 
     #[test]
