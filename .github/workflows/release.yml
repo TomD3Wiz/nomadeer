@@ -19,7 +19,7 @@ jobs:
     strategy:
       matrix:
         include:
-          # AVX2/FMA build: Umbra briefings run about 3x faster.
+          # AVX2/FMA build: Umbra briefings run 2-3x faster.
           - variant: optimized
             rustflags: "-C target-cpu=x86-64-v3"
           # Baseline x86-64 build for CPUs without AVX2.
@@ -186,7 +186,7 @@ jobs:
         # without the Visual C++ Redistributable (VCRUNTIME140.dll). It must be
         # here: RUSTFLAGS replaces any rustflags from Cargo config.
         include:
-          # AVX2/FMA build: Umbra briefings run about 3x faster.
+          # AVX2/FMA build: Umbra briefings run 2-3x faster.
           - variant: optimized
             rustflags: "-C target-feature=+crt-static -C target-cpu=x86-64-v3"
           # Baseline x86-64 build for CPUs without AVX2.

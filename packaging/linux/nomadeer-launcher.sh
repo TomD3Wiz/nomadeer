@@ -2,7 +2,7 @@
 # Starts the Nomadeer build that suits this processor. The AppImage (as AppRun)
 # and the Flatpak install this as bin/nomadeer, with both builds next to it in
 # lib/nomadeer/:
-#   nomadeer-optimized   x86-64-v3 (AVX2/FMA); Umbra briefings run about 3x faster
+#   nomadeer-optimized   x86-64-v3 (AVX2/FMA); Umbra briefings run 2-3x faster
 #   nomadeer-compatible  baseline x86-64 for older processors
 # NOMADEER_EDITION=optimized|compatible skips the check.
 set -eu
