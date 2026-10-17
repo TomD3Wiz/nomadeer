@@ -67,7 +67,7 @@ Nomadeer embeds the local inference runtime but does not include model weights i
 data/models/
 ```
 
-The current model pack is Qwen2 1.5B Instruct Q4 from Hugging Face (Apache 2.0, approximately 938 MB). Downloads are SHA-256 verified. After installation, briefings run entirely on the local computer without an AI service or account. The model explains Nomadeer's calculated evidence; it does not determine the underlying threat or activity scores.
+The current model pack is Qwen2.5 1.5B Instruct Q4_K_M from Hugging Face (Apache 2.0, approximately 1.1 GB), pinned to a specific repository revision. Downloads are SHA-256 verified. After installation, briefings run entirely on the local computer without an AI service or account. The model explains Nomadeer's calculated evidence; it does not determine the underlying threat or activity scores.
 
 ## ESI setup
 

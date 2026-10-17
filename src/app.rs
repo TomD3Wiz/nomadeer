@@ -456,7 +456,7 @@ impl NomadeerApp {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.local_model_import_path)
-                            .hint_text("/path/to/qwen2-1_5b-instruct-q4_0.gguf"),
+                            .hint_text("/path/to/qwen2.5-1.5b-instruct-q4_k_m.gguf"),
                     );
                     if ui
                         .add_enabled(

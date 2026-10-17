@@ -11,18 +11,17 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
-pub(crate) const MODEL_NAME: &str = "Qwen2 1.5B Instruct (Q4)";
+pub(crate) const MODEL_NAME: &str = "Qwen2.5 1.5B Instruct (Q4_K_M)";
 pub(crate) const MODEL_LICENSE: &str = "Apache 2.0";
-pub(crate) const MODEL_DOWNLOAD_SIZE: u64 = 937_532_800;
-const MODEL_FILE: &str = "qwen2-1_5b-instruct-q4_0.gguf";
-const MODEL_URL: &str = "https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-GGUF/resolve/main/qwen2-1_5b-instruct-q4_0.gguf";
-const MODEL_SHA256: &str = "106c176ae807b164f16e2898e8f0267062e3c93c3c18c8267cf9e4ee90766beb";
+pub(crate) const MODEL_DOWNLOAD_SIZE: u64 = 1_117_320_736;
+const MODEL_FILE: &str = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
+const MODEL_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/91cad51170dc346986eccefdc2dd33a9da36ead9/qwen2.5-1.5b-instruct-q4_k_m.gguf";
+const MODEL_SHA256: &str = "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e";
 const TOKENIZER_FILE: &str = "tokenizer.json";
-const TOKENIZER_URL: &str =
-    "https://huggingface.co/Qwen/Qwen2-1.5B-Instruct/resolve/main/tokenizer.json";
-const TOKENIZER_SHA256: &str = "f7c9b2dba4a296b1aa76c16a34b8225c0c118978400d4bb66bff0902d702f5b8";
-const TOKENIZER_SIZE: u64 = 7_028_015;
-const MODEL_DIRECTORY: &str = "data/models/qwen2-1.5b-instruct-q4";
+const TOKENIZER_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/resolve/989aa7980e4cf806f80c7fef2b1adb7bc71aa306/tokenizer.json";
+const TOKENIZER_SHA256: &str = "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539";
+const TOKENIZER_SIZE: u64 = 7_031_645;
+const MODEL_DIRECTORY: &str = "data/models/qwen2.5-1.5b-instruct-q4_k_m";
 
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadProgress {
@@ -70,7 +69,7 @@ pub(crate) fn install_model(mut progress: impl FnMut(DownloadProgress)) -> Resul
 
 pub(crate) fn import_model(source: &Path) -> Result<(), String> {
     if !source.is_file() {
-        return Err("Choose the downloaded Qwen GGUF model file".to_owned());
+        return Err("Choose the downloaded Qwen2.5 GGUF model file".to_owned());
     }
     verify_file(source, MODEL_SHA256, MODEL_DOWNLOAD_SIZE)?;
     fs::create_dir_all(model_directory()).map_err(|error| error.to_string())?;
@@ -480,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "downloads the optional 938 MB model"]
+    #[ignore = "downloads the optional 1.1 GB model"]
     fn installed_model_generates_briefing() {
         install_model(|_| {}).expect("model should install");
         let assessment = SystemAssessment {
@@ -497,6 +496,7 @@ mod tests {
             generated_at: 1,
         };
         let briefing = generate_briefing(&assessment).expect("model should generate");
+        println!("{briefing}");
         assert!(!briefing.trim().is_empty());
     }
 }
