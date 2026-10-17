@@ -22,6 +22,7 @@ const TOKENIZER_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/r
 const TOKENIZER_SHA256: &str = "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539";
 const TOKENIZER_SIZE: u64 = 7_031_645;
 const MODEL_DIRECTORY: &str = "data/models/qwen2.5-1.5b-instruct-q4_k_m";
+const BRIEFING_MAX_TOKENS: usize = 120;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadProgress {
@@ -194,15 +195,28 @@ pub(crate) fn assess_system(
     .to_owned();
 
     let mut evidence = Vec::new();
-    evidence.push(format!(
-        "{} kills in 1h, {} in 4h, {} in 24h",
-        history.kills_1h, history.kills_4h, history.kills_24h
-    ));
-    evidence.push(format!("{} kills over the last 7 days", history.kills_7d));
+    evidence.push(if history.kills_24h == 0 {
+        "No kills in the last 24 hours".to_owned()
+    } else {
+        format!(
+            "{} in the last hour, {} in the last 4 hours and {} in the last 24 hours",
+            count_label(history.kills_1h, "kill"),
+            history.kills_4h,
+            history.kills_24h
+        )
+    });
+    evidence.push(if history.kills_7d == 0 {
+        "No kills in the last 7 days".to_owned()
+    } else {
+        format!(
+            "{} in the last 7 days",
+            count_label(history.kills_7d, "kill")
+        )
+    });
     if history.kills_current_hour_7d > 0 {
         evidence.push(format!(
-            "{} kills occurred during this EVE hour over the last 7 days",
-            history.kills_current_hour_7d
+            "{} at this time of day over the last 7 days",
+            count_label(history.kills_current_hour_7d, "kill")
         ));
     }
     if history.isk_destroyed_24h > 0.0 {
@@ -213,27 +227,29 @@ pub(crate) fn assess_system(
     }
     if history.busiest_attacker_24h > 1 {
         evidence.push(format!(
-            "Most active attacker appears on {} recent kills",
+            "The most active attacker was on {} kills in the last 24 hours",
             history.busiest_attacker_24h
         ));
     }
     if !is_wormhole {
         evidence.push(format!(
-            "{} jumps, {} ship kills and {} pod kills in the last ESI hour",
-            system.jumps_1h, system.ship_kills_1h, system.pod_kills_1h
+            "{}, {} and {} in the last hour",
+            count_label(system.jumps_1h as usize, "jump"),
+            count_label(system.ship_kills_1h as usize, "ship kill"),
+            count_label(system.pod_kills_1h as usize, "pod kill")
         ));
         if let Some(baseline) = baseline_jumps
             && baseline >= 1.0
         {
             let difference = (system.jumps_1h as f32 - baseline) / baseline * 100.0;
             evidence.push(format!(
-                "Traffic is {:.0}% {} the local recorded baseline",
+                "Traffic is {:.0}% {} its usual level",
                 difference.abs(),
                 if difference >= 0.0 { "above" } else { "below" }
             ));
             if same_hour_snapshots.len() >= 2 {
                 evidence.push(format!(
-                    "Traffic baseline uses {} previous samples from this EVE hour",
+                    "Usual traffic is based on {} earlier samples at this time of day",
                     same_hour_snapshots.len()
                 ));
             }
@@ -265,7 +281,8 @@ pub(crate) fn generate_briefing(assessment: &SystemAssessment) -> Result<String,
     let mut model =
         Qwen2::from_gguf(content, &mut file, &device).map_err(|error| error.to_string())?;
 
-    let prompt = briefing_prompt(assessment);
+    let reply_prefix = format!("Threat is {}", score_label(assessment.threat_score));
+    let prompt = format!("{}{reply_prefix}", briefing_prompt(assessment));
     let tokens = tokenizer
         .encode(prompt, true)
         .map_err(|error| error.to_string())?;
@@ -281,25 +298,24 @@ pub(crate) fn generate_briefing(assessment: &SystemAssessment) -> Result<String,
         .forward(&input, 0)
         .and_then(|logits| logits.squeeze(0))
         .map_err(|error| error.to_string())?;
-    let mut processor = LogitsProcessor::from_sampling(
-        assessment.generated_at,
-        Sampling::TopP {
-            p: 0.9,
-            temperature: 0.35,
-        },
-    );
+    // Greedy decoding keeps briefings reproducible and stops a small model from
+    // drifting away from the supplied facts.
+    let mut processor = LogitsProcessor::from_sampling(assessment.generated_at, Sampling::ArgMax);
     let mut next_token = processor
         .sample(&logits)
         .map_err(|error| error.to_string())?;
-    let eos_token = tokenizer
-        .get_vocab(true)
-        .get("<|im_end|>")
-        .copied()
-        .ok_or_else(|| "Local model tokenizer has no end token".to_owned())?;
+    let vocab = tokenizer.get_vocab(true);
+    let stop_tokens = ["<|im_end|>", "<|endoftext|>"]
+        .iter()
+        .filter_map(|token| vocab.get(*token).copied())
+        .collect::<Vec<_>>();
+    if stop_tokens.is_empty() {
+        return Err("Local model tokenizer has no end token".to_owned());
+    }
     let mut generated = Vec::new();
 
-    for index in 0..96 {
-        if next_token == eos_token {
+    for index in 0..BRIEFING_MAX_TOKENS {
+        if stop_tokens.contains(&next_token) {
             break;
         }
         generated.push(next_token);
@@ -315,25 +331,106 @@ pub(crate) fn generate_briefing(assessment: &SystemAssessment) -> Result<String,
             .map_err(|error| error.to_string())?;
     }
 
-    let briefing = tokenizer
+    let decoded = tokenizer
         .decode(&generated, true)
-        .map_err(|error| error.to_string())?
-        .trim()
-        .to_owned();
-    if briefing.is_empty() {
+        .map_err(|error| error.to_string())?;
+    let briefing = clean_briefing(&format!("{reply_prefix}{decoded}"));
+    if briefing == reply_prefix {
         return Err("Local model returned an empty briefing".to_owned());
     }
+    validate_briefing(&briefing, assessment)?;
     Ok(briefing)
 }
 
 fn briefing_prompt(assessment: &SystemAssessment) -> String {
+    let facts = fact_sheet(assessment);
     format!(
-        "<|im_start|>system\nYou are Nomadeer's EVE Online intelligence officer. Write exactly two concise sentences, no more than 65 words total. Use only the supplied facts. Do not invent pilots, motives, routes, or certainty. Describe immediate threat first, then activity and confidence. Return only the briefing.<|im_end|>\n<|im_start|>user\nThreat score: {}/100. Activity score: {}/100. Confidence: {}. Evidence: {}.<|im_end|>\n<|im_start|>assistant\n",
-        assessment.threat_score,
-        assessment.activity_score,
-        assessment.confidence,
-        assessment.evidence.join("; ")
+        "<|im_start|>system\n{BRIEFING_INSTRUCTIONS}<|im_end|>\n\
+         <|im_start|>user\n{facts}<|im_end|>\n\
+         <|im_start|>assistant\n"
     )
+}
+
+const BRIEFING_INSTRUCTIONS: &str = "You are a concise EVE Online intel officer. Turn the fact sheet into a two-sentence briefing for a pilot.
+- Sentence one: the Threat label and the kill evidence behind it, quoting its numbers.
+- Sentence two: the Activity label and the remaining evidence, quoting its numbers.
+- Use only the fact sheet. Never mention pilots, corporations, alliances, factions, fleets, ships, motives or routes unless the fact sheet names them.
+- Use the Threat and Activity labels exactly as written.
+- Copy numbers exactly as written and never add new ones.
+- Never call a system safe or free of threats; killboard data can be delayed or missing.
+- At most 60 words. Plain text only.";
+
+fn fact_sheet(assessment: &SystemAssessment) -> String {
+    let mut sheet = format!(
+        "Threat: {}\nActivity: {}\nEvidence:",
+        score_label(assessment.threat_score),
+        score_label(assessment.activity_score),
+    );
+    for fact in &assessment.evidence {
+        sheet.push_str("\n- ");
+        sheet.push_str(fact);
+    }
+    sheet
+}
+
+/// Keeps at most two complete sentences so a rambling or truncated generation
+/// still reads as a short briefing.
+fn clean_briefing(text: &str) -> String {
+    let text = text.trim().trim_matches('"').trim();
+    let mut end = None;
+    let mut sentences = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        let at_boundary = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        if matches!(character, '.' | '!' | '?') && at_boundary {
+            sentences += 1;
+            end = Some(index + character.len_utf8());
+            if sentences == 2 {
+                break;
+            }
+        }
+    }
+    match end {
+        Some(end) => text[..end].to_owned(),
+        None => text.to_owned(),
+    }
+}
+
+/// Rejects briefings that contradict the evidence: a small model can drop the
+/// activity label or invent numbers, and an evidence summary is safer than that.
+fn validate_briefing(briefing: &str, assessment: &SystemAssessment) -> Result<(), String> {
+    let activity_label = score_label(assessment.activity_score).to_lowercase();
+    if !briefing.to_lowercase().contains(&activity_label) {
+        return Err("Local model briefing left out the activity level".to_owned());
+    }
+
+    let facts = fact_sheet(assessment);
+    let known_numbers = numbers_in(&facts);
+    if let Some(number) = numbers_in(briefing)
+        .into_iter()
+        .find(|number| !known_numbers.contains(number))
+    {
+        return Err(format!(
+            "Local model briefing used {number}, which is not in the evidence"
+        ));
+    }
+    Ok(())
+}
+
+fn numbers_in(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_ascii_digit() && character != '.')
+        .map(|part| part.trim_matches('.'))
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn count_label(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
 
 fn template_briefing(threat: u8, activity: u8, evidence: &[String]) -> String {
@@ -467,8 +564,155 @@ fn format_isk(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_briefing, install_model, score_label};
+    use super::{
+        clean_briefing, fact_sheet, generate_briefing, install_model, is_model_installed,
+        numbers_in, score_label, validate_briefing,
+    };
     use crate::model::SystemAssessment;
+
+    fn test_assessment(
+        threat: u8,
+        activity: u8,
+        confidence: &str,
+        evidence: &[&str],
+    ) -> SystemAssessment {
+        SystemAssessment {
+            system_id: "test-system".to_owned(),
+            threat_score: threat,
+            activity_score: activity,
+            confidence: confidence.to_owned(),
+            evidence: evidence.iter().map(|fact| (*fact).to_owned()).collect(),
+            briefing: String::new(),
+            model_generated: false,
+            generated_at: 1,
+        }
+    }
+
+    #[test]
+    fn clean_briefing_keeps_two_sentences() {
+        assert_eq!(
+            clean_briefing(" \"Threat is Low. Activity is Quiet. Extra rambling.\" "),
+            "Threat is Low. Activity is Quiet."
+        );
+        assert_eq!(
+            clean_briefing("Threat is High with 1.2b ISK lost. Activity is Low."),
+            "Threat is High with 1.2b ISK lost. Activity is Low."
+        );
+        assert_eq!(clean_briefing("Threat is Low and"), "Threat is Low and");
+    }
+
+    #[test]
+    fn fact_sheet_includes_labels_and_evidence() {
+        let sheet = fact_sheet(&test_assessment(
+            68,
+            21,
+            "Medium",
+            &["1 kill in the last hour"],
+        ));
+        assert_eq!(
+            sheet,
+            "Threat: Elevated\nActivity: Low\nEvidence:\n- 1 kill in the last hour"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invented_numbers_and_missing_activity() {
+        let assessment = test_assessment(
+            68,
+            21,
+            "Medium",
+            &["1 kill in the last hour, 2 in the last 4 hours and 3 in the last 24 hours"],
+        );
+        assert!(
+            validate_briefing(
+                "Threat is Elevated, with 1 kill in the last hour and 3 in 24 hours. Activity is Low, with Medium confidence.",
+                &assessment
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_briefing(
+                "Threat is Elevated, with 5 kills in the last hour. Activity is Low.",
+                &assessment
+            )
+            .is_err()
+        );
+        assert!(validate_briefing("Threat is Elevated. Traffic is quiet.", &assessment).is_err());
+    }
+
+    #[test]
+    fn numbers_in_keeps_decimals_and_drops_punctuation() {
+        assert_eq!(
+            numbers_in("3.4b ISK, 42% and 2140 jumps."),
+            vec!["3.4", "42", "2140"]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the installed local model"]
+    fn installed_model_briefing_scenarios() {
+        assert!(is_model_installed(), "install the local model first");
+        let scenarios = [
+            test_assessment(
+                68,
+                21,
+                "Medium",
+                &[
+                    "1 kill in the last hour, 2 in the last 4 hours and 3 in the last 24 hours",
+                    "3 kills in the last 7 days",
+                    "Traffic is 42% below its usual level",
+                ],
+            ),
+            test_assessment(
+                4,
+                0,
+                "Low",
+                &[
+                    "No kills in the last 24 hours",
+                    "No kills in the last 7 days",
+                ],
+            ),
+            test_assessment(
+                92,
+                74,
+                "High",
+                &[
+                    "4 kills in the last hour, 9 in the last 4 hours and 15 in the last 24 hours",
+                    "41 kills in the last 7 days",
+                    "6 kills at this time of day over the last 7 days",
+                    "3.4b ISK destroyed in the last 24 hours",
+                    "The most active attacker was on 7 kills in the last 24 hours",
+                ],
+            ),
+            test_assessment(
+                35,
+                88,
+                "High",
+                &[
+                    "0 kills in the last hour, 1 in the last 4 hours and 6 in the last 24 hours",
+                    "52 kills in the last 7 days",
+                    "2140 jumps, 0 ship kills and 0 pod kills in the last hour",
+                    "Traffic is 18% above its usual level",
+                    "Usual traffic is based on 5 earlier samples at this time of day",
+                ],
+            ),
+        ];
+        let mut failures = 0;
+        for assessment in scenarios {
+            let started = std::time::Instant::now();
+            match generate_briefing(&assessment) {
+                Ok(briefing) => println!("[{:.1}s] {briefing}", started.elapsed().as_secs_f32()),
+                Err(error) => {
+                    failures += 1;
+                    println!(
+                        "[{:.1}s] REJECTED: {error}",
+                        started.elapsed().as_secs_f32()
+                    );
+                }
+            }
+        }
+        assert_eq!(failures, 0, "some briefings were rejected");
+    }
 
     #[test]
     fn score_labels_cover_ranges() {
@@ -488,8 +732,9 @@ mod tests {
             activity_score: 21,
             confidence: "Medium".to_owned(),
             evidence: vec![
-                "1 kill in 1h, 2 in 4h, 3 in 24h".to_owned(),
-                "Traffic is 42% below the local recorded baseline".to_owned(),
+                "1 kill in the last hour, 2 in the last 4 hours and 3 in the last 24 hours"
+                    .to_owned(),
+                "Traffic is 42% below its usual level".to_owned(),
             ],
             briefing: String::new(),
             model_generated: false,
