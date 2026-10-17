@@ -18,10 +18,14 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod layout;
 mod umbra;
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const WARNING_TEXT: Color32 = Color32::from_rgb(255, 194, 87);
+/// The tabs and Umbra scroll within whatever height is left under the chain map, but
+/// never less than this; below it the bottom is cut off instead.
+const MIN_DASHBOARD_PANES_HEIGHT: f32 = 140.0;
 const RECON_HINT: &str = "Nomadeer gathers intel and Umbra briefs wherever recon pilots arrive.";
 
 /// Traffic recent enough to show as describing a system now.
@@ -153,7 +157,6 @@ enum DashboardTab {
     Connections,
     Systems,
     Intel,
-    Umbra,
     Chain,
 }
 
@@ -205,7 +208,7 @@ pub(crate) struct NomadeerApp {
     umbra_needs_repair: bool,
     /// Checks run once per process on their own; after that the player asks for them.
     umbra_check_attempted: bool,
-    /// Her briefings, oldest first, as shown in her tab.
+    /// Her briefings, oldest first, as shown in her panel.
     umbra_feed: Vec<UmbraBriefing>,
     /// Her portrait once loaded; None inside when it could not be decoded.
     umbra_avatar: Option<Option<egui::TextureHandle>>,
@@ -332,6 +335,13 @@ impl NomadeerApp {
         match self.store.save(&self.data) {
             Ok(()) => self.status = "Saved".to_owned(),
             Err(error) => self.status = format!("Save failed: {error}"),
+        }
+    }
+
+    /// Saves without announcing it, for layout changes the player can already see.
+    fn save_quietly(&mut self) {
+        if let Err(error) = self.store.save(&self.data) {
+            self.status = format!("Save failed: {error}");
         }
     }
 
@@ -2268,23 +2278,119 @@ impl NomadeerApp {
             });
             self.chain_map(ui);
             ui.separator();
-            self.dashboard_tabs(ui);
-            ui.separator();
-            // Umbra's feed scrolls on its own so it can follow her newest briefing; her
-            // tab keeps its own outer scroll so the feed is never squeezed out.
-            if self.active_tab == DashboardTab::Umbra {
-                self.umbra_tab(ui);
-                return;
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| match self.active_tab {
+            self.dashboard_panes(ui);
+        });
+    }
+
+    /// The tabs on the left and Umbra on the right, under the chain map and down to
+    /// the bottom of the window; stacked when the window is too narrow for both.
+    fn dashboard_panes(&mut self, ui: &mut egui::Ui) {
+        let mut area = ui.available_rect_before_wrap();
+        area.set_height(area.height().max(MIN_DASHBOARD_PANES_HEIGHT));
+        let mut panes = layout::dashboard_panes(area, self.data.dashboard_layout.tabs_fraction);
+        if let Some(divider) = panes.divider
+            && self.dashboard_divider(ui, area, divider)
+        {
+            panes = layout::dashboard_panes(area, self.data.dashboard_layout.tabs_fraction);
+        }
+
+        let mut tabs_ui = Self::pane_ui(ui, "dashboard_tabs_pane", panes.tabs);
+        self.dashboard_tabs(&mut tabs_ui);
+        tabs_ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("dashboard_tab_content")
+            .auto_shrink([false, false])
+            .show(&mut tabs_ui, |ui| match self.active_tab {
                 DashboardTab::Movement => self.recent_movements(ui),
                 DashboardTab::Connections => self.inferred_connections(ui),
                 DashboardTab::Systems => self.systems_overview(ui),
                 DashboardTab::Intel => self.selected_system_intel(ui),
-                DashboardTab::Umbra => self.umbra_tab(ui),
                 DashboardTab::Chain => self.chain_management(ui),
             });
-        });
+
+        let mut umbra_ui = Self::pane_ui(ui, "umbra_pane", panes.umbra);
+        self.umbra_panel(&mut umbra_ui);
+
+        ui.advance_cursor_after_rect(area);
+    }
+
+    /// A child UI confined to one pane, so nothing it draws spills into the other.
+    fn pane_ui(ui: &mut egui::Ui, id: &str, rect: egui::Rect) -> egui::Ui {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(id)
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        child
+    }
+
+    /// The divider between the tabs and Umbra. Dragging moves it, a double-click puts it
+    /// back; the new split is saved when the player lets go. Returns whether it moved.
+    fn dashboard_divider(
+        &mut self,
+        ui: &mut egui::Ui,
+        area: egui::Rect,
+        divider: egui::Rect,
+    ) -> bool {
+        let response = ui
+            .interact(
+                divider,
+                ui.id().with("dashboard_divider"),
+                Sense::click_and_drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        if response.dragged() {
+            // Off the divider mid-drag, the cursor still shows what the drag does.
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        let mut moved = false;
+        if response.dragged()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let fraction = layout::fraction_at(pointer.x, area);
+            if fraction != self.data.dashboard_layout.tabs_fraction {
+                self.data.dashboard_layout.tabs_fraction = fraction;
+                moved = true;
+            }
+        }
+        if response.drag_stopped() {
+            self.save_quietly();
+        }
+        if response.double_clicked() {
+            self.data.dashboard_layout = DashboardLayout::default();
+            self.save_quietly();
+            moved = true;
+        }
+
+        let active = response.hovered() || response.dragged();
+        let color = if active {
+            theme::accent()
+        } else {
+            theme::panel_stroke()
+        };
+        let painter = ui.painter();
+        let center_x = divider.center().x;
+        painter.line_segment(
+            [
+                egui::pos2(center_x, divider.top() + 4.0),
+                egui::pos2(center_x, divider.bottom() - 4.0),
+            ],
+            Stroke::new(if active { 2.0_f32 } else { 1.0 }, color),
+        );
+        let grip = egui::Rect::from_center_size(divider.center(), Vec2::new(8.0, 26.0));
+        painter.rect_filled(grip, 4.0, theme::panel_background());
+        painter.rect_stroke(
+            grip,
+            4.0,
+            Stroke::new(1.0_f32, color),
+            egui::StrokeKind::Inside,
+        );
+        for dot in layout::grip_dots(divider) {
+            painter.circle_filled(dot, 1.5, color);
+        }
+        moved
     }
 
     fn chain_map(&mut self, ui: &mut egui::Ui) {
@@ -3068,12 +3174,6 @@ impl NomadeerApp {
                 self.active_tab = DashboardTab::Intel;
             }
             if ui
-                .selectable_label(self.active_tab == DashboardTab::Umbra, "Umbra")
-                .clicked()
-            {
-                self.active_tab = DashboardTab::Umbra;
-            }
-            if ui
                 .selectable_label(self.active_tab == DashboardTab::Chain, "Chain")
                 .clicked()
             {
@@ -3638,9 +3738,12 @@ impl NomadeerApp {
 
         record_frame(ui, |ui| {
             ui.heading("Save current chain");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Name");
-                ui.text_edit_singleline(&mut self.chain_snapshot_name);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.chain_snapshot_name)
+                        .desired_width(ui.available_width().min(220.0)),
+                );
                 if ui.button("Save chain").clicked() {
                     self.save_chain_snapshot();
                 }
