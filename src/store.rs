@@ -3,6 +3,7 @@ use crate::model::{
     Signature, SystemAssessment, SystemNode, SystemTrafficHistory, TrafficHour, TrafficReading,
     TrafficRows, TrafficSample, VisitLog,
 };
+use crate::paths;
 use crate::util::{DAY_SECS, hour_start, now};
 use rusqlite::{
     Connection as SqliteConnection, OptionalExtension, Row, TransactionBehavior, params,
@@ -25,6 +26,8 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub(crate) struct Store {
     path: PathBuf,
+    /// Folders searched for data left by older Nomadeer versions.
+    legacy_dirs: Arc<[PathBuf]>,
     schema_ready: Arc<AtomicBool>,
 }
 
@@ -32,8 +35,15 @@ impl Store {
     pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             path,
+            legacy_dirs: Arc::new([]),
             schema_ready: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Lets an empty database pick up data older versions kept in `legacy_dirs`.
+    pub(crate) fn with_legacy_dirs(mut self, legacy_dirs: Vec<PathBuf>) -> Self {
+        self.legacy_dirs = legacy_dirs.into();
+        self
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -621,16 +631,23 @@ impl Store {
     }
 
     fn copy_legacy_sqlite_if_needed(&self) -> Result<(), String> {
-        let legacy_path = PathBuf::from("data/eve_wanderer.sqlite3");
-        if self.path.exists() || self.path == legacy_path || !legacy_path.exists() {
+        if self.path.exists() {
             return Ok(());
         }
+        let Some(legacy_path) = self
+            .legacy_dirs
+            .iter()
+            .map(|dir| dir.join(paths::LEGACY_DATABASE_FILE))
+            .find(|path| *path != self.path && path.is_file())
+        else {
+            return Ok(());
+        };
 
         fs::copy(&legacy_path, &self.path).map_err(|error| error.to_string())?;
 
         for suffix in ["-wal", "-shm"] {
-            let legacy_sidecar = PathBuf::from(format!("{}{}", legacy_path.display(), suffix));
-            let new_sidecar = PathBuf::from(format!("{}{}", self.path.display(), suffix));
+            let legacy_sidecar = sidecar_path(&legacy_path, suffix);
+            let new_sidecar = sidecar_path(&self.path, suffix);
             if legacy_sidecar.exists() {
                 fs::copy(legacy_sidecar, new_sidecar).map_err(|error| error.to_string())?;
             }
@@ -1135,11 +1152,12 @@ impl Store {
     }
 
     fn import_legacy_json(&self) -> Result<Option<AppData>, String> {
-        for legacy_path in [
-            PathBuf::from("data/nomadeer.json"),
-            PathBuf::from("data/eve_wanderer.json"),
-        ] {
-            if legacy_path.exists() {
+        for dir in self.legacy_dirs.iter() {
+            for name in paths::LEGACY_JSON_FILES {
+                let legacy_path = dir.join(name);
+                if !legacy_path.is_file() {
+                    continue;
+                }
                 let text = fs::read_to_string(&legacy_path).map_err(|error| error.to_string())?;
                 let data =
                     serde_json::from_str::<AppData>(&text).map_err(|error| error.to_string())?;
@@ -1149,6 +1167,13 @@ impl Store {
 
         Ok(None)
     }
+}
+
+/// SQLite's `-wal`/`-shm` companion of `database`, without assuming a UTF-8 path.
+fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 fn traffic_kills(row: &Row<'_>, first_column: usize) -> rusqlite::Result<KillCounts> {
@@ -1202,6 +1227,78 @@ mod tests {
         fn drop(&mut self) {
             self.remove_files();
         }
+    }
+
+    /// A scratch folder standing in for data folders, removed afterwards.
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("nomadeer-store-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("test dir should be created");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn data_with_client_id(client_id: &str) -> AppData {
+        let mut data = AppData::default();
+        data.esi_settings.client_id = client_id.to_owned();
+        data
+    }
+
+    #[test]
+    fn a_new_database_copies_the_legacy_database_from_an_older_folder() {
+        let dir = TestDir::new("legacy-sqlite");
+        let data_dir = dir.path.join("data");
+        let old_dir = dir.path.join("old");
+        Store::new(old_dir.join("eve_wanderer.sqlite3"))
+            .save(&data_with_client_id("legacy"))
+            .unwrap();
+
+        let store = Store::new(data_dir.join("nomadeer.sqlite3"))
+            .with_legacy_dirs(vec![data_dir.clone(), old_dir.clone()]);
+        assert_eq!(store.load().unwrap().esi_settings.client_id, "legacy");
+        // The old copy is left for older versions.
+        assert!(old_dir.join("eve_wanderer.sqlite3").is_file());
+
+        // Once the database exists, the legacy one is no longer consulted.
+        store.save(&data_with_client_id("current")).unwrap();
+        let reopened =
+            Store::new(data_dir.join("nomadeer.sqlite3")).with_legacy_dirs(vec![data_dir, old_dir]);
+        assert_eq!(reopened.load().unwrap().esi_settings.client_id, "current");
+    }
+
+    #[test]
+    fn an_empty_database_imports_legacy_json_preferring_the_data_folder() {
+        let dir = TestDir::new("legacy-json");
+        let data_dir = dir.path.join("data");
+        let old_dir = dir.path.join("old");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let write = |path: PathBuf, client_id: &str| {
+            let json = serde_json::to_string(&data_with_client_id(client_id)).unwrap();
+            std::fs::write(path, json).unwrap();
+        };
+        write(old_dir.join("nomadeer.json"), "old-folder");
+        write(data_dir.join("eve_wanderer.json"), "data-folder");
+
+        let store = Store::new(data_dir.join("nomadeer.sqlite3"))
+            .with_legacy_dirs(vec![data_dir.clone(), old_dir.clone()]);
+        assert_eq!(store.load().unwrap().esi_settings.client_id, "data-folder");
+
+        // Without legacy folders nothing is imported.
+        let isolated = Store::new(old_dir.join("nomadeer.sqlite3"));
+        assert_eq!(isolated.load().unwrap().esi_settings.client_id, "");
     }
 
     fn jumps(hour: u64, rows: &[(u64, u32)]) -> TrafficHour {

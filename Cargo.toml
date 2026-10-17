@@ -23,6 +23,10 @@ url = "2"
 urlencoding = "2"
 webbrowser = "1"
 
+[build-dependencies]
+# Embeds the icon and version info into Windows executables; unused elsewhere.
+winresource = { version = "0.1", default-features = false }
+
 # Candle's tensor kernels are unusably slow without optimisation, so debug builds
 # still optimise dependencies while keeping Nomadeer's own code quick to rebuild.
 [profile.dev.package."*"]

@@ -1,5 +1,8 @@
+use std::io::ErrorKind;
+use std::path::Path;
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) fn clean(value: &str) -> String {
     value.trim().to_owned()
@@ -70,21 +73,43 @@ pub(crate) fn parse_http_date(value: &str) -> Option<u64> {
     Some(days * DAY_SECS + hour * HOUR_SECS + minute * 60 + second)
 }
 
+/// Moves `from` into place at `to`, replacing any file already there. On Windows a
+/// virus scanner or the search indexer can hold a just-written file open for a
+/// moment, so a refused move is retried briefly before giving up.
+pub(crate) fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let attempts = if cfg!(windows) { 20 } else { 1 };
+    let mut attempt = 1;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(error) if attempt < attempts && error.kind() == ErrorKind::PermissionDenied => {
+                std::thread::sleep(Duration::from_millis(100));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 pub(crate) fn open_url(url: &str) -> Result<(), String> {
     if webbrowser::open(url).is_ok() {
         return Ok(());
     }
 
-    let candidates: &[(&str, &[&str])] = &[
-        ("xdg-open", &[url]),
-        ("gio", &["open", url]),
-        ("flatpak-spawn", &["--host", "xdg-open", url]),
-        ("distrobox-host-exec", &["xdg-open", url]),
-    ];
+    // Desktop helpers for Linux setups the webbrowser crate misses, such as
+    // sandboxes. Windows and macOS have no such fallbacks.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let candidates: &[(&str, &[&str])] = &[
+            ("xdg-open", &[url]),
+            ("gio", &["open", url]),
+            ("flatpak-spawn", &["--host", "xdg-open", url]),
+            ("distrobox-host-exec", &["xdg-open", url]),
+        ];
 
-    for (program, args) in candidates {
-        if Command::new(program).args(*args).spawn().is_ok() {
-            return Ok(());
+        for (program, args) in candidates {
+            if Command::new(program).args(*args).spawn().is_ok() {
+                return Ok(());
+            }
         }
     }
 
@@ -95,7 +120,24 @@ pub(crate) fn open_url(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hour_start, parse_http_date};
+    use super::{hour_start, parse_http_date, replace_file};
+
+    #[test]
+    fn replace_file_overwrites_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("nomadeer-util-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (part, installed) = (dir.join("core.part"), dir.join("core.gguf"));
+        std::fs::write(&installed, b"old core").unwrap();
+        std::fs::write(&part, b"new core").unwrap();
+
+        replace_file(&part, &installed).unwrap();
+        assert_eq!(std::fs::read(&installed).unwrap(), b"new core");
+        assert!(!part.exists());
+        assert!(replace_file(&part, &installed).is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn parses_http_dates() {
