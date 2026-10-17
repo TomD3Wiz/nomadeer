@@ -266,7 +266,10 @@ pub(crate) struct NomadeerApp {
 }
 
 impl NomadeerApp {
-    pub(crate) fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // The theme palette is drawn for a dark background, so a light OS theme
+        // would leave text unreadable.
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
         let store = Store::new(paths::database_path()).with_legacy_dirs(paths::legacy_data_dirs());
         let (esi_tx, esi_rx) = mpsc::channel();
         let (zkill_tx, zkill_rx) = mpsc::channel();
