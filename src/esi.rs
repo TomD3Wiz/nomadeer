@@ -373,7 +373,7 @@ pub(crate) fn with_scope(scopes: &str, scope: &str) -> String {
 
 fn validate_settings(settings: &EsiSettings) -> Result<(), String> {
     if settings.client_id.trim().is_empty() {
-        return Err("Set your EVE application Client ID in ESI settings first".to_owned());
+        return Err("Set your EVE application Client ID in Settings first".to_owned());
     }
     if settings.callback_port == 0 {
         return Err("Callback port must be greater than zero".to_owned());

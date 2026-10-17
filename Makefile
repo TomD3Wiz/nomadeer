@@ -35,7 +35,7 @@ FLATPAK_DIST_DIR := $(DIST_DIR)/flatpak
 FLATPAK_BUILD_DIR := target/flatpak
 FLATPAK_IMAGE ?= ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
 
-.PHONY: build run release release-optimized release-compatible dist appimage flatpak windows-installer fmt fmt-check clippy test audit deny coverage qa clean
+.PHONY: build run release release-optimized release-compatible dist appimage flatpak windows-installer bump release-notes fmt fmt-check clippy test audit deny coverage qa clean
 
 build:
 	$(CARGO) build
@@ -64,8 +64,9 @@ dist: release
 		(cd $(DIST_DIR) && sha256sum $$name.tar.gz > $$name.tar.gz.sha256); \
 	done
 
-# Nomadeer-<version>-x86_64.AppImage. The binaries need the glibc of the
-# machine that built them; the release workflow builds on Ubuntu 22.04.
+# Nomadeer-<version>-x86_64.AppImage, plus the .zsync file AppImage updaters
+# use when zsyncmake (package zsync) is installed. The binaries need the glibc
+# of the machine that built them; the release workflow builds on Ubuntu 22.04.
 appimage: release
 	packaging/linux/appimage/build-appimage.sh $(VERSION) \
 		$(OPTIMIZED_TARGET_DIR)/release/nomadeer \
@@ -102,6 +103,17 @@ windows-installer:
 		'/DCompatibleExe=Z:\stage\nomadeer-compatible.exe' \
 		'/OZ:\dist' packaging/windows/nomadeer.iss
 	cd $(WINDOWS_DIST_DIR) && sha256sum Nomadeer-$(VERSION)-Setup.exe > Nomadeer-$(VERSION)-Setup.exe.sha256
+
+# Starts release x.y.z: moves CHANGELOG.md's Unreleased notes into a dated
+# section and sets the version in Cargo.toml, Cargo.lock and the metainfo.
+# Commit the result, then tag it vx.y.z to build a draft GitHub release.
+bump:
+	@test "$(origin VERSION)" = "command line" || { echo "usage: make bump VERSION=x.y.z" >&2; exit 2; }
+	CARGO=$(CARGO) python3 tools/release.py bump $(VERSION)
+
+# Prints a version's changelog section (default: the current version).
+release-notes:
+	@python3 tools/release.py notes $(VERSION)
 
 fmt:
 	$(CARGO) fmt
