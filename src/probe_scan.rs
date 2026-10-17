@@ -257,7 +257,7 @@ fn parse_signal(text: &str) -> Option<f32> {
 }
 
 /// "4.32 AU", "1,234 km", "12 345 м", "0,75 AE" and the like, in kilometres.
-fn parse_distance_km(text: &str) -> Option<f64> {
+pub(crate) fn parse_distance_km(text: &str) -> Option<f64> {
     let text = text.trim();
     let split = text
         .char_indices()

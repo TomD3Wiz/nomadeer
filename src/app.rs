@@ -3,6 +3,7 @@ use crate::chain_archive::{self, ChainSnapshot, ChainSnapshotMeta};
 use crate::config::theme;
 use crate::esi::{self, AccountAuthorization, LocationSync, ONLINE_SCOPE, OnlineSync, SystemIntel};
 use crate::forms::*;
+use crate::live_intel;
 use crate::local_intel::{self, BriefingEvent, BriefingWorker, CoreStatus, DownloadProgress};
 use crate::model::*;
 use crate::paths;
@@ -22,6 +23,7 @@ mod chain_art;
 mod chain_map;
 mod chain_view;
 mod layout;
+mod live;
 mod scan;
 mod umbra;
 mod wormholes;
@@ -52,6 +54,8 @@ enum ZkillTaskResult {
     Report {
         report: ZkillReport,
         traffic: SystemTrafficHistory,
+        /// The system's cached week of kills, for checking pasted local against.
+        killmails: Option<Vec<CachedKillmail>>,
         save_error: Option<String>,
     },
 }
@@ -202,8 +206,21 @@ pub(crate) struct NomadeerApp {
     online_poll_in_flight: Option<String>,
     auto_briefings: AutoBriefings,
     zkill_reports: HashMap<u64, ZkillReport>,
-    /// The latest traffic readings each killboard refresh found, by solar system ID.
+    /// The traffic each killboard refresh read, by solar system ID, for showing and
+    /// for re-assessing the system when live intel is pasted.
     refreshed_traffic: HashMap<u64, SystemTrafficHistory>,
+    /// Each system's cached week of kills, by solar system ID, for checking pasted
+    /// local against.
+    system_killmails: HashMap<u64, Vec<CachedKillmail>>,
+    /// The latest pasted local and d-scan of each system, by map system ID.
+    live_intel: HashMap<String, live_intel::SystemLiveIntel>,
+    /// Pastes being read: the system and what was pasted.
+    live_reading: Vec<(String, live::LiveKind)>,
+    live_tx: Sender<live::LiveTaskResult>,
+    live_rx: Receiver<live::LiveTaskResult>,
+    /// When the live intel in each system's assessment runs out, so it is
+    /// re-assessed without it.
+    live_expiry: HashMap<String, u64>,
     selected_zkill_kill: Option<ZkillKill>,
     system_assessments: HashMap<String, SystemAssessment>,
     umbra_task: Option<UmbraTask>,
@@ -249,6 +266,7 @@ impl NomadeerApp {
         let (portrait_tx, portrait_rx) = mpsc::channel();
         let (local_intel_tx, local_intel_rx) = mpsc::channel();
         let (traffic_tx, traffic_rx) = mpsc::channel();
+        let (live_tx, live_rx) = mpsc::channel();
         let mut app = Self {
             data: AppData::default(),
             store,
@@ -288,6 +306,12 @@ impl NomadeerApp {
             auto_briefings: AutoBriefings::default(),
             zkill_reports: HashMap::new(),
             refreshed_traffic: HashMap::new(),
+            system_killmails: HashMap::new(),
+            live_intel: HashMap::new(),
+            live_reading: Vec::new(),
+            live_tx,
+            live_rx,
+            live_expiry: HashMap::new(),
             selected_zkill_kill: None,
             system_assessments: HashMap::new(),
             umbra_task: None,
@@ -332,6 +356,7 @@ impl NomadeerApp {
                     .cloned()
                     .map(|assessment| (assessment.system_id.clone(), assessment))
                     .collect();
+                self.load_live_intel();
                 self.sync_esi_settings_form();
                 self.reconcile_selected_system();
                 self.refresh_chain_snapshots();
@@ -1303,9 +1328,16 @@ impl NomadeerApp {
                 save_error.get_or_insert(error);
                 SystemTrafficHistory::default()
             });
+        let killmails = store
+            .cached_killmails(
+                solar_system_id,
+                current_time.saturating_sub(KILLMAIL_RETENTION_SECS),
+            )
+            .ok();
         Ok(ZkillTaskResult::Report {
             report,
             traffic,
+            killmails,
             save_error,
         })
     }
@@ -1361,6 +1393,7 @@ impl NomadeerApp {
                 Ok(Ok(ZkillTaskResult::Report {
                     report,
                     traffic,
+                    killmails,
                     save_error,
                 })) => {
                     let background = self
@@ -1369,18 +1402,17 @@ impl NomadeerApp {
                         .is_some_and(|(_, request)| request == IntelRequest::Arrival);
                     self.intel_errors.remove(&report.solar_system_id);
                     let kill_count = report.history.kills_7d + report.history.npc_kills_7d;
+                    if let Some(killmails) = killmails {
+                        self.system_killmails
+                            .insert(report.solar_system_id, killmails);
+                    }
                     let assessment = self
                         .data
                         .systems
                         .iter()
                         .find(|system| system.solar_system_id == report.solar_system_id)
-                        .map(|system| {
-                            let mut assessment =
-                                local_intel::assess_system(system, &report, &traffic, now());
-                            // What the player marked on the chain is evidence too.
-                            assessment.evidence.extend(self.chain_facts_for(&system.id));
-                            assessment
-                        });
+                        .cloned()
+                        .map(|system| self.assess(&system, &report, &traffic, now()));
                     let mut save_error = save_error;
                     if let Some(mut assessment) = assessment {
                         if let Some(previous) = self.system_assessments.get(&assessment.system_id) {
@@ -1417,13 +1449,8 @@ impl NomadeerApp {
                     if let Some(status) = status {
                         self.status = status;
                     }
-                    self.refreshed_traffic.insert(
-                        report.solar_system_id,
-                        SystemTrafficHistory {
-                            samples: Vec::new(),
-                            ..traffic
-                        },
-                    );
+                    self.refreshed_traffic
+                        .insert(report.solar_system_id, traffic);
                     self.zkill_reports.insert(report.solar_system_id, report);
                 }
                 Ok(Err(error)) => {
@@ -2268,6 +2295,7 @@ impl NomadeerApp {
             .retain(|assessment| assessment.system_id != system_id);
         self.system_assessments.remove(system_id);
         self.zkill_reports.remove(&solar_system_id);
+        self.forget_live_intel(system_id);
         for account in &mut self.data.accounts {
             if account.last_system_id == system_id {
                 account.last_system_id.clear();
@@ -2626,6 +2654,7 @@ impl NomadeerApp {
             }
         });
         record_frame(ui, |ui| self.signatures_section(ui, &system_id));
+        record_frame(ui, |ui| self.live_intel_section(ui, &system_id));
     }
 
     /// What is under way for a system's intel: its killboard refresh and, with
@@ -3019,7 +3048,7 @@ impl NomadeerApp {
                         assessment.activity_score,
                         local_intel::score_label(assessment.activity_score)
                     ),
-                    format!("{} confidence", assessment.confidence),
+                    local_intel::confidence_label(&assessment.confidence),
                 ] {
                     ui.label(egui::RichText::new(text).color(score_color));
                 }
@@ -3510,12 +3539,14 @@ impl eframe::App for NomadeerApp {
         self.poll_traffic_tasks();
         self.poll_portrait_tasks(ctx);
         self.poll_local_intel_tasks();
+        self.poll_live_tasks();
         self.maybe_request_portraits();
         self.maybe_poll_online();
         self.maybe_auto_sync();
         self.maybe_poll_traffic();
         self.maybe_check_umbra_core();
         self.maybe_start_intel();
+        self.maybe_expire_live_intel();
         self.maybe_start_auto_briefing();
         self.handle_paste(ctx);
         self.top_bar(ctx);

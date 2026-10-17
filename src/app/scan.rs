@@ -1,6 +1,6 @@
-//! Pasting from the game: Ctrl+V anywhere outside a text field, or the Paste scan
-//! button, reads the clipboard and applies it to the selected system. Probe scans
-//! update its signatures, which the sidebar lists.
+//! Pasting from the game: Ctrl+V anywhere outside a text field, or a Paste button,
+//! reads the clipboard and applies it to the selected system. Probe scans update its
+//! signatures, which the sidebar lists; local and d-scans are read in `live`.
 
 use super::wormholes::{ConnectionAction, SignatureAction, state_color, wormhole_type_picker};
 use super::{NomadeerApp, WARNING_TEXT};
@@ -49,15 +49,15 @@ impl NomadeerApp {
             }
             _ if self.paste_requested.is_some() && !requested => {
                 self.paste_requested = None;
-                self.status =
-                    "Nothing to paste. Copy the rows from the probe scanner first".to_owned();
+                self.status = "Nothing to paste. Copy the probe scanner, local or the d-scan first"
+                    .to_owned();
             }
             _ => {}
         }
     }
 
     /// Reads the clipboard on the next frame, as Ctrl+V would.
-    fn request_paste(&mut self, ctx: &egui::Context) {
+    pub(super) fn request_paste(&mut self, ctx: &egui::Context) {
         self.paste_requested = Some(Instant::now());
         ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
         ctx.request_repaint();
@@ -69,27 +69,11 @@ impl NomadeerApp {
         match paste::classify(text) {
             Paste::ProbeScan(scan) => self.apply_probe_scan(&scan),
             Paste::Local(pilots) => self.apply_local_paste(&pilots),
-            Paste::DirectionalScan(rows) => self.apply_directional_scan(&rows),
+            Paste::DirectionalScan(rows) => self.apply_directional_scan(rows),
             Paste::Unrecognised => {
                 self.status = "That paste is not a probe scan, local list or d-scan".to_owned();
             }
         }
-    }
-
-    /// Local member lists are recognised but not read yet.
-    fn apply_local_paste(&mut self, pilots: &[String]) {
-        self.status = format!(
-            "That looks like local ({} pilots); Nomadeer cannot read local yet",
-            pilots.len()
-        );
-    }
-
-    /// Directional scans are recognised but not read yet.
-    fn apply_directional_scan(&mut self, rows: &[String]) {
-        self.status = format!(
-            "That looks like a d-scan ({} results); Nomadeer cannot read d-scans yet",
-            rows.len()
-        );
     }
 
     fn apply_probe_scan(&mut self, scan: &ProbeScan) {

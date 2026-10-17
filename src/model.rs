@@ -372,3 +372,22 @@ pub(crate) struct UmbraBriefing {
     /// She wrote it on her own rather than when the player asked.
     pub(crate) auto: bool,
 }
+
+/// A character's corporation and alliance, as ESI's affiliation lookup gives them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CharacterAffiliation {
+    pub(crate) character_id: u64,
+    pub(crate) corporation_id: u64,
+    /// 0 when the corporation is in no alliance.
+    pub(crate) alliance_id: u64,
+}
+
+/// An item type with its group and category, for reading d-scans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EveType {
+    pub(crate) type_id: u32,
+    pub(crate) name: String,
+    pub(crate) group_id: u32,
+    pub(crate) group_name: String,
+    pub(crate) category_id: u32,
+}
