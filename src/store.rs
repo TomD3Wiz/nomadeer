@@ -29,8 +29,6 @@ const UMBRA_BRIEFS_AUTOMATICALLY_KEY: &str = "umbra_briefs_automatically";
 const RECON_DEFAULTS_APPLIED_KEY: &str = "recon_defaults_applied";
 const DASHBOARD_TABS_FRACTION_KEY: &str = "dashboard_tabs_fraction";
 
-/// Handle to the SQLite database. Clones share schema setup and can be moved to
-/// background threads; each operation opens its own connection.
 /// Everything kept in `app_settings`.
 #[derive(Default)]
 struct Settings {
@@ -40,6 +38,8 @@ struct Settings {
     dashboard_layout: DashboardLayout,
 }
 
+/// Handle to the SQLite database. Clones share schema setup and can be moved to
+/// background threads; each operation opens its own connection.
 #[derive(Clone)]
 pub(crate) struct Store {
     path: PathBuf,
