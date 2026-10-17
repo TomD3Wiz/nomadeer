@@ -1,12 +1,13 @@
-use crate::auto_intel::{self, AutoBriefings, IntelQueue, IntelRequest};
+use crate::auto_intel::{self, AutoBriefings, IntelQueue, IntelRequest, LocationFix};
 use crate::chain_archive::{self, ChainSnapshot, ChainSnapshotMeta};
 use crate::config::theme;
-use crate::esi::{self, AccountAuthorization, LocationSync, SystemIntel};
+use crate::esi::{self, AccountAuthorization, LocationSync, ONLINE_SCOPE, OnlineSync, SystemIntel};
 use crate::forms::*;
 use crate::local_intel::{self, BriefingEvent, BriefingWorker, CoreStatus, DownloadProgress};
 use crate::model::*;
 use crate::paths;
 use crate::portrait;
+use crate::recon::{self, MAX_RECON_CHARACTERS, OnlinePolls};
 use crate::store::{KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS};
 use crate::util::{clean, now, open_url};
 use crate::widgets::{pill, record_frame};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const WARNING_TEXT: Color32 = Color32::from_rgb(255, 194, 87);
+const RECON_HINT: &str = "Nomadeer gathers intel and Umbra briefs wherever recon pilots arrive.";
 
 /// Traffic recent enough to show as describing a system now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +34,7 @@ struct RecentTraffic {
 enum EsiTaskResult {
     Authorized(AccountAuthorization),
     Location(LocationSync),
+    Online(OnlineSync),
 }
 
 enum ZkillTaskResult {
@@ -178,6 +181,10 @@ pub(crate) struct NomadeerApp {
     intel_errors: HashMap<u64, String>,
     /// Characters located since launch, so their first fix counts as an arrival.
     located_this_session: HashSet<String>,
+    /// Whether each character is logged in, for those whose sign-in can tell.
+    online_polls: OnlinePolls,
+    /// The character whose online status the ESI task in flight is checking.
+    online_poll_in_flight: Option<String>,
     auto_briefings: AutoBriefings,
     zkill_reports: HashMap<u64, ZkillReport>,
     /// The latest traffic readings each killboard refresh found, by solar system ID.
@@ -245,6 +252,8 @@ impl NomadeerApp {
             intel_queue: IntelQueue::default(),
             intel_errors: HashMap::new(),
             located_this_session: HashSet::new(),
+            online_polls: OnlinePolls::default(),
+            online_poll_in_flight: None,
             auto_briefings: AutoBriefings::default(),
             zkill_reports: HashMap::new(),
             refreshed_traffic: HashMap::new(),
@@ -289,6 +298,11 @@ impl NomadeerApp {
                 self.refresh_chain_snapshots();
                 self.default_chain_snapshot_name();
                 self.status = "Loaded".to_owned();
+                if recon::apply_recon_default(&mut self.data)
+                    && let Err(error) = self.store.save(&self.data)
+                {
+                    self.status = format!("Save failed: {error}");
+                }
             }
             Err(error) => {
                 self.status = format!("Could not load database: {error}");
@@ -1021,7 +1035,9 @@ impl NomadeerApp {
             token_expires_at: None,
             created_at: timestamp,
             updated_at: timestamp,
+            recon: false,
         });
+        recon::mark_added_character(&mut self.data, &account_id);
         self.save();
         self.spawn_authorize_account(account_id);
     }
@@ -1072,16 +1088,61 @@ impl NomadeerApp {
         });
     }
 
+    /// Checks whether the next character is logged in, when ESI has a newer answer.
+    fn maybe_poll_online(&mut self) {
+        if self.esi_busy || self.data.esi_settings.client_id.is_empty() {
+            return;
+        }
+        let Some(account) = self
+            .online_polls
+            .next_due(
+                self.data
+                    .accounts
+                    .iter()
+                    .filter(|account| recon::online_status_available(account))
+                    .map(|account| account.id.as_str()),
+                Instant::now(),
+            )
+            .and_then(|account_id| {
+                self.data
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == account_id)
+            })
+            .cloned()
+        else {
+            return;
+        };
+
+        self.esi_busy = true;
+        self.background_esi_task = true;
+        self.online_poll_in_flight = Some(account.id.clone());
+        let tx = self.esi_tx.clone();
+        let settings = self.data.esi_settings.clone();
+        thread::spawn(move || {
+            let result = esi::sync_online(settings, account).map(EsiTaskResult::Online);
+            let _ = tx.send(result);
+        });
+    }
+
     fn maybe_auto_sync(&mut self) {
         if self.esi_busy || Instant::now() < self.next_auto_sync {
             return;
         }
 
+        // Logged-off characters cannot move, so they are skipped until they log in.
         let accounts: Vec<Account> = self
             .data
             .accounts
             .iter()
-            .filter(|account| account.auth_status == "authorized")
+            .filter(|account| {
+                account.auth_status == "authorized"
+                    && self.online_polls.wants_location_poll(
+                        &account.id,
+                        recon::online_status_available(account),
+                        self.located_this_session.contains(&account.id),
+                    )
+            })
             .cloned()
             .collect();
         if accounts.is_empty() || self.data.esi_settings.client_id.is_empty() {
@@ -1669,8 +1730,17 @@ impl NomadeerApp {
                     self.esi_busy = false;
                     self.apply_location_sync(location);
                 }
+                Ok(Ok(EsiTaskResult::Online(online))) => {
+                    self.esi_busy = false;
+                    self.online_poll_in_flight = None;
+                    self.apply_online_sync(online);
+                }
                 Ok(Err(error)) => {
                     self.esi_busy = false;
+                    if let Some(account_id) = self.online_poll_in_flight.take() {
+                        self.online_polls
+                            .record_failure(&account_id, Instant::now());
+                    }
                     // A failed background sync is retried in a few seconds anyway.
                     if !self.background_esi_task {
                         self.status = format!("Character update failed: {error}");
@@ -1679,6 +1749,7 @@ impl NomadeerApp {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.esi_busy = false;
+                    self.online_poll_in_flight = None;
                     self.status = "Character update stopped unexpectedly".to_owned();
                     break;
                 }
@@ -1701,10 +1772,52 @@ impl NomadeerApp {
             account.refresh_token = Some(auth.refresh_token);
             account.token_expires_at = Some(auth.token_expires_at);
             account.updated_at = now();
+            // The new sign-in may read online status the old one could not.
+            self.online_polls.forget(&auth.account_id);
             self.save();
             self.status = "Character connected".to_owned();
         } else {
             self.status = "Character connected, but it is no longer in the list".to_owned();
+        }
+    }
+
+    fn apply_online_sync(&mut self, sync: OnlineSync) {
+        let Some(account) = self
+            .data
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == sync.account_id)
+        else {
+            return;
+        };
+        let tokens_changed = account.access_token.as_deref() != Some(sync.access_token.as_str())
+            || account.refresh_token.as_deref() != Some(sync.refresh_token.as_str())
+            || account.token_expires_at != Some(sync.token_expires_at);
+        if tokens_changed {
+            account.access_token = Some(sync.access_token);
+            account.refresh_token = Some(sync.refresh_token);
+            account.token_expires_at = Some(sync.token_expires_at);
+            account.updated_at = now();
+        }
+        let is_recon = account.recon;
+        let last_system_id = account.last_system_id.clone();
+
+        let was_online = self.online_polls.record(
+            &sync.account_id,
+            sync.online,
+            sync.expires_at,
+            now(),
+            Instant::now(),
+        );
+        // Logging in puts a recon pilot back in the system they logged off in.
+        if self.data.auto_intel.gather_on_arrival
+            && !last_system_id.is_empty()
+            && auto_intel::is_login_arrival(is_recon, was_online, sync.online)
+        {
+            self.queue_arrival_intel(&last_system_id);
+        }
+        if tokens_changed && let Err(error) = self.store.save(&self.data) {
+            self.status = format!("Save failed: {error}");
         }
     }
 
@@ -1725,6 +1838,11 @@ impl NomadeerApp {
 
         let previous_system_id = self.data.accounts[account_index].last_system_id.clone();
         let character_name = self.data.accounts[account_index].character_name.clone();
+        let is_recon = self.data.accounts[account_index].recon;
+        let presence = self.online_polls.presence(
+            &location.account_id,
+            recon::online_status_available(&self.data.accounts[account_index]),
+        );
 
         let account = &mut self.data.accounts[account_index];
         let account_changed = account.access_token.as_deref()
@@ -1773,11 +1891,15 @@ impl NomadeerApp {
             .insert(location.account_id.clone());
         if self.data.auto_intel.gather_on_arrival
             && auto_intel::is_arrival(
-                &previous_system_id,
-                &system_id,
-                first_fix,
-                node_created,
-                system_id == self.selected_system_id,
+                is_recon,
+                presence,
+                &LocationFix {
+                    previous_system_id: &previous_system_id,
+                    system_id: &system_id,
+                    first_fix_this_session: first_fix,
+                    node_created,
+                    on_screen: system_id == self.selected_system_id,
+                },
             )
         {
             self.queue_arrival_intel(&system_id);
@@ -2750,8 +2872,10 @@ impl NomadeerApp {
 
     fn characters_sidebar(&mut self, ui: &mut egui::Ui) {
         let mut authorize_id = None;
+        let mut sign_in_for_online_id = None;
         let mut sync_id = None;
         let mut delete_id = None;
+        let mut recon_change = None;
 
         ui.horizontal(|ui| {
             ui.heading("Characters");
@@ -2791,6 +2915,25 @@ impl NomadeerApp {
                             );
                             pill(ui, &account.auth_status);
                         });
+                        ui.horizontal_wrapped(|ui| {
+                            let mut is_recon = account.recon;
+                            if ui
+                                .add_enabled(
+                                    recon::can_mark_recon(&self.data.accounts, &account.id),
+                                    egui::Checkbox::new(&mut is_recon, "Recon"),
+                                )
+                                .on_hover_text(RECON_HINT)
+                                .on_disabled_hover_text(format!(
+                                    "Up to {MAX_RECON_CHARACTERS} recon pilots at a time. Stand one down to make room."
+                                ))
+                                .changed()
+                            {
+                                recon_change = Some((account.id.clone(), is_recon));
+                            }
+                            if self.online_indicator(ui, account) {
+                                sign_in_for_online_id = Some(account.id.clone());
+                            }
+                        });
                         if !account.last_system_name.is_empty() {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
@@ -2827,16 +2970,63 @@ impl NomadeerApp {
             });
         }
 
+        if let Some((id, is_recon)) = recon_change
+            && recon::set_recon(&mut self.data.accounts, &id, is_recon)
+        {
+            self.save();
+        }
         if let Some(id) = delete_id {
             self.data.accounts.retain(|account| account.id != id);
+            self.online_polls.forget(&id);
             self.reconcile_selected_system();
             self.save();
+        }
+        if let Some(id) = sign_in_for_online_id {
+            self.request_online_scope();
+            self.start_authorize_account(id);
         }
         if let Some(id) = authorize_id {
             self.start_authorize_account(id);
         }
         if let Some(id) = sync_id {
             self.start_sync_location(id);
+        }
+    }
+
+    /// Shows whether the character is logged in, or how to let Nomadeer tell. Returns
+    /// whether the player asked to sign in again for it.
+    fn online_indicator(&self, ui: &mut egui::Ui, account: &Account) -> bool {
+        match recon::online_scope(account) {
+            Some(true) => {
+                let (text, color) = match self.online_polls.online(&account.id) {
+                    Some(true) => ("Online", theme::online()),
+                    Some(false) => ("Offline", theme::muted_text()),
+                    None => return false,
+                };
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.5, color);
+                ui.label(egui::RichText::new(text).color(color));
+                false
+            }
+            Some(false) if account.auth_status == "authorized" => ui
+                .add_enabled(
+                    !self.esi_busy,
+                    egui::Button::new("Show online status").small(),
+                )
+                .on_hover_text("Sign in again so Nomadeer can see when this pilot is logged in.")
+                .clicked(),
+            _ => false,
+        }
+    }
+
+    /// Makes sure the next sign-in asks to see whether characters are logged in.
+    fn request_online_scope(&mut self) {
+        let scopes = &mut self.esi_settings_form.scopes;
+        if !scopes.split_whitespace().any(|scope| scope == ONLINE_SCOPE) {
+            if !scopes.trim().is_empty() {
+                scopes.push(' ');
+            }
+            scopes.push_str(ONLINE_SCOPE);
         }
     }
 
@@ -2882,7 +3072,7 @@ impl NomadeerApp {
             if ui
                 .checkbox(&mut gather, "Gather intel on arrival")
                 .on_hover_text(
-                    "Refresh killboard intel when a character enters a system without fresh intel.",
+                    "Refresh killboard intel when a recon pilot enters a system without fresh intel.",
                 )
                 .changed()
             {
@@ -3623,6 +3813,7 @@ impl eframe::App for NomadeerApp {
         self.poll_portrait_tasks(ctx);
         self.poll_local_intel_tasks();
         self.maybe_request_portraits();
+        self.maybe_poll_online();
         self.maybe_auto_sync();
         self.maybe_poll_traffic();
         self.maybe_check_umbra_core();

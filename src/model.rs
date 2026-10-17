@@ -24,6 +24,10 @@ pub(crate) struct AppData {
     pub(crate) system_assessments: Vec<SystemAssessment>,
     #[serde(default)]
     pub(crate) auto_intel: AutoIntelSettings,
+    /// The first character has been made a recon pilot once; after that the player
+    /// decides, even if they unmark everyone.
+    #[serde(default)]
+    pub(crate) recon_defaults_applied: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +80,9 @@ pub(crate) struct Account {
     pub(crate) token_expires_at: Option<u64>,
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
+    /// Recon pilots' arrivals gather intel and get Umbra's briefings.
+    #[serde(default)]
+    pub(crate) recon: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -25,6 +25,10 @@ const SYSTEM_KILLS_PATH: &str = "/universe/system_kills/";
 const TRAFFIC_MIN_POLL: Duration = Duration::from_secs(60);
 const TRAFFIC_MAX_RETRY: Duration = Duration::from_secs(15 * 60);
 const TRAFFIC_EXPIRES_SLACK_SECS: u64 = 15;
+/// Lets Nomadeer see whether a character is logged in.
+pub(crate) const ONLINE_SCOPE: &str = "esi-location.read_online.v1";
+/// ESI caches a character's online status for about a minute.
+const ONLINE_CACHE_SECS: u64 = 60;
 
 type FeedCacheLock<T> = OnceLock<Mutex<Option<FeedCache<T>>>>;
 
@@ -91,6 +95,24 @@ pub(crate) struct LocationSync {
     pub(crate) system: SystemIntel,
 }
 
+/// Whether a character is logged in, valid until ESI's `expires_at`.
+#[derive(Debug)]
+pub(crate) struct OnlineSync {
+    pub(crate) account_id: String,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
+    pub(crate) token_expires_at: u64,
+    pub(crate) online: bool,
+    pub(crate) expires_at: u64,
+}
+
+/// A character's access and refresh tokens, refreshed when about to expire.
+struct Tokens {
+    access_token: String,
+    refresh_token: String,
+    token_expires_at: u64,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SystemIntel {
     pub(crate) solar_system_id: u64,
@@ -124,6 +146,12 @@ struct VerifyResponse {
     character_name: String,
     #[serde(rename = "CharacterOwnerHash")]
     character_owner_hash: String,
+}
+
+/// ESI also sends `last_login`, `last_logout` and `logins`; only `online` is used.
+#[derive(Debug, Deserialize)]
+struct OnlineResponse {
+    online: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,39 +241,107 @@ pub(crate) fn sync_location(
     account: Account,
 ) -> Result<LocationSync, String> {
     validate_settings(&settings)?;
-    let mut access_token = account
-        .access_token
-        .clone()
-        .ok_or_else(|| "Account is missing an ESI access token".to_owned())?;
-    let mut refresh_token = account
-        .refresh_token
-        .clone()
-        .ok_or_else(|| "Account is missing an ESI refresh token".to_owned())?;
-    let mut token_expires_at = account.token_expires_at.unwrap_or_default();
-
-    if token_expires_at <= now() + 60 {
-        let refreshed = refresh_token_pair(&settings, &refresh_token)?;
-        access_token = refreshed.access_token;
-        if let Some(new_refresh_token) = refreshed.refresh_token {
-            refresh_token = new_refresh_token;
-        }
-        token_expires_at = now() + refreshed.expires_in;
-    }
-
-    let character_id = account
-        .character_id
-        .parse::<u64>()
-        .map_err(|_| "Account does not have a valid EVE character ID".to_owned())?;
-    let location = fetch_location(character_id, &access_token)?;
+    let tokens = fresh_tokens(&settings, &account)?;
+    let character_id = character_id(&account)?;
+    let location = fetch_location(character_id, &tokens.access_token)?;
     let system = fetch_system_intel(location.solar_system_id)?;
 
     Ok(LocationSync {
         account_id: account.id,
-        access_token,
-        refresh_token,
-        token_expires_at,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        token_expires_at: tokens.token_expires_at,
         system,
     })
+}
+
+/// Asks ESI whether the character is logged in. Needs [`ONLINE_SCOPE`].
+pub(crate) fn sync_online(settings: EsiSettings, account: Account) -> Result<OnlineSync, String> {
+    validate_settings(&settings)?;
+    let tokens = fresh_tokens(&settings, &account)?;
+    let character_id = character_id(&account)?;
+    let url = format!("{ESI_BASE_URL}/characters/{character_id}/online/?datasource=tranquility");
+    let response = get_response(&url, Some(&tokens.access_token))?;
+    let expires_at = online_expires_at(header_time(&response, EXPIRES), now());
+    let online = response
+        .json::<OnlineResponse>()
+        .map_err(|error| format!("Could not parse ESI response: {error}"))?
+        .online;
+
+    Ok(OnlineSync {
+        account_id: account.id,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        token_expires_at: tokens.token_expires_at,
+        online,
+        expires_at,
+    })
+}
+
+/// When ESI will have a newer online status; about a minute when it does not say.
+fn online_expires_at(expires: Option<u64>, current_time: u64) -> u64 {
+    expires.unwrap_or(current_time + ONLINE_CACHE_SECS)
+}
+
+fn fresh_tokens(settings: &EsiSettings, account: &Account) -> Result<Tokens, String> {
+    let mut tokens = Tokens {
+        access_token: account
+            .access_token
+            .clone()
+            .ok_or_else(|| "Account is missing an ESI access token".to_owned())?,
+        refresh_token: account
+            .refresh_token
+            .clone()
+            .ok_or_else(|| "Account is missing an ESI refresh token".to_owned())?,
+        token_expires_at: account.token_expires_at.unwrap_or_default(),
+    };
+
+    if tokens.token_expires_at <= now() + 60 {
+        let refreshed = refresh_token_pair(settings, &tokens.refresh_token)?;
+        tokens.access_token = refreshed.access_token;
+        if let Some(new_refresh_token) = refreshed.refresh_token {
+            tokens.refresh_token = new_refresh_token;
+        }
+        tokens.token_expires_at = now() + refreshed.expires_in;
+    }
+    Ok(tokens)
+}
+
+fn character_id(account: &Account) -> Result<u64, String> {
+    account
+        .character_id
+        .parse::<u64>()
+        .map_err(|_| "Account does not have a valid EVE character ID".to_owned())
+}
+
+/// The scopes an SSO access token was granted, read from its JWT `scp` claim. The
+/// token came from EVE's SSO to Nomadeer, so its signature is not checked here.
+/// `None` when the token cannot be read.
+pub(crate) fn token_scopes(access_token: &str) -> Option<Vec<String>> {
+    let mut parts = access_token.split('.');
+    let (_header, payload, _signature) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let payload = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let claims = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
+    match claims.as_object()?.get("scp") {
+        // A token granted a single scope carries it as a plain string.
+        Some(serde_json::Value::String(scope)) => {
+            Some(scope.split_whitespace().map(str::to_owned).collect())
+        }
+        Some(serde_json::Value::Array(scopes)) => scopes
+            .iter()
+            .map(|scope| scope.as_str().map(str::to_owned))
+            .collect(),
+        None => Some(Vec::new()),
+        Some(_) => None,
+    }
+}
+
+/// Whether the access token was granted `scope`; `None` when it cannot be read.
+pub(crate) fn token_has_scope(access_token: &str, scope: &str) -> Option<bool> {
+    token_scopes(access_token).map(|scopes| scopes.iter().any(|granted| granted == scope))
 }
 
 fn validate_settings(settings: &EsiSettings) -> Result<(), String> {
@@ -645,8 +741,69 @@ fn get_response(url: &str, access_token: Option<&str>) -> Result<HttpResponse, S
 
 #[cfg(test)]
 mod tests {
-    use super::{feed_times, traffic_next_poll_delay, traffic_retry_delay};
+    use super::{
+        ONLINE_SCOPE, feed_times, online_expires_at, token_has_scope, token_scopes,
+        traffic_next_poll_delay, traffic_retry_delay,
+    };
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use std::time::Duration;
+
+    fn jwt(claims: &str) -> String {
+        format!(
+            "{}.{}.signature",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+            URL_SAFE_NO_PAD.encode(claims)
+        )
+    }
+
+    #[test]
+    fn token_scopes_read_the_scp_claim_as_array_or_string() {
+        let token = jwt(&format!(
+            r#"{{"scp":["publicData","{ONLINE_SCOPE}"],"sub":"CHARACTER:EVE:1"}}"#
+        ));
+        assert_eq!(
+            token_scopes(&token),
+            Some(vec!["publicData".to_owned(), ONLINE_SCOPE.to_owned()])
+        );
+        assert_eq!(token_has_scope(&token, ONLINE_SCOPE), Some(true));
+
+        let single = jwt(r#"{"scp":"esi-location.read_location.v1"}"#);
+        assert_eq!(
+            token_scopes(&single),
+            Some(vec!["esi-location.read_location.v1".to_owned()])
+        );
+        assert_eq!(token_has_scope(&single, ONLINE_SCOPE), Some(false));
+
+        let unscoped = jwt(r#"{"sub":"CHARACTER:EVE:1"}"#);
+        assert_eq!(token_has_scope(&unscoped, ONLINE_SCOPE), Some(false));
+
+        // Padding some encoders leave on is tolerated.
+        let padded = format!(
+            "e30.{}=.sig",
+            URL_SAFE_NO_PAD.encode(r#"{"scp":["publicData"]}"#)
+        );
+        assert_eq!(token_scopes(&padded), Some(vec!["publicData".to_owned()]));
+    }
+
+    #[test]
+    fn malformed_tokens_have_no_known_scopes() {
+        assert_eq!(token_scopes(""), None);
+        assert_eq!(token_scopes("not-a-jwt"), None);
+        assert_eq!(token_scopes("a.b"), None);
+        assert_eq!(token_scopes("a.b.c.d"), None);
+        assert_eq!(token_scopes("e30.!!!.sig"), None);
+        assert_eq!(token_has_scope(&jwt("not json"), ONLINE_SCOPE), None);
+        assert_eq!(token_scopes(&jwt(r#"["publicData"]"#)), None);
+        assert_eq!(token_scopes(&jwt(r#"{"scp":42}"#)), None);
+        assert_eq!(token_scopes(&jwt(r#"{"scp":["publicData",7]}"#)), None);
+    }
+
+    #[test]
+    fn online_status_expires_when_esi_says_or_after_a_minute() {
+        assert_eq!(online_expires_at(Some(1_030), 1_000), 1_030);
+        assert_eq!(online_expires_at(None, 1_000), 1_060);
+    }
 
     #[test]
     fn feed_times_prefer_last_modified() {

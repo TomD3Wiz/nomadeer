@@ -62,7 +62,9 @@ Windows builds link the C runtime statically, so no Visual C++ Redistributable i
 
 1. Install and start Nomadeer.
 2. Choose **Add character** and sign in through the EVE login page that opens in your browser. Nomadeer includes its own registered EVE application, so there is nothing to configure.
-3. Nomadeer follows your character's location and builds the chain as you jump. When a character arrives in a system without recent intel, Nomadeer gathers it automatically and, if Umbra is installed, she briefs you as soon as it is in. Select any system on the map to see its kills, scores and Umbra's briefing. Both can be switched off: **Gather intel on arrival** in the selected system's Intel section and **Umbra briefs automatically** in Umbra's window.
+3. Nomadeer follows your characters' locations and builds the chain as you jump. When a **Recon** pilot arrives in a system without recent intel, Nomadeer gathers it automatically and, if Umbra is installed, she briefs you as soon as it is in. Select any system on the map to see its kills, scores and Umbra's briefing; **Refresh zKill** and **Ask Umbra** work for any system. Both can be switched off: **Gather intel on arrival** in the selected system's Intel section and **Umbra briefs automatically** in Umbra's window.
+4. Your first character starts as a recon pilot. Tick **Recon** on up to three characters in the Characters list to choose who scouts; the others still move on the map but do not gather intel on their own.
+5. Nomadeer shows which characters are online, only counts arrivals while a recon pilot is logged in, and stops following a logged-off character until they log back in. Characters signed in before Nomadeer asked for online status show **Show online status**; sign in again from there to turn it on.
 
 Using your own EVE application instead is optional: create one at <https://developers.eveonline.com/> with this callback URL, then paste its Client ID under **ESI settings** (leave the field empty to go back to Nomadeer's app):
 

@@ -22,6 +22,7 @@ pub(crate) const TRAFFIC_RETENTION_SECS: u64 = 8 * DAY_SECS;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const GATHER_ON_ARRIVAL_KEY: &str = "gather_intel_on_arrival";
 const UMBRA_BRIEFS_AUTOMATICALLY_KEY: &str = "umbra_briefs_automatically";
+const RECON_DEFAULTS_APPLIED_KEY: &str = "recon_defaults_applied";
 
 /// Handle to the SQLite database. Clones share schema setup and can be moved to
 /// background threads; each operation opens its own connection.
@@ -109,6 +110,7 @@ impl Store {
                 UMBRA_BRIEFS_AUTOMATICALLY_KEY,
                 data.auto_intel.umbra_briefs_automatically,
             ),
+            (RECON_DEFAULTS_APPLIED_KEY, data.recon_defaults_applied),
         ] {
             tx.execute(
                 "INSERT INTO app_settings (key, value) VALUES (?1, ?2)",
@@ -122,8 +124,8 @@ impl Store {
                 "INSERT INTO accounts (
                     id, character_id, character_name, owner_hash, auth_status,
                     last_system_id, last_system_name, access_token, refresh_token,
-                    token_expires_at, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    token_expires_at, created_at, updated_at, recon
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     account.id,
                     account.character_id,
@@ -137,6 +139,7 @@ impl Store {
                     account.token_expires_at.map(|value| value as i64),
                     account.created_at as i64,
                     account.updated_at as i64,
+                    account.recon,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -693,7 +696,8 @@ impl Store {
                 refresh_token TEXT,
                 token_expires_at INTEGER,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                recon INTEGER NOT NULL DEFAULT 0
              );
               CREATE TABLE IF NOT EXISTS systems (
                  id TEXT PRIMARY KEY,
@@ -807,6 +811,7 @@ impl Store {
         )
         .map_err(|error| error.to_string())?;
 
+        self.add_missing_column(conn, "accounts", "recon", "INTEGER NOT NULL DEFAULT 0")?;
         self.add_missing_column(
             conn,
             "systems",
@@ -909,10 +914,11 @@ impl Store {
     }
 
     fn load_all(&self, conn: &SqliteConnection) -> Result<AppData, String> {
-        let (esi_settings, auto_intel) = self.load_settings(conn)?;
+        let (esi_settings, auto_intel, recon_defaults_applied) = self.load_settings(conn)?;
         Ok(AppData {
             esi_settings,
             auto_intel,
+            recon_defaults_applied,
             accounts: self.load_accounts(conn)?,
             systems: self.load_systems(conn)?,
             connections: self.load_connections(conn)?,
@@ -928,9 +934,10 @@ impl Store {
     fn load_settings(
         &self,
         conn: &SqliteConnection,
-    ) -> Result<(EsiSettings, AutoIntelSettings), String> {
+    ) -> Result<(EsiSettings, AutoIntelSettings, bool), String> {
         let mut settings = EsiSettings::default();
         let mut auto_intel = AutoIntelSettings::default();
+        let mut recon_defaults_applied = false;
         let mut stmt = conn
             .prepare("SELECT key, value FROM app_settings")
             .map_err(|error| error.to_string())?;
@@ -952,11 +959,12 @@ impl Store {
                 UMBRA_BRIEFS_AUTOMATICALLY_KEY => {
                     auto_intel.umbra_briefs_automatically = value != "0";
                 }
+                RECON_DEFAULTS_APPLIED_KEY => recon_defaults_applied = value == "1",
                 _ => {}
             }
         }
 
-        Ok((settings, auto_intel))
+        Ok((settings, auto_intel, recon_defaults_applied))
     }
 
     fn load_accounts(&self, conn: &SqliteConnection) -> Result<Vec<Account>, String> {
@@ -964,7 +972,7 @@ impl Store {
             .prepare(
                 "SELECT id, character_id, character_name, owner_hash, auth_status,
                     last_system_id, last_system_name, access_token, refresh_token,
-                    token_expires_at, created_at, updated_at
+                    token_expires_at, created_at, updated_at, recon
              FROM accounts ORDER BY character_name",
             )
             .map_err(|error| error.to_string())?;
@@ -985,6 +993,7 @@ impl Store {
                     token_expires_at: token_expires_at.map(|value| value as u64),
                     created_at: row.get::<_, i64>(10)? as u64,
                     updated_at: row.get::<_, i64>(11)? as u64,
+                    recon: row.get::<_, i64>(12)? != 0,
                 })
             })
             .map_err(|error| error.to_string())?;
@@ -1650,6 +1659,72 @@ mod tests {
         // Legacy JSON without the settings turns both on.
         let legacy: AppData = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.auto_intel, AutoIntelSettings::default());
+    }
+
+    #[test]
+    fn recon_pilots_survive_the_accounts_migration_and_persist() {
+        let db = TestDb::new("recon");
+        {
+            // Characters saved before recon pilots existed.
+            let conn = SqliteConnection::open(&db.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE accounts (
+                    id TEXT PRIMARY KEY,
+                    character_id TEXT NOT NULL DEFAULT '',
+                    character_name TEXT NOT NULL,
+                    owner_hash TEXT NOT NULL DEFAULT '',
+                    auth_status TEXT NOT NULL DEFAULT 'unauthorized',
+                    last_system_id TEXT NOT NULL DEFAULT '',
+                    last_system_name TEXT NOT NULL DEFAULT '',
+                    access_token TEXT,
+                    refresh_token TEXT,
+                    token_expires_at INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO accounts (id, character_name, created_at, updated_at)
+                    VALUES ('acct_1', 'Scout', 1, 1), ('acct_2', 'Hauler', 1, 1);",
+            )
+            .unwrap();
+        }
+        let store = db.store();
+        let mut data = store.load().unwrap();
+        assert_eq!(data.accounts.len(), 2);
+        assert!(data.accounts.iter().all(|account| !account.recon));
+        assert!(!data.recon_defaults_applied);
+        // A second store over the same file re-runs the migration without errors.
+        db.store().load().unwrap();
+
+        let scout = data
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == "acct_1")
+            .unwrap();
+        scout.recon = true;
+        data.recon_defaults_applied = true;
+        store.save(&data).unwrap();
+        let loaded = store.load().unwrap();
+        assert!(loaded.recon_defaults_applied);
+        let recon: Vec<_> = loaded
+            .accounts
+            .iter()
+            .filter(|account| account.recon)
+            .map(|account| account.id.as_str())
+            .collect();
+        assert_eq!(recon, ["acct_1"]);
+
+        // Legacy JSON characters are not recon pilots until the defaults apply.
+        let legacy: AppData = serde_json::from_str(
+            r#"{"accounts": [{
+                "id": "acct_1", "character_id": "", "character_name": "Scout",
+                "owner_hash": "", "auth_status": "authorized", "last_system_id": "",
+                "last_system_name": "", "access_token": null, "refresh_token": null,
+                "token_expires_at": null, "created_at": 1, "updated_at": 1
+            }]}"#,
+        )
+        .unwrap();
+        assert!(!legacy.accounts[0].recon);
+        assert!(!legacy.recon_defaults_applied);
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod local_intel;
 mod model;
 mod paths;
 mod portrait;
+mod recon;
 mod store;
 mod util;
 mod widgets;
