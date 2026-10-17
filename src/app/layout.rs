@@ -1,5 +1,5 @@
-//! How the area under the chain map is shared: the dashboard tabs on the left, Umbra
-//! on the right, with a divider the player can drag between them.
+//! How the dashboard is shared: the chain map above, and under it the dashboard tabs
+//! on the left and Umbra on the right, with dividers the player can drag between them.
 
 use crate::model::DashboardLayout;
 use eframe::egui::{Pos2, Rect, pos2};
@@ -12,6 +12,10 @@ pub(super) const DIVIDER_WIDTH: f32 = 10.0;
 pub(super) const STACK_GAP: f32 = 8.0;
 /// The tabs' share of the height when stacked; Umbra has the rest.
 const STACKED_TABS_SHARE: f32 = 0.4;
+/// Neither the chain map nor the area under it is squeezed shorter than these while
+/// there is room for both; below that they shrink together.
+pub(super) const MIN_MAP_HEIGHT: f32 = 200.0;
+pub(super) const MIN_BELOW_MAP_HEIGHT: f32 = 180.0;
 
 /// Where the tabs, Umbra and the divider sit.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -79,17 +83,73 @@ pub(super) fn dashboard_panes(area: Rect, tabs_fraction: f32) -> DashboardPanes 
     }
 }
 
-/// The grip's dots, centred in the divider.
+/// Where the chain map, the divider under it and the tabs and Umbra sit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct MapSplit {
+    pub(super) map: Rect,
+    pub(super) divider: Rect,
+    pub(super) below: Rect,
+}
+
+/// The map's share of `height`, kept so that both it and the area under it get at
+/// least their minimum. Too short for both, they share it in proportion to their
+/// minimums. A share that makes no sense falls back to the default.
+pub(super) fn clamp_map_fraction(fraction: f32, height: f32) -> f32 {
+    let fraction = if DashboardLayout::is_valid_fraction(fraction) {
+        fraction
+    } else {
+        DashboardLayout::DEFAULT_MAP_FRACTION
+    };
+    let shared = height - DIVIDER_WIDTH;
+    let needed = MIN_MAP_HEIGHT + MIN_BELOW_MAP_HEIGHT;
+    if shared < needed {
+        return MIN_MAP_HEIGHT / needed;
+    }
+    fraction.clamp(MIN_MAP_HEIGHT / shared, 1.0 - MIN_BELOW_MAP_HEIGHT / shared)
+}
+
+/// The map's share that puts the middle of the divider under the pointer.
+pub(super) fn map_fraction_at(pointer_y: f32, area: Rect) -> f32 {
+    let shared = area.height() - DIVIDER_WIDTH;
+    if shared <= 0.0 {
+        return DashboardLayout::DEFAULT_MAP_FRACTION;
+    }
+    let fraction = (pointer_y - area.top() - DIVIDER_WIDTH / 2.0) / shared;
+    clamp_map_fraction(fraction.clamp(0.01, 0.99), area.height())
+}
+
+/// Splits the area into the chain map, the divider and what goes under the map.
+pub(super) fn map_split(area: Rect, map_fraction: f32) -> MapSplit {
+    let fraction = clamp_map_fraction(map_fraction, area.height());
+    let shared = (area.height() - DIVIDER_WIDTH).max(0.0);
+    let divider_top = area.top() + (shared * fraction).round();
+    let divider_bottom = (divider_top + DIVIDER_WIDTH).min(area.bottom());
+    MapSplit {
+        map: Rect::from_min_max(area.min, pos2(area.right(), divider_top)),
+        divider: Rect::from_min_max(
+            pos2(area.left(), divider_top),
+            pos2(area.right(), divider_bottom),
+        ),
+        below: Rect::from_min_max(pos2(area.left(), divider_bottom), area.max),
+    }
+}
+
+/// The grip's dots, centred in the divider and running along it.
 pub(super) fn grip_dots(divider: Rect) -> [Pos2; 3] {
     let center = divider.center();
-    [-6.0, 0.0, 6.0].map(|offset| pos2(center.x, center.y + offset))
+    if divider.height() >= divider.width() {
+        [-6.0, 0.0, 6.0].map(|offset| pos2(center.x, center.y + offset))
+    } else {
+        [-6.0, 0.0, 6.0].map(|offset| pos2(center.x + offset, center.y))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DIVIDER_WIDTH, MIN_PANE_WIDTH, STACK_GAP, clamp_tabs_fraction, dashboard_panes,
-        fraction_at, grip_dots, stacks,
+        DIVIDER_WIDTH, MIN_BELOW_MAP_HEIGHT, MIN_MAP_HEIGHT, MIN_PANE_WIDTH, STACK_GAP,
+        clamp_map_fraction, clamp_tabs_fraction, dashboard_panes, fraction_at, grip_dots,
+        map_fraction_at, map_split, stacks,
     };
     use crate::model::DashboardLayout;
     use eframe::egui::{Rect, pos2};
@@ -201,5 +261,70 @@ mod tests {
         let dots = grip_dots(divider);
         assert!(dots.iter().all(|dot| dot.x == 15.0));
         assert_eq!(dots[1].y, 50.0);
+
+        let under_map = Rect::from_min_max(pos2(0.0, 300.0), pos2(800.0, 310.0));
+        let dots = grip_dots(under_map);
+        assert!(dots.iter().all(|dot| dot.y == 305.0));
+        assert_eq!(dots[1].x, 400.0);
+        assert!(dots[0].x < dots[2].x);
+    }
+
+    #[test]
+    fn the_map_split_stacks_map_divider_and_the_rest_without_gaps() {
+        let area = area(900.0, 810.0);
+        let split = map_split(area, 0.5);
+        assert_eq!(split.map.top(), area.top());
+        assert_eq!(split.map.height(), 400.0);
+        assert_eq!(split.divider.top(), split.map.bottom());
+        assert_eq!(split.divider.height(), DIVIDER_WIDTH);
+        assert_eq!(split.below.top(), split.divider.bottom());
+        assert_eq!(split.below.bottom(), area.bottom());
+        assert_eq!(split.below.height(), 400.0);
+        for rect in [split.map, split.divider, split.below] {
+            assert_eq!(rect.left(), area.left());
+            assert_eq!(rect.right(), area.right());
+        }
+    }
+
+    #[test]
+    fn the_map_and_the_area_under_it_keep_their_minimums() {
+        for fraction in [0.0001, 0.1, 0.45, 0.9, 0.9999] {
+            for height in [400.0, 600.0, 1000.0, 2000.0] {
+                let split = map_split(area(900.0, height), fraction);
+                assert!(
+                    split.map.height() >= MIN_MAP_HEIGHT - 0.5,
+                    "{fraction} {height}"
+                );
+                assert!(
+                    split.below.height() >= MIN_BELOW_MAP_HEIGHT - 0.5,
+                    "{fraction} {height}"
+                );
+            }
+        }
+        // Too short for both, they shrink together rather than one vanishing.
+        let split = map_split(area(900.0, 200.0), 0.9);
+        assert!(split.map.height() > 0.0 && split.below.height() > 0.0);
+        let ratio = split.map.height() / split.below.height();
+        assert!((ratio - MIN_MAP_HEIGHT / MIN_BELOW_MAP_HEIGHT).abs() < 0.05);
+        // Nonsense shares fall back to the default.
+        for bad in [f32::NAN, -1.0, 0.0, 1.0, 7.0] {
+            assert!(
+                (clamp_map_fraction(bad, 1000.0) - DashboardLayout::DEFAULT_MAP_FRACTION).abs()
+                    < 1e-6,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn dragging_puts_the_map_divider_under_the_pointer_within_limits() {
+        let area = area(900.0, 810.0);
+        let target = area.top() + 300.0;
+        let split = map_split(area, map_fraction_at(target, area));
+        assert!((split.divider.center().y - target).abs() < 1.0);
+        let top = map_split(area, map_fraction_at(area.top() - 500.0, area));
+        assert!((top.map.height() - MIN_MAP_HEIGHT).abs() < 1.0);
+        let bottom = map_split(area, map_fraction_at(area.bottom() + 500.0, area));
+        assert!((bottom.below.height() - MIN_BELOW_MAP_HEIGHT).abs() < 1.0);
     }
 }

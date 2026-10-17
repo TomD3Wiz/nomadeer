@@ -1,3 +1,4 @@
+use crate::live_intel::LiveContribution;
 use crate::model::{SystemAssessment, SystemNode, SystemTrafficHistory, TrafficSample};
 use crate::paths;
 use crate::util::{DAY_SECS, HOUR_SECS, replace_file};
@@ -355,10 +356,30 @@ struct TrafficBaseline {
     earlier_samples: usize,
 }
 
+/// Assesses a system from its killboard and traffic alone.
+#[cfg(test)]
 pub(crate) fn assess_system(
     system: &SystemNode,
     report: &ZkillReport,
     traffic: &SystemTrafficHistory,
+    current_time: u64,
+) -> SystemAssessment {
+    assess_with_live_intel(
+        system,
+        report,
+        traffic,
+        &LiveContribution::default(),
+        current_time,
+    )
+}
+
+/// Assesses a system from its killboard, its traffic and whatever fresh local or
+/// d-scan the player pasted, which `live` sums up.
+pub(crate) fn assess_with_live_intel(
+    system: &SystemNode,
+    report: &ZkillReport,
+    traffic: &SystemTrafficHistory,
+    live: &LiveContribution,
     current_time: u64,
 ) -> SystemAssessment {
     let history = &report.history;
@@ -451,6 +472,10 @@ pub(crate) fn assess_system(
         activity = (activity + baseline_adjustment).clamp(0.0, 100.0);
     }
 
+    // Pasted local and d-scan come on top, already capped to a modest share.
+    threat += live.threat;
+    activity += live.activity;
+
     let threat_score = threat.clamp(0.0, 100.0).round() as u8;
     let activity_score = activity.clamp(0.0, 100.0).round() as u8;
     let confidence = if is_wormhole {
@@ -480,8 +505,18 @@ pub(crate) fn assess_system(
         Some(_) if confidence == "High" => "Medium",
         Some(_) => "Low",
         None => confidence,
-    }
-    .to_owned();
+    };
+    // Eyes on the system now make up for a thin killboard, though never for a
+    // partly read one.
+    let confidence = match confidence {
+        "Low" if live.is_live() && killboard_hours.is_none() => "Medium",
+        confidence => confidence,
+    };
+    let confidence = if live.is_live() {
+        format!("{confidence}{LIVE_CONFIDENCE}")
+    } else {
+        confidence.to_owned()
+    };
     let at_least = |partial: bool| if partial { "At least " } else { "" };
 
     let mut evidence = Vec::new();
@@ -598,6 +633,8 @@ pub(crate) fn assess_system(
         }
     }
 
+    evidence.extend(live.evidence.iter().cloned());
+
     let briefing = template_briefing(threat_score, activity_score, &evidence);
     SystemAssessment {
         system_id: system.id.clone(),
@@ -608,6 +645,17 @@ pub(crate) fn assess_system(
         briefing,
         model_generated: false,
         generated_at: current_time,
+    }
+}
+
+/// Marks a confidence that rests partly on pasted local or d-scan.
+pub(crate) const LIVE_CONFIDENCE: &str = " · live intel";
+
+/// "Medium confidence", or "Medium confidence · live intel".
+pub(crate) fn confidence_label(confidence: &str) -> String {
+    match confidence.strip_suffix(LIVE_CONFIDENCE) {
+        Some(level) => format!("{level} confidence{LIVE_CONFIDENCE}"),
+        None => format!("{confidence} confidence"),
     }
 }
 
@@ -671,7 +719,7 @@ pub(crate) fn eve_clock(timestamp: u64) -> String {
     format!("{:02}:{:02}", seconds / HOUR_SECS, seconds % HOUR_SECS / 60)
 }
 
-fn join_phrases(phrases: &[String]) -> String {
+pub(crate) fn join_phrases(phrases: &[String]) -> String {
     match phrases.split_last() {
         None => String::new(),
         Some((last, [])) => last.clone(),
@@ -1030,7 +1078,7 @@ fn numbers_in(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn count_label(count: usize, noun: &str) -> String {
+pub(crate) fn count_label(count: usize, noun: &str) -> String {
     if count == 1 {
         format!("1 {noun}")
     } else {
@@ -1184,12 +1232,14 @@ fn format_isk(value: f64) -> String {
 mod tests {
     use super::{
         BriefingEvent, BriefingWorker, CoreFile, CoreStatus, LEGACY_MODEL_DIRECTORY_NAMES,
-        LoadedCore, MODEL_DIRECTORY_NAME, VERIFIED_MARKER_FILE, assess_system, attach_briefing,
-        clean_briefing, core_status, core_status_in, fact_sheet, import_file, import_path_hint_for,
-        import_source_path, install_model, is_wormhole_space, keep_briefing, numbers_in,
-        remove_cores_in, remove_directory_in, score_label, umbra_thread_count, validate_briefing,
-        verify_core, verify_core_in,
+        LoadedCore, MODEL_DIRECTORY_NAME, VERIFIED_MARKER_FILE, assess_system,
+        assess_with_live_intel, attach_briefing, clean_briefing, confidence_label, core_status,
+        core_status_in, fact_sheet, import_file, import_path_hint_for, import_source_path,
+        install_model, is_wormhole_space, keep_briefing, numbers_in, remove_cores_in,
+        remove_directory_in, score_label, umbra_thread_count, validate_briefing, verify_core,
+        verify_core_in,
     };
+    use crate::live_intel::LiveContribution;
     use crate::model::{
         KillCounts, KillboardCoverage, SystemAssessment, SystemNode, SystemTrafficHistory,
         TrafficReading, TrafficSample,
@@ -1268,6 +1318,7 @@ mod tests {
             owner: String::new(),
             notes: String::new(),
             created_at: 0,
+            map_position: None,
         }
     }
 
@@ -1687,6 +1738,53 @@ mod tests {
         );
         assert_eq!(assessment.threat_score, 0);
         assert_eq!(assessment.confidence, "Low");
+    }
+
+    #[test]
+    fn live_intel_adds_its_evidence_and_scores_and_lifts_low_confidence() {
+        let live = LiveContribution {
+            threat: 26.0,
+            activity: 12.0,
+            evidence: vec![
+                "Local shows 4 pilots".to_owned(),
+                "D-scan picked up 1 interdictor (1 on grid)".to_owned(),
+            ],
+        };
+        let hole = system(HOME_HOLE, "J123456");
+        let quiet = report(ZkillHistory::default());
+        let traffic = SystemTrafficHistory::default();
+        let without = assess_system(&hole, &quiet, &traffic, NOW);
+        let with = assess_with_live_intel(&hole, &quiet, &traffic, &live, NOW);
+        assert_eq!(with.threat_score, without.threat_score + 26);
+        assert_eq!(with.activity_score, without.activity_score + 12);
+        assert_eq!(
+            &with.evidence[..without.evidence.len()],
+            &without.evidence[..]
+        );
+        assert_eq!(&with.evidence[without.evidence.len()..], &live.evidence[..]);
+        assert_eq!(without.confidence, "Low");
+        assert_eq!(with.confidence, "Medium · live intel");
+        assert_eq!(
+            confidence_label(&with.confidence),
+            "Medium confidence · live intel"
+        );
+        assert_eq!(confidence_label("High"), "High confidence");
+        // Umbra may quote the live numbers, since they are in the evidence.
+        assert!(
+            validate_briefing(
+                "Threat is Low with 4 pilots in local. Activity is Quiet with 1 interdictor on grid.",
+                &with
+            )
+            .is_ok()
+        );
+
+        // A partly read killboard stays low, live intel or not.
+        let partial = report(ZkillHistory {
+            partial_since: Some(NOW - 6 * HOUR_SECS),
+            ..ZkillHistory::default()
+        });
+        let with = assess_with_live_intel(&hole, &partial, &traffic, &live, NOW);
+        assert_eq!(with.confidence, "Low · live intel");
     }
 
     #[test]
