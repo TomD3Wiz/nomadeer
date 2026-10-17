@@ -58,6 +58,31 @@ jobs:
       - name: Build release binary
         run: cargo build --release --all-features
 
+  windows:
+    name: Windows build and test
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --all-features --locked
+
+      - name: Run tests
+        run: cargo test --all-features --locked
+
   security:
     name: Audit and dependency policy
     runs-on: ubuntu-latest
@@ -76,7 +101,13 @@ jobs:
         run: cargo install --locked cargo-audit cargo-deny
 
       - name: Run cargo-audit
-        run: cargo audit
+        # Candle's zip dependency is used for optional NPZ/PyTorch readers. Nomadeer
+        # only loads checksum-verified GGUF files and never invokes zip extraction.
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0367
+          --ignore RUSTSEC-2026-0368
+          --ignore RUSTSEC-2026-0369
 
       - name: Run cargo-deny
         run: cargo deny check

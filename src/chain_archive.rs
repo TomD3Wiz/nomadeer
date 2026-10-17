@@ -97,7 +97,8 @@ fn load_snapshot_path(path: &Path) -> Result<ChainSnapshot, String> {
 }
 
 fn safe_snapshot_path(directory: &Path, file_name: &str) -> Result<PathBuf, String> {
-    if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+    // A Windows drive prefix such as "C:" would make `join` leave the archive.
+    if file_name.is_empty() || file_name.contains(['/', '\\', ':']) || file_name.contains("..") {
         return Err("Invalid chain snapshot file".to_owned());
     }
     Ok(directory.join(file_name))
@@ -124,5 +125,32 @@ fn slugify_snapshot_name(name: &str) -> String {
         "chain".to_owned()
     } else {
         slug
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_snapshot_path;
+    use std::path::Path;
+
+    #[test]
+    fn snapshot_names_stay_inside_the_archive() {
+        let archive = Path::new("archive");
+        assert_eq!(
+            safe_snapshot_path(archive, "1760000000_home_chain.json").unwrap(),
+            archive.join("1760000000_home_chain.json")
+        );
+        for name in [
+            "",
+            "../outside.json",
+            "..",
+            "nested/chain.json",
+            r"nested\chain.json",
+            "C:chain.json",
+            r"C:\chain.json",
+            "/etc/chain.json",
+        ] {
+            assert!(safe_snapshot_path(archive, name).is_err(), "{name:?}");
+        }
     }
 }

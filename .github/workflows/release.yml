@@ -1,0 +1,317 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Build every package (without publishing) when a pull request changes how
+  # releases are built, so packaging breakages show up before a tag.
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+      - "assets/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "Makefile"
+  workflow_dispatch:
+
+# A newer push to the same pull request supersedes an older package build.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    # Built on Ubuntu 22.04 so the binaries, and the AppImage that bundles
+    # them, run on glibc 2.35 or newer rather than the runner's own glibc.
+    container: ubuntu:22.04
+    strategy:
+      matrix:
+        include:
+          # AVX2/FMA build: Umbra briefings run 2-3x faster.
+          - variant: optimized
+            rustflags: "-C target-cpu=x86-64-v3"
+          # Baseline x86-64 build for CPUs without AVX2.
+          - variant: compatible
+            rustflags: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux GUI dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            pkg-config \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxrandr-dev \
+            libxxf86vm-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.variant }}
+
+      - name: Build release binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          name="nomadeer-${version}-linux-x86_64-${{ matrix.variant }}"
+          mkdir -p "dist/${name}"
+          cp target/release/nomadeer README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+
+      # For the AppImage and Flatpak jobs; not a release file.
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bin-${{ matrix.variant }}
+          path: target/release/nomadeer
+          if-no-files-found: error
+          retention-days: 1
+
+  appimage:
+    name: Package AppImage
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: linux-bin-*
+          path: target/linux
+
+      # appimagetool needs file, and validates the desktop entry and metainfo
+      # when the other two are installed.
+      - name: Install validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y appstream desktop-file-utils file
+
+      - name: Build AppImage
+        id: package
+        env:
+          # Fail if a build needs a newer glibc than Ubuntu 22.04's.
+          APPIMAGE_MAX_GLIBC: "2.35"
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          packaging/linux/appimage/build-appimage.sh "${version}" \
+            target/linux/linux-bin-optimized/nomadeer \
+            target/linux/linux-bin-compatible/nomadeer \
+            dist
+          echo "name=nomadeer-${version}-appimage-x86_64" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  flatpak:
+    name: Package Flatpak
+    needs: build
+    runs-on: ubuntu-latest
+    # Has flatpak-builder and the runtime the manifest uses. bubblewrap inside
+    # needs a privileged container.
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+      options: --privileged
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The manifest takes the binaries from the make release locations.
+      - name: Download optimized binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-bin-optimized
+          path: target/optimized/release
+
+      - name: Download compatible binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-bin-compatible
+          path: target/compatible/release
+
+      - name: Build Flatpak bundle
+        id: package
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          packaging/linux/flatpak/build-flatpak.sh "${version}" dist
+          echo "name=nomadeer-${version}-flatpak-x86_64" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows-build:
+    name: Build Windows ${{ matrix.variant }}
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        # crt-static links the C runtime into the exe, so it starts on PCs
+        # without the Visual C++ Redistributable (VCRUNTIME140.dll). It must be
+        # here: RUSTFLAGS replaces any rustflags from Cargo config.
+        include:
+          # AVX2/FMA build: Umbra briefings run 2-3x faster.
+          - variant: optimized
+            rustflags: "-C target-feature=+crt-static -C target-cpu=x86-64-v3"
+          # Baseline x86-64 build for CPUs without AVX2.
+          - variant: compatible
+            rustflags: "-C target-feature=+crt-static"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.variant }}
+          workspaces: ". -> target/${{ matrix.variant }}"
+
+      - name: Build release binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --target-dir target/${{ matrix.variant }}
+
+      - name: Check the exe needs no Visual C++ runtime
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe was not found' }
+          $dependents = & $dumpbin /nologo /dependents target/${{ matrix.variant }}/release/nomadeer.exe
+          $dependents
+          if ($dependents -match '(?i)vcruntime|msvcp') { throw 'nomadeer.exe needs the Visual C++ Redistributable' }
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe-${{ matrix.variant }}
+          path: target/${{ matrix.variant }}/release/nomadeer.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-package:
+    name: Package Windows installer
+    needs: windows-build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-exe-*
+          path: target/windows
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = @("$env:ProgramFiles\Inno Setup 6\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and -not ($iscc | Where-Object { Test-Path $_ })) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build installer and portable zip
+        id: package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          ./packaging/windows/package.ps1 -Version $version `
+            -OptimizedExe target/windows/windows-exe-optimized/nomadeer.exe `
+            -CompatibleExe target/windows/windows-exe-compatible/nomadeer.exe `
+            -OutDir dist
+          "name=nomadeer-$version-windows-x86_64" >> $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [build, appimage, flatpak, windows-package]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # Release files only, not the intermediate Linux and Windows binaries.
+          pattern: nomadeer-*
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          --repo "${GITHUB_REPOSITORY}"
+          --title "Nomadeer ${GITHUB_REF_NAME}"
+          --generate-notes
+          dist/*
