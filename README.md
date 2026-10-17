@@ -2,6 +2,8 @@
 
 A native desktop companion for EVE Online wormhole explorers: it maps your chain as you move, tracks your characters, and briefs you on the systems you pass through.
 
+![Nomadeer's chain map with wormhole and faction artwork, the selected system's intel, and Umbra's briefing feed](docs/screenshots/nomadeer-chain-and-umbra.png)
+
 Nomadeer is a Rust application built with `egui`/`eframe`. Everything it stores stays on your computer in a local SQLite database; it does not run a web server.
 
 ## Features
@@ -29,7 +31,11 @@ Every release on the [Releases page](https://github.com/TomD3Wiz/nomadeer/releas
 | Linux | `Nomadeer-<version>-x86_64.flatpak` | Sandboxed. `flatpak install --user Nomadeer-<version>-x86_64.flatpak`. Picks the right edition at launch. |
 | Linux | `nomadeer-<version>-linux-x86_64-optimized.tar.gz` / `-compatible.tar.gz` | Plain binaries for people who manage their own installs. |
 
-Each file has a matching `.sha256`.
+Each file has a matching `.sha256`. The AppImage also has a `.zsync` file, so AppImage updaters such as AppImageUpdate or Gear Lever can update it in place. [CHANGELOG.md](CHANGELOG.md) lists what changed in each release.
+
+Once a day Nomadeer checks GitHub for a new release and, when there is one, shows it in the top bar with its notes and the file that fits your install. Nothing is downloaded or installed until you press **Update**, and **Settings** has the switch to turn the check off and a **Check now** button. Copies built from source only show the news.
+
+The Windows installer and the AppImage update themselves. **Update** downloads the new version (you can cancel while it downloads), checks it against its published `.sha256`, and only then installs it: Windows runs the new installer silently for the same user or all users and the same edition, then reopens Nomadeer (an install for all users asks Windows for permission first); the AppImage is replaced in place under the same file name and restarted. Your data folder is never touched. Anything that does not check out is not installed, and the panel says what to do instead. The portable zip, the Flatpak and the tarballs show which file to download and what to do with it.
 
 ### Editions
 
@@ -70,7 +76,7 @@ Windows builds link the C runtime statically, so no Visual C++ Redistributable i
 4. Your first character starts as a recon pilot. Tick **Recon** on up to three characters in the Characters list to choose who scouts; the others still move on the map but do not gather intel on their own.
 5. Nomadeer shows which characters are online and only counts arrivals while a recon pilot is logged in; logging in counts as arriving wherever they are. Characters signed in before Nomadeer asked for online status show **Show online status**; sign in again from there to turn it on.
 
-Using your own EVE application instead is optional: create one at <https://developers.eveonline.com/> with this callback URL, then paste its Client ID under **ESI settings** (leave the field empty to go back to Nomadeer's app):
+Using your own EVE application instead is optional: create one at <https://developers.eveonline.com/> with this callback URL, then paste its Client ID under **Settings** (leave the field empty to go back to Nomadeer's app):
 
 ```text
 http://localhost:8788/callback
@@ -96,7 +102,7 @@ Nomadeer keeps its database (`nomadeer.sqlite3`), saved chains (`chains/`) and U
 | Flatpak | `~/.var/app/io.github.TomD3Wiz.Nomadeer/data/nomadeer` |
 | Running from a source checkout | `./data`, if it already contains a Nomadeer database |
 
-The **ESI settings** window shows the database location in use. Uninstalling on Windows keeps your data unless you choose to remove it when asked. Older `eve_wanderer` databases and JSON exports are imported automatically on first launch.
+The **Settings** window shows the database location in use. Uninstalling on Windows keeps your data unless you choose to remove it when asked. Older `eve_wanderer` databases and JSON exports are imported automatically on first launch.
 
 Portable zip: the empty `portable` file next to the exe tells Nomadeer to use the `data` folder beside it. Once that folder holds a database it stays in use; to move to `%LOCALAPPDATA%\Nomadeer`, move the contents of `data` there and delete both `data` and `portable`.
 
@@ -147,7 +153,18 @@ Notes:
 - `make flatpak` runs `flatpak-builder` in `ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08` with `--privileged` (bubblewrap needs it). `make windows-installer` cross-compiles with mingw and runs Inno Setup under Wine. Both mount the repository read-only with `--security-opt label=disable`.
 - On Windows itself, build both editions with `-C target-feature=+crt-static` in `RUSTFLAGS` (plus `-C target-cpu=x86-64-v3` for the optimized one, using `--target-dir target/optimized` and `target/compatible`), then run `./packaging/windows/package.ps1 -Version <version>`. This needs Inno Setup 6.3 or later.
 
-Pushing a `v*` tag runs the Release workflow, which builds every package above and attaches them to a GitHub release. CI also builds and tests on Windows for every pull request.
+### Making a release
+
+```sh
+make bump VERSION=x.y.z            # CHANGELOG.md, Cargo.toml, Cargo.lock and the metainfo
+make release-notes VERSION=x.y.z   # print that version's changelog section
+```
+
+1. Write what changed for players under `## [Unreleased]` in `CHANGELOG.md` as you go.
+2. Run `make bump VERSION=x.y.z`. It moves those notes into a dated `## [x.y.z]` section, sets the version in `Cargo.toml` and `Cargo.lock`, and adds a `<release>` to the metainfo. A pre-release such as `1.2.0-rc.1` goes into the metainfo as a development release, and the final `1.2.0` replaces it there. It refuses a version that is not newer, already exists or has no notes, and leaves every file as it was if anything fails.
+3. Commit, then tag the commit `vx.y.z` and push the tag.
+
+Pushing a `v*` tag runs the Release workflow. It first checks that the tag matches `Cargo.toml` and that the metainfo and `CHANGELOG.md` have the version, builds every package above, then creates a **draft** GitHub release titled `Nomadeer vx.y.z` with the changelog section and a downloads table as its notes. Nothing is public until you publish the draft; a version with a pre-release suffix (`1.2.0-rc.1`) is marked as a pre-release. Release file names are fixed (`python3 tools/release.py assets x.y.z` lists them) because update checks and AppImage updaters look for them by name. Update checks only see published, non-pre-release versions. To try them against a stand-in server, set `NOMADEER_UPDATE_API` to its base URL (for example `http://127.0.0.1:8080`); Nomadeer then asks it for `/repos/TomD3Wiz/nomadeer/releases/latest` and also accepts release files from it; otherwise Update only downloads from `https://github.com/TomD3Wiz/nomadeer/releases/download/`. CI also builds and tests on Windows for every pull request.
 
 Flathub publication would additionally need a build-from-source manifest (vendored crates via `flatpak-cargo-generator.py`), screenshots in the metainfo, and a pull request to `flathub/flathub`.
 

@@ -26,6 +26,7 @@ mod layout;
 mod live;
 mod scan;
 mod umbra;
+mod updates;
 mod wormholes;
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -176,7 +177,7 @@ pub(crate) struct NomadeerApp {
     selected_system_id: String,
     active_tab: DashboardTab,
     esi_settings_form: EsiSettingsForm,
-    show_esi_settings: bool,
+    show_settings: bool,
     show_local_intel_settings: bool,
     id_counter: u64,
     esi_tx: Sender<Result<EsiTaskResult, String>>,
@@ -261,10 +262,14 @@ pub(crate) struct NomadeerApp {
     paste_requested: Option<Instant>,
     next_auto_sync: Instant,
     auto_sync_index: usize,
+    updates: updates::UpdateUi,
 }
 
 impl NomadeerApp {
-    pub(crate) fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // The theme palette is drawn for a dark background, so a light OS theme
+        // would leave text unreadable.
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
         let store = Store::new(paths::database_path()).with_legacy_dirs(paths::legacy_data_dirs());
         let (esi_tx, esi_rx) = mpsc::channel();
         let (zkill_tx, zkill_rx) = mpsc::channel();
@@ -279,7 +284,7 @@ impl NomadeerApp {
             selected_system_id: String::new(),
             active_tab: DashboardTab::Movement,
             esi_settings_form: EsiSettingsForm::default(),
-            show_esi_settings: false,
+            show_settings: false,
             show_local_intel_settings: false,
             id_counter: 0,
             esi_tx,
@@ -344,6 +349,7 @@ impl NomadeerApp {
             paste_requested: None,
             next_auto_sync: Instant::now() + Duration::from_secs(5),
             auto_sync_index: 0,
+            updates: updates::UpdateUi::new(),
         };
         app.load();
         app
@@ -371,6 +377,7 @@ impl NomadeerApp {
                 self.status = "Loaded".to_owned();
                 // After "Loaded", so a feed that cannot be read is not hidden behind it.
                 self.load_umbra_feed();
+                self.load_update_state();
                 if recon::apply_recon_default(&mut self.data)
                     && let Err(error) = self.store.save(&self.data)
                 {
@@ -646,8 +653,8 @@ impl NomadeerApp {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Nomadeer");
-                if ui.button("ESI settings").clicked() {
-                    self.show_esi_settings = true;
+                if ui.button("Settings").clicked() {
+                    self.show_settings = true;
                 }
                 if ui.button("Umbra").clicked() {
                     self.show_local_intel_settings = true;
@@ -658,6 +665,7 @@ impl NomadeerApp {
                 {
                     self.start_add_character();
                 }
+                self.update_pill(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(&self.status);
                 });
@@ -665,20 +673,25 @@ impl NomadeerApp {
         });
     }
 
-    fn esi_settings_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_esi_settings;
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
         let mut close_requested = false;
-        egui::Window::new("ESI settings")
+        egui::Window::new("Settings")
             .open(&mut open)
             .resizable(true)
             .default_width(520.0)
             .show(ctx, |ui| {
-                close_requested = self.esi_settings_contents(ui);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.update_settings(ui);
+                    ui.separator();
+                    ui.heading("EVE sign-in");
+                    close_requested = self.esi_settings_contents(ui);
+                });
             });
         if close_requested {
             open = false;
         }
-        self.show_esi_settings = open;
+        self.show_settings = open;
     }
 
     fn esi_settings_contents(&mut self, ui: &mut egui::Ui) -> bool {
@@ -1083,12 +1096,12 @@ impl NomadeerApp {
             return;
         }
         if !self.save_esi_settings_from_form() {
-            self.show_esi_settings = true;
+            self.show_settings = true;
             return;
         }
         if self.data.esi_settings.client_id.is_empty() {
             self.status = "Set your ESI Client ID before adding a character".to_owned();
-            self.show_esi_settings = true;
+            self.show_settings = true;
             return;
         }
 
@@ -3560,9 +3573,14 @@ impl eframe::App for NomadeerApp {
         self.maybe_start_intel();
         self.maybe_expire_live_intel();
         self.maybe_start_auto_briefing();
+        self.poll_update_check();
+        self.poll_update_install(ctx);
+        self.maybe_check_for_updates();
         self.handle_paste(ctx);
         self.top_bar(ctx);
-        self.esi_settings_window(ctx);
+        self.update_notice_bar(ctx);
+        self.settings_window(ctx);
+        self.update_window(ctx);
         self.local_intel_settings_window(ctx);
         self.side_panel(ctx);
         self.central_panel(ctx);

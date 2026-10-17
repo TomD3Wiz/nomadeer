@@ -46,6 +46,9 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Check release version files agree
+        run: python3 tools/release.py check
+
       - name: Check formatting
         run: cargo fmt --all --check
 
