@@ -309,12 +309,13 @@ impl NomadeerApp {
                     .cloned()
                     .map(|assessment| (assessment.system_id.clone(), assessment))
                     .collect();
-                self.load_umbra_feed();
                 self.sync_esi_settings_form();
                 self.reconcile_selected_system();
                 self.refresh_chain_snapshots();
                 self.default_chain_snapshot_name();
                 self.status = "Loaded".to_owned();
+                // After "Loaded", so a feed that cannot be read is not hidden behind it.
+                self.load_umbra_feed();
                 if recon::apply_recon_default(&mut self.data)
                     && let Err(error) = self.store.save(&self.data)
                 {
@@ -2236,10 +2237,15 @@ impl NomadeerApp {
             .resizable(true)
             .default_width(320.0)
             .show(ctx, |ui| {
-                ui.add_space(2.0);
-                self.selected_system_sidebar(ui);
-                ui.separator();
-                self.characters_sidebar(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("dashboard_sidebar_scroll")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add_space(2.0);
+                        self.selected_system_sidebar(ui);
+                        ui.separator();
+                        self.characters_sidebar(ui);
+                    });
             });
     }
 
@@ -2264,7 +2270,8 @@ impl NomadeerApp {
             ui.separator();
             self.dashboard_tabs(ui);
             ui.separator();
-            // Umbra's feed scrolls on its own so it can follow her newest briefing.
+            // Umbra's feed scrolls on its own so it can follow her newest briefing; her
+            // tab keeps its own outer scroll so the feed is never squeezed out.
             if self.active_tab == DashboardTab::Umbra {
                 self.umbra_tab(ui);
                 return;
