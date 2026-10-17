@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Nomadeer app icon: a stylised deer head and antlers rising through a wormhole ring.
+  Colours follow src/config.rs (panel background, panel stroke, accent,
+  character text). Regenerate the PNG/ICO renders with packaging/icons/render-icons.sh.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="space" cx="50%" cy="58%" r="62%">
+      <stop offset="0" stop-color="#0d2c36"/>
+      <stop offset="1" stop-color="#061116"/>
+    </radialGradient>
+    <radialGradient id="core" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#061116"/>
+      <stop offset="0.7" stop-color="#0a2a33"/>
+      <stop offset="1" stop-color="#14606c"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Tile -->
+  <rect x="8" y="8" width="496" height="496" rx="104" fill="url(#space)" stroke="#224e5a" stroke-width="12"/>
+
+  <!-- Wormhole -->
+  <circle cx="256" cy="300" r="150" fill="url(#core)"/>
+  <circle cx="256" cy="300" r="150" fill="none" stroke="#5df2ff" stroke-width="44"/>
+  <circle cx="256" cy="300" r="104" fill="none" stroke="#224e5a" stroke-width="10"/>
+
+  <!-- Deer: outlined in the panel colour first so it reads cleanly over the ring -->
+  <defs>
+    <g id="deer">
+      <path id="antler" d="M262 320 C 256 276 240 254 224 238 C 236 200 228 140 204 90 C 196 140 202 186 190 210 C 166 184 128 140 100 74 C 104 128 124 164 142 186 C 118 172 86 162 50 166 C 84 182 124 196 156 218 C 184 246 204 280 208 324 Z"/>
+      <use xlink:href="#antler" transform="matrix(-1 0 0 1 512 0)"/>
+      <path id="ear" d="M218 312 C 198 292 172 284 146 290 C 162 314 188 328 216 330 Z"/>
+      <use xlink:href="#ear" transform="matrix(-1 0 0 1 512 0)"/>
+      <path d="M212 300 C 236 290 276 290 300 300 C 302 338 284 372 256 398 C 228 372 210 338 212 300 Z"/>
+    </g>
+  </defs>
+  <use xlink:href="#deer" fill="none" stroke="#061116" stroke-width="28" stroke-linejoin="round"/>
+  <use xlink:href="#deer" fill="#ffda79"/>
+</svg>
