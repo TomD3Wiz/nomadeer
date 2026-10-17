@@ -22,8 +22,8 @@ const COMPACT_HEADER_AVATAR_SIZE: f32 = 72.0;
 const COMPACT_PANEL_WIDTH: f32 = 420.0;
 const COMPACT_PANEL_HEIGHT: f32 = 360.0;
 const MESSAGE_AVATAR_SIZE: f32 = 30.0;
-/// Room the feed always gets, about one briefing; on a short window her panel scrolls
-/// to reach it instead of squeezing it away.
+/// Room the feed always gets, about one briefing; on a short window her panel opens
+/// scrolled down to it, header above the fold, instead of squeezing it away.
 const MIN_FEED_HEIGHT: f32 = 120.0;
 /// Briefings kept on screen; the feed itself holds more until they age out.
 pub(super) const FEED_SHOWN: usize = 200;
@@ -400,7 +400,9 @@ impl NomadeerApp {
     }
 
     /// Her own panel: who she is, what she is doing, and every briefing she has written.
-    /// It fills `ui`; the feed takes whatever height the header leaves.
+    /// It fills `ui`; the feed takes whatever height the header leaves. When the header
+    /// leaves less than the feed's minimum, the panel stays scrolled to the feed's bottom so
+    /// her newest briefing and her writing line stay in view.
     pub(super) fn umbra_panel(&mut self, ui: &mut egui::Ui) {
         let avatar = self.umbra_avatar(ui.ctx());
         let viewport_height = ui.available_height();
@@ -408,6 +410,7 @@ impl NomadeerApp {
         egui::ScrollArea::vertical()
             .id_salt("umbra_panel")
             .auto_shrink([false, false])
+            .stick_to_bottom(true)
             .show(ui, |ui| {
                 let header_top = ui.cursor().top();
                 self.umbra_header(ui, avatar.as_ref(), avatar_size);
