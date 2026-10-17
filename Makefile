@@ -30,7 +30,10 @@ test:
 	$(CARGO) test
 
 audit:
-	$(CARGO) audit
+	$(CARGO) audit \
+		--ignore RUSTSEC-2026-0367 \
+		--ignore RUSTSEC-2026-0368 \
+		--ignore RUSTSEC-2026-0369
 
 deny:
 	$(CARGO) deny check

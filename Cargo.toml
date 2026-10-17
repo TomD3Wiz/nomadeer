@@ -7,6 +7,8 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
+candle-core = "0.11"
+candle-transformers = "0.11"
 eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 getrandom = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -16,6 +18,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tiny_http = "0.12"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 url = "2"
 urlencoding = "2"
 webbrowser = "1"

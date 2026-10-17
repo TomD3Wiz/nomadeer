@@ -10,7 +10,10 @@ This scaffold is a Rust GUI application built with `egui`/`eframe`. It stores yo
 - Track systems, signatures, wormhole connections, visits, and notes.
 - Authorize characters with EVE ESI using local loopback OAuth + PKCE.
 - Sync authorized character location from ESI and infer movement connections.
-- Visual chain map with mass/status coloring.
+- Interactive chain map with direct connection and removal controls.
+- Save and restore historical chain snapshots.
+- Selected-system zKillboard history and detailed in-app kill reports.
+- Optional local AI system briefings backed by transparent threat/activity scores.
 - Local SQLite persistence.
 - Single binary target via Cargo.
 
@@ -55,6 +58,16 @@ data/nomadeer.sqlite3
 ```
 
 Those files are ignored by git. Existing `data/eve_wanderer.sqlite3` data is copied to the new Nomadeer database path on first launch. Existing `data/eve_wanderer.json` data is imported into SQLite on first empty database load.
+
+## Local Intel Model
+
+Nomadeer embeds the local inference runtime but does not include model weights in the repository or standard binary. Open **Local Intel** and choose **Install model** to download the optional model into:
+
+```text
+data/models/
+```
+
+The current model pack is Qwen2 1.5B Instruct Q4 from Hugging Face (Apache 2.0, approximately 938 MB). Downloads are SHA-256 verified. After installation, briefings run entirely on the local computer without an AI service or account. The model explains Nomadeer's calculated evidence; it does not determine the underlying threat or activity scores.
 
 ## ESI setup
 

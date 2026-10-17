@@ -76,7 +76,13 @@ jobs:
         run: cargo install --locked cargo-audit cargo-deny
 
       - name: Run cargo-audit
-        run: cargo audit
+        # Candle's zip dependency is used for optional NPZ/PyTorch readers. Nomadeer
+        # only loads checksum-verified GGUF files and never invokes zip extraction.
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0367
+          --ignore RUSTSEC-2026-0368
+          --ignore RUSTSEC-2026-0369
 
       - name: Run cargo-deny
         run: cargo deny check

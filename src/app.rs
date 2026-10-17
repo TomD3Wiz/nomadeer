@@ -2,6 +2,7 @@ use crate::chain_archive::{self, ChainSnapshot, ChainSnapshotMeta};
 use crate::config::theme;
 use crate::esi::{self, AccountAuthorization, LocationSync, SystemIntel};
 use crate::forms::*;
+use crate::local_intel::{self, DownloadProgress};
 use crate::model::*;
 use crate::portrait;
 use crate::store::Store;
@@ -25,6 +26,17 @@ enum EsiTaskResult {
 
 enum ZkillTaskResult {
     Report(ZkillReport),
+}
+
+enum LocalIntelTaskResult {
+    Installed,
+    Imported,
+    Briefing { system_id: String, briefing: String },
+}
+
+enum LocalIntelEvent {
+    Progress(DownloadProgress),
+    Finished(Result<LocalIntelTaskResult, String>),
 }
 
 struct PortraitTaskResult {
@@ -56,6 +68,7 @@ pub(crate) struct NomadeerApp {
     active_tab: DashboardTab,
     esi_settings_form: EsiSettingsForm,
     show_esi_settings: bool,
+    show_local_intel_settings: bool,
     id_counter: u64,
     esi_tx: Sender<Result<EsiTaskResult, String>>,
     esi_rx: Receiver<Result<EsiTaskResult, String>>,
@@ -63,10 +76,16 @@ pub(crate) struct NomadeerApp {
     zkill_rx: Receiver<Result<ZkillTaskResult, String>>,
     portrait_tx: Sender<Result<PortraitTaskResult, String>>,
     portrait_rx: Receiver<Result<PortraitTaskResult, String>>,
+    local_intel_tx: Sender<LocalIntelEvent>,
+    local_intel_rx: Receiver<LocalIntelEvent>,
     esi_busy: bool,
     zkill_busy_system_id: Option<u64>,
     zkill_reports: HashMap<u64, ZkillReport>,
     selected_zkill_kill: Option<ZkillKill>,
+    system_assessments: HashMap<String, SystemAssessment>,
+    local_intel_busy: bool,
+    local_intel_progress: Option<DownloadProgress>,
+    local_model_import_path: String,
     portrait_textures: HashMap<String, egui::TextureHandle>,
     portrait_requested: HashSet<String>,
     chain_snapshot_name: String,
@@ -83,6 +102,7 @@ impl NomadeerApp {
         let (esi_tx, esi_rx) = mpsc::channel();
         let (zkill_tx, zkill_rx) = mpsc::channel();
         let (portrait_tx, portrait_rx) = mpsc::channel();
+        let (local_intel_tx, local_intel_rx) = mpsc::channel();
         let mut app = Self {
             data: AppData::default(),
             store,
@@ -91,6 +111,7 @@ impl NomadeerApp {
             active_tab: DashboardTab::Movement,
             esi_settings_form: EsiSettingsForm::default(),
             show_esi_settings: false,
+            show_local_intel_settings: false,
             id_counter: 0,
             esi_tx,
             esi_rx,
@@ -98,10 +119,16 @@ impl NomadeerApp {
             zkill_rx,
             portrait_tx,
             portrait_rx,
+            local_intel_tx,
+            local_intel_rx,
             esi_busy: false,
             zkill_busy_system_id: None,
             zkill_reports: HashMap::new(),
             selected_zkill_kill: None,
+            system_assessments: HashMap::new(),
+            local_intel_busy: false,
+            local_intel_progress: None,
+            local_model_import_path: String::new(),
             portrait_textures: HashMap::new(),
             portrait_requested: HashSet::new(),
             chain_snapshot_name: String::new(),
@@ -119,6 +146,13 @@ impl NomadeerApp {
         match self.store.load() {
             Ok(data) => {
                 self.data = data;
+                self.system_assessments = self
+                    .data
+                    .system_assessments
+                    .iter()
+                    .cloned()
+                    .map(|assessment| (assessment.system_id.clone(), assessment))
+                    .collect();
                 self.sync_esi_settings_form();
                 self.reconcile_selected_system();
                 self.refresh_chain_snapshots();
@@ -289,6 +323,9 @@ impl NomadeerApp {
                 if ui.button("ESI settings").clicked() {
                     self.show_esi_settings = true;
                 }
+                if ui.button("Local Intel").clicked() {
+                    self.show_local_intel_settings = true;
+                }
                 if ui
                     .add_enabled(!self.esi_busy, egui::Button::new("Add character"))
                     .clicked()
@@ -355,6 +392,134 @@ impl NomadeerApp {
         ui.separator();
         ui.label(format!("Database: {}", self.store.path().display()));
         close_requested
+    }
+
+    fn local_intel_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_local_intel_settings;
+        egui::Window::new("Local Intel Model")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.heading(local_intel::MODEL_NAME);
+                ui.label(format!(
+                    "{} · {:.0} MB download · runs entirely on this computer",
+                    local_intel::MODEL_LICENSE,
+                    local_intel::MODEL_DOWNLOAD_SIZE as f64 / 1_000_000.0
+                ));
+                ui.label("The model writes short briefings from Nomadeer's calculated evidence. It does not set the threat score.");
+                ui.label(format!(
+                    "Stored locally in {}",
+                    local_intel::model_directory().display()
+                ));
+                ui.add_space(8.0);
+
+                let installed = local_intel::is_model_installed();
+                ui.horizontal_wrapped(|ui| {
+                    pill(ui, if installed { "Installed" } else { "Not installed" });
+                    if !installed
+                        && ui
+                            .add_enabled(
+                                !self.local_intel_busy,
+                                egui::Button::new("Install model"),
+                            )
+                            .clicked()
+                    {
+                        self.start_local_model_install();
+                    }
+                    if installed
+                        && ui
+                            .add_enabled(
+                                !self.local_intel_busy,
+                                egui::Button::new("Remove model"),
+                            )
+                            .clicked()
+                    {
+                        self.remove_local_model();
+                    }
+                });
+
+                if let Some(progress) = &self.local_intel_progress {
+                    let fraction = if progress.total == 0 {
+                        0.0
+                    } else {
+                        progress.downloaded as f32 / progress.total as f32
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                            .text(format!("Downloading {} · {:.0}%", progress.file, fraction * 100.0)),
+                    );
+                }
+
+                ui.separator();
+                ui.label("Install from an existing official GGUF file");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.local_model_import_path)
+                            .hint_text("/path/to/qwen2-1_5b-instruct-q4_0.gguf"),
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.local_intel_busy,
+                            egui::Button::new("Import model"),
+                        )
+                        .clicked()
+                    {
+                        self.start_local_model_import();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Imports are checksum-verified. The tokenizer is downloaded separately if needed.",
+                    )
+                    .color(theme::muted_text()),
+                );
+            });
+        self.show_local_intel_settings = open;
+    }
+
+    fn start_local_model_install(&mut self) {
+        if self.local_intel_busy {
+            return;
+        }
+        self.local_intel_busy = true;
+        self.local_intel_progress = None;
+        self.status = "Installing Local Intel Model...".to_owned();
+        let tx = self.local_intel_tx.clone();
+        thread::spawn(move || {
+            let progress_tx = tx.clone();
+            let result = local_intel::install_model(|progress| {
+                let _ = progress_tx.send(LocalIntelEvent::Progress(progress));
+            })
+            .map(|()| LocalIntelTaskResult::Installed);
+            let _ = tx.send(LocalIntelEvent::Finished(result));
+        });
+    }
+
+    fn start_local_model_import(&mut self) {
+        if self.local_intel_busy {
+            return;
+        }
+        let path = PathBuf::from(clean(&self.local_model_import_path));
+        if path.as_os_str().is_empty() {
+            self.status = "Enter the path to the official GGUF model".to_owned();
+            return;
+        }
+
+        self.local_intel_busy = true;
+        self.status = "Importing Local Intel Model...".to_owned();
+        let tx = self.local_intel_tx.clone();
+        thread::spawn(move || {
+            let result = local_intel::import_model(&path).map(|()| LocalIntelTaskResult::Imported);
+            let _ = tx.send(LocalIntelEvent::Finished(result));
+        });
+    }
+
+    fn remove_local_model(&mut self) {
+        match local_intel::remove_model() {
+            Ok(()) => self.status = "Removed Local Intel Model".to_owned(),
+            Err(error) => self.status = format!("Could not remove model: {error}"),
+        }
     }
 
     fn start_authorize_account(&mut self, account_id: String) {
@@ -491,11 +656,19 @@ impl NomadeerApp {
 
         let solar_system_id = system.solar_system_id;
         let system_name = system.name.clone();
+        let cached_killmails = self
+            .data
+            .cached_killmails
+            .iter()
+            .filter(|kill| kill.solar_system_id == solar_system_id)
+            .cloned()
+            .collect();
         self.zkill_busy_system_id = Some(solar_system_id);
         self.status = format!("Fetching killboard intel for {system_name}...");
         let tx = self.zkill_tx.clone();
         thread::spawn(move || {
-            let result = zkill::fetch_system_report(solar_system_id).map(ZkillTaskResult::Report);
+            let result = zkill::fetch_system_report(solar_system_id, cached_killmails)
+                .map(ZkillTaskResult::Report);
             let _ = tx.send(result);
         });
     }
@@ -504,10 +677,37 @@ impl NomadeerApp {
         loop {
             match self.zkill_rx.try_recv() {
                 Ok(Ok(ZkillTaskResult::Report(report))) => {
-                    let kill_count = report.recent_kills.len();
+                    let kill_count = report.history.kills_7d;
+                    let assessment = self
+                        .data
+                        .systems
+                        .iter()
+                        .find(|system| system.solar_system_id == report.solar_system_id)
+                        .map(|system| {
+                            local_intel::assess_system(
+                                system,
+                                &report,
+                                &self.data.activity_snapshots,
+                            )
+                        });
+                    if let Some(assessment) = assessment {
+                        self.system_assessments
+                            .insert(assessment.system_id.clone(), assessment.clone());
+                        self.upsert_system_assessment(assessment);
+                    }
+                    self.data.cached_killmails.retain(|kill| {
+                        kill.solar_system_id != report.solar_system_id
+                            && kill.killmail_time >= now().saturating_sub(7 * 24 * 60 * 60)
+                    });
+                    self.data
+                        .cached_killmails
+                        .extend(report.cached_killmails.iter().cloned());
                     self.zkill_busy_system_id = None;
-                    self.status = format!("Loaded {kill_count} recent kills from zKillboard");
                     self.zkill_reports.insert(report.solar_system_id, report);
+                    self.status = match self.store.save(&self.data) {
+                        Ok(()) => format!("Loaded {kill_count} kills from the last 7 days"),
+                        Err(error) => format!("Intel loaded, but cache save failed: {error}"),
+                    };
                 }
                 Ok(Err(error)) => {
                     self.zkill_busy_system_id = None;
@@ -564,6 +764,85 @@ impl NomadeerApp {
         }
     }
 
+    fn start_local_briefing(&mut self, system_id: &str) {
+        if self.local_intel_busy {
+            self.status = "Local Intel is already working".to_owned();
+            return;
+        }
+        if !local_intel::is_model_installed() {
+            self.show_local_intel_settings = true;
+            self.status = "Install the Local Intel Model first".to_owned();
+            return;
+        }
+        let Some(assessment) = self.system_assessments.get(system_id).cloned() else {
+            self.status = "Refresh zKill before generating a briefing".to_owned();
+            return;
+        };
+
+        self.local_intel_busy = true;
+        self.status = "Local Intel is assessing the system...".to_owned();
+        let tx = self.local_intel_tx.clone();
+        let system_id = system_id.to_owned();
+        thread::spawn(move || {
+            let result = local_intel::generate_briefing(&assessment).map(|briefing| {
+                LocalIntelTaskResult::Briefing {
+                    system_id,
+                    briefing,
+                }
+            });
+            let _ = tx.send(LocalIntelEvent::Finished(result));
+        });
+    }
+
+    fn poll_local_intel_tasks(&mut self) {
+        loop {
+            match self.local_intel_rx.try_recv() {
+                Ok(LocalIntelEvent::Progress(progress)) => {
+                    self.local_intel_progress = Some(progress);
+                }
+                Ok(LocalIntelEvent::Finished(Ok(LocalIntelTaskResult::Installed))) => {
+                    self.local_intel_busy = false;
+                    self.local_intel_progress = None;
+                    self.status = "Local Intel Model installed".to_owned();
+                }
+                Ok(LocalIntelEvent::Finished(Ok(LocalIntelTaskResult::Imported))) => {
+                    self.local_intel_busy = false;
+                    self.local_intel_progress = None;
+                    self.status = "Local Intel Model imported".to_owned();
+                }
+                Ok(LocalIntelEvent::Finished(Ok(LocalIntelTaskResult::Briefing {
+                    system_id,
+                    briefing,
+                }))) => {
+                    self.local_intel_busy = false;
+                    if let Some(assessment) = self.system_assessments.get_mut(&system_id) {
+                        assessment.briefing = briefing;
+                        assessment.model_generated = true;
+                        assessment.generated_at = now();
+                    }
+                    if let Some(assessment) = self.system_assessments.get(&system_id).cloned() {
+                        self.upsert_system_assessment(assessment);
+                    }
+                    self.status = match self.store.save(&self.data) {
+                        Ok(()) => "Local Intel briefing ready".to_owned(),
+                        Err(error) => format!("Briefing ready, but save failed: {error}"),
+                    };
+                }
+                Ok(LocalIntelEvent::Finished(Err(error))) => {
+                    self.local_intel_busy = false;
+                    self.local_intel_progress = None;
+                    self.status = format!("Local Intel failed: {error}");
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.local_intel_busy = false;
+                    self.local_intel_progress = None;
+                    break;
+                }
+            }
+        }
+    }
+
     fn poll_esi_tasks(&mut self) {
         loop {
             match self.esi_rx.try_recv() {
@@ -613,6 +892,7 @@ impl NomadeerApp {
 
     fn apply_location_sync(&mut self, location: LocationSync) {
         let system_id = self.ensure_esi_system(&location.system);
+        self.record_activity_snapshot(&system_id);
 
         let Some(account_index) = self
             .data
@@ -660,6 +940,44 @@ impl NomadeerApp {
             self.selected_system_id = system_id;
         }
         self.status = format!("{character_name} is in {}", location.system.name);
+    }
+
+    fn record_activity_snapshot(&mut self, system_id: &str) {
+        let Some(system) = self.system_by_id(system_id) else {
+            return;
+        };
+        let snapshot = SystemActivitySnapshot {
+            system_id: system_id.to_owned(),
+            captured_at: system.intel_updated_at / 3_600 * 3_600,
+            jumps_1h: system.jumps_1h,
+            ship_kills_1h: system.ship_kills_1h,
+            pod_kills_1h: system.pod_kills_1h,
+            npc_kills_1h: system.npc_kills_1h,
+        };
+        if self.data.activity_snapshots.iter().any(|existing| {
+            existing.system_id == system_id && existing.captured_at == snapshot.captured_at
+        }) {
+            return;
+        }
+        self.data.activity_snapshots.push(snapshot);
+
+        let cutoff = now().saturating_sub(30 * 24 * 60 * 60);
+        self.data
+            .activity_snapshots
+            .retain(|snapshot| snapshot.captured_at >= cutoff);
+    }
+
+    fn upsert_system_assessment(&mut self, assessment: SystemAssessment) {
+        if let Some(existing) = self
+            .data
+            .system_assessments
+            .iter_mut()
+            .find(|existing| existing.system_id == assessment.system_id)
+        {
+            *existing = assessment;
+        } else {
+            self.data.system_assessments.push(assessment);
+        }
     }
 
     fn ensure_esi_system(&mut self, intel: &SystemIntel) -> String {
@@ -886,12 +1204,12 @@ impl NomadeerApp {
     }
 
     fn delete_system(&mut self, system_id: &str) {
-        let Some(system_name) = self
+        let Some((system_name, solar_system_id)) = self
             .data
             .systems
             .iter()
             .find(|system| system.id == system_id)
-            .map(|system| system.name.clone())
+            .map(|system| (system.name.clone(), system.solar_system_id))
         else {
             self.status = "System not found".to_owned();
             return;
@@ -908,6 +1226,17 @@ impl NomadeerApp {
             .visits
             .retain(|visit| visit.system_id != system_id);
         self.data.notes.retain(|note| note.system_id != system_id);
+        self.data
+            .activity_snapshots
+            .retain(|snapshot| snapshot.system_id != system_id);
+        self.data
+            .system_assessments
+            .retain(|assessment| assessment.system_id != system_id);
+        self.data
+            .cached_killmails
+            .retain(|kill| kill.solar_system_id != solar_system_id);
+        self.system_assessments.remove(system_id);
+        self.zkill_reports.remove(&solar_system_id);
         for account in &mut self.data.accounts {
             if account.last_system_id == system_id {
                 account.last_system_id.clear();
@@ -1669,9 +1998,75 @@ impl NomadeerApp {
         let total_value = report.total_value;
         let solo_kills = report.solo_kills;
         let npc_kills = report.npc_kills;
+        let history_kills = report.history.kills_7d;
+        let assessment = self.system_assessments.get(&system.id).cloned();
+
+        if let Some(assessment) = assessment {
+            record_frame(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.heading("System assessment");
+                    pill(
+                        ui,
+                        &format!(
+                            "Threat {} · {}",
+                            assessment.threat_score,
+                            local_intel::score_label(assessment.threat_score)
+                        ),
+                    );
+                    pill(
+                        ui,
+                        &format!(
+                            "Activity {} · {}",
+                            assessment.activity_score,
+                            local_intel::score_label(assessment.activity_score)
+                        ),
+                    );
+                    pill(ui, &format!("{} confidence", assessment.confidence));
+                });
+                ui.label(&assessment.briefing);
+                ui.horizontal_wrapped(|ui| {
+                    if assessment.model_generated {
+                        pill(ui, "Local model briefing");
+                    } else {
+                        pill(ui, "Evidence summary");
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.local_intel_busy,
+                            egui::Button::new(if assessment.model_generated {
+                                "Regenerate briefing"
+                            } else {
+                                "Generate local briefing"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.start_local_briefing(&system.id);
+                    }
+                    if !local_intel::is_model_installed()
+                        && ui.button("Install Local Intel Model").clicked()
+                    {
+                        self.show_local_intel_settings = true;
+                    }
+                });
+                egui::CollapsingHeader::new("Evidence")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        for evidence in &assessment.evidence {
+                            ui.label(format!("• {evidence}"));
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "Public killmails may be delayed or absent; quiet never means safe.",
+                            )
+                            .color(theme::muted_text()),
+                        );
+                    });
+            });
+        }
 
         ui.label(format!(
-            "{} recent kills · {} total · {} solo · {} NPC",
+            "Latest {} shown · {history_kills} kills in 7d · {} shown value · {} solo · {} NPC",
             recent_kills.len(),
             Self::format_isk(total_value),
             solo_kills,
@@ -2208,10 +2603,12 @@ impl eframe::App for NomadeerApp {
         self.poll_esi_tasks();
         self.poll_zkill_tasks();
         self.poll_portrait_tasks(ctx);
+        self.poll_local_intel_tasks();
         self.maybe_request_portraits();
         self.maybe_auto_sync();
         self.top_bar(ctx);
         self.esi_settings_window(ctx);
+        self.local_intel_settings_window(ctx);
         self.side_panel(ctx);
         self.central_panel(ctx);
         self.zkill_details_window(ctx);

@@ -18,6 +18,12 @@ pub(crate) struct AppData {
     pub(crate) visits: Vec<VisitLog>,
     #[serde(default)]
     pub(crate) notes: Vec<Note>,
+    #[serde(default)]
+    pub(crate) activity_snapshots: Vec<SystemActivitySnapshot>,
+    #[serde(default)]
+    pub(crate) cached_killmails: Vec<CachedKillmail>,
+    #[serde(default)]
+    pub(crate) system_assessments: Vec<SystemAssessment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,4 +143,38 @@ pub(crate) struct Note {
     pub(crate) title: String,
     pub(crate) body: String,
     pub(crate) created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SystemActivitySnapshot {
+    pub(crate) system_id: String,
+    pub(crate) captured_at: u64,
+    pub(crate) jumps_1h: u32,
+    pub(crate) ship_kills_1h: u32,
+    pub(crate) pod_kills_1h: u32,
+    pub(crate) npc_kills_1h: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CachedKillmail {
+    pub(crate) killmail_id: u64,
+    pub(crate) solar_system_id: u64,
+    pub(crate) killmail_time: u64,
+    pub(crate) total_value: f64,
+    pub(crate) solo: bool,
+    pub(crate) npc: bool,
+    pub(crate) attacker_ids: Vec<u64>,
+    pub(crate) corporation_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SystemAssessment {
+    pub(crate) system_id: String,
+    pub(crate) threat_score: u8,
+    pub(crate) activity_score: u8,
+    pub(crate) confidence: String,
+    pub(crate) evidence: Vec<String>,
+    pub(crate) briefing: String,
+    pub(crate) model_generated: bool,
+    pub(crate) generated_at: u64,
 }
