@@ -5,6 +5,7 @@ mod app;
 mod auto_intel;
 mod chain_archive;
 mod config;
+mod data;
 mod esi;
 mod forms;
 mod local_intel;
