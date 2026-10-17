@@ -1,3 +1,4 @@
+use crate::auto_intel::{self, AutoBriefings, IntelQueue, IntelRequest};
 use crate::chain_archive::{self, ChainSnapshot, ChainSnapshotMeta};
 use crate::config::theme;
 use crate::esi::{self, AccountAuthorization, LocationSync, SystemIntel};
@@ -7,7 +8,7 @@ use crate::model::*;
 use crate::paths;
 use crate::portrait;
 use crate::store::{KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS};
-use crate::util::{HOUR_SECS, clean, now, open_url};
+use crate::util::{clean, now, open_url};
 use crate::widgets::{pill, record_frame};
 use crate::zkill::{self, ZkillKill, ZkillReport};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
@@ -17,9 +18,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
-/// The assessment weighs the last hour most, so after an hour it no longer describes
-/// the system as it is now.
-const ASSESSMENT_STALE_SECS: u64 = HOUR_SECS;
 const WARNING_TEXT: Color32 = Color32::from_rgb(255, 194, 87);
 
 /// Traffic recent enough to show as describing a system now.
@@ -75,7 +73,13 @@ enum UmbraTask {
     Installing,
     Importing,
     Checking,
-    Briefing { system_id: String, waking: bool },
+    /// `auto` briefings are ones she writes on her own once fresh intel is in; they
+    /// stay in her panels and out of the status bar.
+    Briefing {
+        system_id: String,
+        waking: bool,
+        auto: bool,
+    },
 }
 
 impl UmbraTask {
@@ -88,6 +92,18 @@ impl UmbraTask {
                 "Umbra is waking up for her first briefing this session..."
             }
             Self::Briefing { waking: false, .. } => "Umbra is writing a briefing...",
+        }
+    }
+
+    fn is_auto(&self) -> bool {
+        matches!(self, Self::Briefing { auto: true, .. })
+    }
+
+    /// The system she is briefing, if any.
+    fn briefing_system(&self) -> Option<&str> {
+        match self {
+            Self::Briefing { system_id, .. } => Some(system_id),
+            _ => None,
         }
     }
 
@@ -156,7 +172,13 @@ pub(crate) struct NomadeerApp {
     /// The ESI task in flight is a background location sync, which only speaks up when a
     /// character moves, so it does not bury other news every few seconds.
     background_esi_task: bool,
-    zkill_busy_system_id: Option<u64>,
+    /// Killboard refreshes waiting and in flight, one at a time.
+    intel_queue: IntelQueue,
+    /// Why the last refresh of a system failed, by solar system ID, until one succeeds.
+    intel_errors: HashMap<u64, String>,
+    /// Characters located since launch, so their first fix counts as an arrival.
+    located_this_session: HashSet<String>,
+    auto_briefings: AutoBriefings,
     zkill_reports: HashMap<u64, ZkillReport>,
     /// The latest traffic readings each killboard refresh found, by solar system ID.
     refreshed_traffic: HashMap<u64, SystemTrafficHistory>,
@@ -220,7 +242,10 @@ impl NomadeerApp {
                 .collect(),
             esi_busy: false,
             background_esi_task: false,
-            zkill_busy_system_id: None,
+            intel_queue: IntelQueue::default(),
+            intel_errors: HashMap::new(),
+            located_this_session: HashSet::new(),
+            auto_briefings: AutoBriefings::default(),
             zkill_reports: HashMap::new(),
             refreshed_traffic: HashMap::new(),
             selected_zkill_kill: None,
@@ -672,6 +697,18 @@ impl NomadeerApp {
                     }
                 });
 
+                let mut auto_brief = self.data.auto_intel.umbra_briefs_automatically;
+                if ui
+                    .checkbox(&mut auto_brief, "Umbra briefs automatically")
+                    .on_hover_text(
+                        "Umbra briefs each system as soon as fresh intel is in, without being asked.",
+                    )
+                    .changed()
+                {
+                    self.data.auto_intel.umbra_briefs_automatically = auto_brief;
+                    self.save();
+                }
+
                 if let Some(progress) = &self.local_intel_progress {
                     let fraction = if progress.total == 0 {
                         0.0
@@ -757,10 +794,28 @@ impl NomadeerApp {
             };
             ui.label(egui::RichText::new(&notice.message).color(color));
         }
+        if let Some(system_id) = system_id
+            && self.auto_briefings.is_pending(system_id)
+            && self
+                .umbra_task
+                .as_ref()
+                .and_then(UmbraTask::briefing_system)
+                != Some(system_id)
+        {
+            ui.label(
+                egui::RichText::new("Umbra will brief this system as soon as she is free.")
+                    .color(theme::muted_text()),
+            );
+        }
     }
 
     fn set_umbra_notice(&mut self, system_id: Option<String>, message: String, is_error: bool) {
         self.status = message.clone();
+        self.note_umbra(system_id, message, is_error);
+    }
+
+    /// Leaves Umbra's word in her panels without touching the status bar.
+    fn note_umbra(&mut self, system_id: Option<String>, message: String, is_error: bool) {
         self.umbra_notice = Some(UmbraNotice {
             system_id,
             message,
@@ -769,9 +824,20 @@ impl NomadeerApp {
     }
 
     fn start_umbra_task(&mut self, task: UmbraTask) {
-        self.status = task.label().to_owned();
+        if task.is_auto() {
+            // Work she starts on her own only clears earlier news about the same system.
+            if self
+                .umbra_notice
+                .as_ref()
+                .is_some_and(|notice| notice.system_id.as_deref() == task.briefing_system())
+            {
+                self.umbra_notice = None;
+            }
+        } else {
+            self.status = task.label().to_owned();
+            self.umbra_notice = None;
+        }
         self.umbra_task = Some(task);
-        self.umbra_notice = None;
         self.local_intel_progress = None;
     }
 
@@ -987,6 +1053,7 @@ impl NomadeerApp {
         self.spawn_sync_location(accounts[index].clone(), false);
     }
 
+    /// Puts the selected system at the front of the killboard queue.
     fn start_zkill_refresh(&mut self) {
         let Some(system) = self.selected_system() else {
             self.status = "Select a system first".to_owned();
@@ -996,15 +1063,55 @@ impl NomadeerApp {
             self.status = "Selected system has no EVE system ID yet".to_owned();
             return;
         }
-        if self.zkill_busy_system_id.is_some() {
-            self.status = "Already fetching killboard intel".to_owned();
-            return;
-        }
 
         let solar_system_id = system.solar_system_id;
         let system_name = system.name.clone();
-        self.zkill_busy_system_id = Some(solar_system_id);
-        self.status = format!("Fetching killboard intel for {system_name}...");
+        self.intel_queue
+            .push(solar_system_id, IntelRequest::Player, Instant::now());
+        if self.intel_queue.in_flight().is_some() {
+            self.status = format!("{system_name} is next for killboard intel");
+        }
+        self.maybe_start_intel();
+    }
+
+    /// Queues killboard intel for a system a character just arrived in, unless it
+    /// already has a fresh assessment.
+    fn queue_arrival_intel(&mut self, system_id: &str) {
+        let Some(system) = self.system_by_id(system_id) else {
+            return;
+        };
+        let assessed_at = self
+            .system_assessments
+            .get(system_id)
+            .map(|assessment| assessment.generated_at);
+        if auto_intel::wants_intel_on_arrival(system.solar_system_id, assessed_at, now()) {
+            let solar_system_id = system.solar_system_id;
+            self.intel_queue
+                .push(solar_system_id, IntelRequest::Arrival, Instant::now());
+        }
+    }
+
+    /// Starts the next queued killboard refresh when the last one is done.
+    fn maybe_start_intel(&mut self) {
+        let systems = &self.data.systems;
+        let Some((solar_system_id, request)) =
+            self.intel_queue
+                .start_next(Instant::now(), |solar_system_id| {
+                    systems
+                        .iter()
+                        .any(|system| system.solar_system_id == solar_system_id)
+                })
+        else {
+            return;
+        };
+        // Arrivals are gathered quietly; the selected system's panel shows them.
+        if request == IntelRequest::Player
+            && let Some(system) = systems
+                .iter()
+                .find(|system| system.solar_system_id == solar_system_id)
+        {
+            self.status = format!("Fetching killboard intel for {}...", system.name);
+        }
         let tx = self.zkill_tx.clone();
         let store = self.store.clone();
         thread::spawn(move || {
@@ -1117,6 +1224,11 @@ impl NomadeerApp {
                     traffic,
                     save_error,
                 })) => {
+                    let background = self
+                        .intel_queue
+                        .finish(Instant::now())
+                        .is_some_and(|(_, request)| request == IntelRequest::Arrival);
+                    self.intel_errors.remove(&report.solar_system_id);
                     let kill_count = report.history.kills_7d + report.history.npc_kills_7d;
                     let assessment = self
                         .data
@@ -1131,24 +1243,31 @@ impl NomadeerApp {
                         }
                         self.system_assessments
                             .insert(assessment.system_id.clone(), assessment.clone());
+                        self.queue_auto_briefing(&assessment);
                         self.upsert_system_assessment(assessment);
                         if let Err(error) = self.store.save(&self.data) {
                             save_error.get_or_insert(error);
                         }
                     }
-                    self.status = match (save_error, &report.interrupted) {
+                    let status = match (save_error, &report.interrupted) {
                         (Some(error), _) => {
-                            format!("Intel loaded, but it could not be saved: {error}")
+                            Some(format!("Intel loaded, but it could not be saved: {error}"))
                         }
-                        (None, Some(error)) => format!(
+                        // Intel gathered on arrival speaks up only when it could not be kept.
+                        _ if background => None,
+                        (None, Some(error)) => Some(format!(
                             "Loaded {kill_count} kills before zKillboard stopped answering: {error}"
-                        ),
-                        (None, None) if report.history.partial_since.is_some() => format!(
+                        )),
+                        (None, None) if report.history.partial_since.is_some() => Some(format!(
                             "Loaded the latest {kill_count} kills; older kills from this week will be read on later refreshes"
-                        ),
-                        (None, None) => format!("Loaded {kill_count} kills from the last 7 days"),
+                        )),
+                        (None, None) => {
+                            Some(format!("Loaded {kill_count} kills from the last 7 days"))
+                        }
                     };
-                    self.zkill_busy_system_id = None;
+                    if let Some(status) = status {
+                        self.status = status;
+                    }
                     self.refreshed_traffic.insert(
                         report.solar_system_id,
                         SystemTrafficHistory {
@@ -1159,12 +1278,17 @@ impl NomadeerApp {
                     self.zkill_reports.insert(report.solar_system_id, report);
                 }
                 Ok(Err(error)) => {
-                    self.zkill_busy_system_id = None;
-                    self.status = format!("Killboard intel failed: {error}");
+                    let finished = self.intel_queue.finish(Instant::now());
+                    if let Some((solar_system_id, request)) = finished {
+                        if request == IntelRequest::Player {
+                            self.status = format!("Killboard intel failed: {error}");
+                        }
+                        self.intel_errors.insert(solar_system_id, error);
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.zkill_busy_system_id = None;
+                    self.intel_queue.finish(Instant::now());
                     self.status = "Killboard update stopped unexpectedly".to_owned();
                     break;
                 }
@@ -1262,7 +1386,12 @@ impl NomadeerApp {
             );
             return;
         };
+        self.request_briefing(assessment, false);
+    }
 
+    /// Hands the assessment to Umbra's worker, waking her if she is not loaded yet.
+    fn request_briefing(&mut self, assessment: SystemAssessment, auto: bool) {
+        let system_id = assessment.system_id.clone();
         let tx = self.local_intel_tx.clone();
         let worker = self.umbra_worker.get_or_insert_with(|| {
             BriefingWorker::spawn(move |event| {
@@ -1271,13 +1400,61 @@ impl NomadeerApp {
         });
         if let Err(error) = worker.request(assessment) {
             self.umbra_worker = None;
-            self.set_umbra_notice(Some(system_id.to_owned()), error, true);
+            if auto {
+                self.note_umbra(Some(system_id), error, true);
+            } else {
+                self.set_umbra_notice(Some(system_id), error, true);
+            }
             return;
         }
         self.start_umbra_task(UmbraTask::Briefing {
-            system_id: system_id.to_owned(),
+            system_id,
             waking: false,
+            auto,
         });
+    }
+
+    /// Asks Umbra to brief a fresh assessment on her own, when she is installed and
+    /// the player wants her to. Without her core nothing is asked.
+    fn queue_auto_briefing(&mut self, assessment: &SystemAssessment) {
+        if self.data.auto_intel.umbra_briefs_automatically
+            && !assessment.model_generated
+            && !self.umbra_needs_repair
+            && local_intel::core_status() != CoreStatus::Missing
+        {
+            self.auto_briefings.request(assessment.clone());
+        }
+    }
+
+    /// Starts the next briefing Umbra owes once she is free: the selected system's
+    /// first, then the newest.
+    fn maybe_start_auto_briefing(&mut self) {
+        if self.umbra_task.is_some() || self.auto_briefings.is_empty() {
+            return;
+        }
+        if !self.data.auto_intel.umbra_briefs_automatically {
+            self.auto_briefings.clear();
+            return;
+        }
+        match local_intel::core_status() {
+            _ if self.umbra_needs_repair => {
+                self.auto_briefings.clear();
+                return;
+            }
+            CoreStatus::Ready => {}
+            // Her core is checked once per session before she briefs.
+            CoreStatus::Unchecked if !self.umbra_check_attempted => return,
+            CoreStatus::Unchecked | CoreStatus::Missing => {
+                self.auto_briefings.clear();
+                return;
+            }
+        }
+        if let Some(assessment) = self
+            .auto_briefings
+            .next(&self.system_assessments, &self.selected_system_id)
+        {
+            self.request_briefing(assessment, true);
+        }
     }
 
     fn poll_local_intel_tasks(&mut self) {
@@ -1329,17 +1506,23 @@ impl NomadeerApp {
                 if let Some(UmbraTask::Briefing { waking, .. }) = &mut self.umbra_task {
                     *waking = waking_up;
                 }
-                if let Some(task) = &self.umbra_task {
+                if let Some(task) = &self.umbra_task
+                    && !task.is_auto()
+                {
                     self.status = task.label().to_owned();
                 }
             }
             BriefingEvent::Written { source, briefing } => {
-                self.umbra_task = None;
+                let auto = self.umbra_task.take().is_some_and(|task| task.is_auto());
                 let briefed = self
                     .system_assessments
                     .get(&source.system_id)
                     .and_then(|current| local_intel::attach_briefing(current, &source, briefing));
                 let Some(briefed) = briefed else {
+                    // The newer intel has its own briefing coming.
+                    if auto {
+                        return;
+                    }
                     self.set_umbra_notice(
                         Some(source.system_id),
                         "The intel changed while Umbra was writing, so she set her briefing aside. Ask her again for the latest picture.".to_owned(),
@@ -1351,6 +1534,7 @@ impl NomadeerApp {
                     .insert(briefed.system_id.clone(), briefed.clone());
                 self.upsert_system_assessment(briefed);
                 match self.store.save(&self.data) {
+                    Ok(()) if auto => {}
                     Ok(()) => self.status = "Umbra's briefing is ready".to_owned(),
                     Err(error) => self.set_umbra_notice(
                         Some(source.system_id),
@@ -1364,12 +1548,16 @@ impl NomadeerApp {
                 error,
                 needs_repair,
             } => {
-                self.umbra_task = None;
+                let auto = self.umbra_task.take().is_some_and(|task| task.is_auto());
                 if needs_repair {
                     self.umbra_needs_repair = true;
                     self.umbra_worker = None;
                 }
-                self.set_umbra_notice(Some(source.system_id), error, true);
+                if auto {
+                    self.note_umbra(Some(source.system_id), error, true);
+                } else {
+                    self.set_umbra_notice(Some(source.system_id), error, true);
+                }
             }
         }
     }
@@ -1425,7 +1613,9 @@ impl NomadeerApp {
     }
 
     fn apply_location_sync(&mut self, location: LocationSync) {
+        let mapped_systems = self.data.systems.len();
         let (system_id, system_changed) = self.ensure_esi_system(&location.system);
+        let node_created = self.data.systems.len() > mapped_systems;
 
         let Some(account_index) = self
             .data
@@ -1477,6 +1667,15 @@ impl NomadeerApp {
 
         if !previous_system_id.is_empty() && previous_system_id != system_id {
             self.ensure_connection(&previous_system_id, &system_id, &character_name);
+        }
+
+        let first_fix = self
+            .located_this_session
+            .insert(location.account_id.clone());
+        if self.data.auto_intel.gather_on_arrival
+            && auto_intel::is_arrival(&previous_system_id, &system_id, first_fix, node_created)
+        {
+            self.queue_arrival_intel(&system_id);
         }
 
         if self.selected_system_id.is_empty() {
@@ -2286,6 +2485,7 @@ impl NomadeerApp {
             return;
         };
 
+        let system_node = system.clone();
         let system_id = system.id.clone();
         let system_name = system.name.clone();
         let system_class = Self::inferred_system_class(system);
@@ -2380,6 +2580,7 @@ impl NomadeerApp {
                     theme::accent()
                 }));
             }
+            self.intel_activity(ui, &system_node, true);
             ui.label(format!(
                 "{} connections · {} visits",
                 connection_count, visit_count
@@ -2401,6 +2602,49 @@ impl NomadeerApp {
                 self.delete_system(&system_id);
             }
         });
+    }
+
+    /// What is under way for a system's intel: its killboard refresh and, with
+    /// `with_umbra`, Umbra's briefing.
+    fn intel_activity(&self, ui: &mut egui::Ui, system: &SystemNode, with_umbra: bool) {
+        let solar_system_id = system.solar_system_id;
+        if solar_system_id != 0 {
+            if self.intel_queue.in_flight_system() == Some(solar_system_id) {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Gathering killboard intel...");
+                });
+            } else if let Some(ahead) = self.intel_queue.place(solar_system_id) {
+                let text = match ahead {
+                    0 => "Killboard intel is next in line".to_owned(),
+                    ahead => format!("Killboard intel queued · {ahead} ahead"),
+                };
+                ui.label(egui::RichText::new(text).color(theme::muted_text()));
+            } else if let Some(error) = self.intel_errors.get(&solar_system_id) {
+                ui.label(
+                    egui::RichText::new(format!("Intel could not be gathered: {error}"))
+                        .color(WARNING_TEXT),
+                );
+            }
+        }
+        if !with_umbra {
+            return;
+        }
+        match &self.umbra_task {
+            Some(task) if task.briefing_system() == Some(system.id.as_str()) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(task.label());
+                });
+            }
+            _ if self.auto_briefings.is_pending(&system.id) => {
+                ui.label(
+                    egui::RichText::new("Umbra will brief this system as soon as she is free.")
+                        .color(theme::muted_text()),
+                );
+            }
+            _ => {}
+        }
     }
 
     fn characters_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -2531,7 +2775,23 @@ impl NomadeerApp {
     }
 
     fn selected_system_intel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Intel");
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Intel");
+            let mut gather = self.data.auto_intel.gather_on_arrival;
+            if ui
+                .checkbox(&mut gather, "Gather intel on arrival")
+                .on_hover_text(
+                    "Refresh killboard intel when a character enters a system without fresh intel.",
+                )
+                .changed()
+            {
+                self.data.auto_intel.gather_on_arrival = gather;
+                if !gather {
+                    self.intel_queue.drop_arrivals();
+                }
+                self.save();
+            }
+        });
         let Some(system) = self.selected_system().cloned() else {
             ui.label("Select a system on the chain map first.");
             return;
@@ -2553,7 +2813,7 @@ impl NomadeerApp {
             }
             if ui
                 .add_enabled(
-                    self.zkill_busy_system_id.is_none() && system.solar_system_id != 0,
+                    self.can_refresh_intel(&system),
                     egui::Button::new("Refresh zKill"),
                 )
                 .clicked()
@@ -2561,6 +2821,7 @@ impl NomadeerApp {
                 self.start_zkill_refresh();
             }
         });
+        self.intel_activity(ui, &system, false);
 
         // Saved assessments outlive the session; the kill list below does not.
         let assessment = self.system_assessments.get(&system.id).cloned();
@@ -2700,7 +2961,7 @@ impl NomadeerApp {
                     );
                     if ui
                         .add_enabled(
-                            self.zkill_busy_system_id.is_none() && system.solar_system_id != 0,
+                            self.can_refresh_intel(system),
                             egui::Button::new("Refresh now"),
                         )
                         .clicked()
@@ -2764,8 +3025,14 @@ impl NomadeerApp {
         let age = current_time.saturating_sub(generated_at);
         (
             format!("Assessed {}", Self::format_duration_ago(age)),
-            age > ASSESSMENT_STALE_SECS,
+            auto_intel::assessment_is_stale(generated_at, current_time),
         )
+    }
+
+    /// A system can be refreshed unless it has no EVE system or is being fetched now.
+    fn can_refresh_intel(&self, system: &SystemNode) -> bool {
+        system.solar_system_id != 0
+            && self.intel_queue.in_flight_system() != Some(system.solar_system_id)
     }
 
     fn zkill_details_window(&mut self, ctx: &egui::Context) {
@@ -3258,6 +3525,8 @@ impl eframe::App for NomadeerApp {
         self.maybe_auto_sync();
         self.maybe_poll_traffic();
         self.maybe_check_umbra_core();
+        self.maybe_start_intel();
+        self.maybe_start_auto_briefing();
         self.top_bar(ctx);
         self.esi_settings_window(ctx);
         self.local_intel_settings_window(ctx);
@@ -3484,10 +3753,15 @@ mod tests {
         let task = UmbraTask::Briefing {
             system_id: "sys_a".to_owned(),
             waking: false,
+            auto: true,
         };
         assert_eq!(task.briefing_elsewhere(Some("sys_b")), Some("sys_a"));
         assert_eq!(task.briefing_elsewhere(Some("sys_a")), None);
         assert_eq!(task.briefing_elsewhere(None), None);
         assert_eq!(UmbraTask::Checking.briefing_elsewhere(Some("sys_b")), None);
+        assert!(task.is_auto());
+        assert_eq!(task.briefing_system(), Some("sys_a"));
+        assert!(!UmbraTask::Checking.is_auto());
+        assert_eq!(UmbraTask::Checking.briefing_system(), None);
     }
 }

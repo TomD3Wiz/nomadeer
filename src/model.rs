@@ -22,6 +22,8 @@ pub(crate) struct AppData {
     pub(crate) notes: Vec<Note>,
     #[serde(default)]
     pub(crate) system_assessments: Vec<SystemAssessment>,
+    #[serde(default)]
+    pub(crate) auto_intel: AutoIntelSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +39,25 @@ impl Default for EsiSettings {
             client_id: String::new(),
             callback_port: 8788,
             scopes: DEFAULT_ESI_SCOPES.to_owned(),
+        }
+    }
+}
+
+/// What Nomadeer does on its own as characters move. Both are on unless turned off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct AutoIntelSettings {
+    /// Refresh killboard intel when a character arrives in a system without fresh intel.
+    pub(crate) gather_on_arrival: bool,
+    /// Have Umbra brief each fresh assessment without being asked.
+    pub(crate) umbra_briefs_automatically: bool,
+}
+
+impl Default for AutoIntelSettings {
+    fn default() -> Self {
+        Self {
+            gather_on_arrival: true,
+            umbra_briefs_automatically: true,
         }
     }
 }
@@ -222,7 +243,7 @@ pub(crate) struct KillboardCoverage {
     pub(crate) until: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SystemAssessment {
     pub(crate) system_id: String,
     pub(crate) threat_score: u8,

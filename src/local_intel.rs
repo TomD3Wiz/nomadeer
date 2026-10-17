@@ -677,6 +677,32 @@ fn join_phrases(phrases: &[String]) -> String {
     }
 }
 
+/// Briefings run while EVE is open, so Umbra keeps to fewer threads than candle's
+/// default of one per physical core: about half the logical processors (one per core
+/// on SMT CPUs) less one, so the game keeps whole cores to itself.
+fn umbra_thread_count(logical_processors: usize) -> usize {
+    (logical_processors / 2).saturating_sub(1).max(1)
+}
+
+/// Caps the threads candle computes on: `CANDLE_NUM_THREADS` sizes the pool behind the
+/// quantized matrix products that dominate a briefing, and `RAYON_NUM_THREADS` the
+/// rayon pools behind its other kernels. Both are read once, when candle first needs
+/// them, so this must run before Umbra starts. A value the player set is kept.
+///
+/// # Safety
+///
+/// Changes the process environment, so it must run before any other thread starts.
+pub(crate) unsafe fn limit_cpu_threads() {
+    let logical_processors = thread::available_parallelism().map_or(1, |count| count.get());
+    let threads = umbra_thread_count(logical_processors).to_string();
+    for variable in ["CANDLE_NUM_THREADS", "RAYON_NUM_THREADS"] {
+        if std::env::var_os(variable).is_none() {
+            // SAFETY: the caller guarantees no other thread is running yet.
+            unsafe { std::env::set_var(variable, &threads) };
+        }
+    }
+}
+
 /// What the briefing worker reports back to the UI.
 #[derive(Debug)]
 pub(crate) enum BriefingEvent {
@@ -860,7 +886,7 @@ impl LoadedCore {
 
 /// True when two assessments rest on exactly the same scores and evidence, so a
 /// briefing written for one is just as true of the other.
-fn same_facts(a: &SystemAssessment, b: &SystemAssessment) -> bool {
+pub(crate) fn same_facts(a: &SystemAssessment, b: &SystemAssessment) -> bool {
     a.system_id == b.system_id
         && a.threat_score == b.threat_score
         && a.activity_score == b.activity_score
@@ -1130,8 +1156,8 @@ mod tests {
         LoadedCore, MODEL_DIRECTORY_NAME, VERIFIED_MARKER_FILE, assess_system, attach_briefing,
         clean_briefing, core_status, core_status_in, fact_sheet, import_file, import_path_hint_for,
         import_source_path, install_model, is_wormhole_space, keep_briefing, numbers_in,
-        remove_cores_in, remove_directory_in, score_label, validate_briefing, verify_core,
-        verify_core_in,
+        remove_cores_in, remove_directory_in, score_label, umbra_thread_count, validate_briefing,
+        verify_core, verify_core_in,
     };
     use crate::model::{
         KillCounts, KillboardCoverage, SystemAssessment, SystemNode, SystemTrafficHistory,
@@ -2012,6 +2038,21 @@ mod tests {
         };
         assert_eq!(briefing, "briefing 1 for 40");
         assert_eq!(loads.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn umbra_leaves_cores_free_for_the_game() {
+        assert_eq!(umbra_thread_count(32), 15);
+        assert_eq!(umbra_thread_count(16), 7);
+        assert_eq!(umbra_thread_count(12), 5);
+        assert_eq!(umbra_thread_count(8), 3);
+        assert_eq!(umbra_thread_count(6), 2);
+        assert_eq!(umbra_thread_count(4), 1);
+        assert_eq!(umbra_thread_count(2), 1);
+        assert_eq!(umbra_thread_count(1), 1);
+        for logical_processors in 3..=64 {
+            assert!(umbra_thread_count(logical_processors) <= logical_processors - 2);
+        }
     }
 
     #[test]
