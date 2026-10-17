@@ -9,7 +9,11 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
+use std::panic::{self, AssertUnwindSafe};
+use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
+use std::thread;
+use std::time::UNIX_EPOCH;
 use tokenizers::Tokenizer;
 
 pub(crate) const UMBRA_TAGLINE: &str = "Sleeper-fused intel companion";
@@ -28,80 +32,276 @@ const TOKENIZER_FILE: &str = "tokenizer.json";
 const TOKENIZER_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/resolve/989aa7980e4cf806f80c7fef2b1adb7bc71aa306/tokenizer.json";
 const TOKENIZER_SHA256: &str = "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539";
 const TOKENIZER_SIZE: u64 = 7_031_645;
-const MODEL_DIRECTORY: &str = "data/models/qwen2.5-1.5b-instruct-q4_k_m";
+const MODELS_ROOT: &str = "data/models";
+const MODEL_DIRECTORY_NAME: &str = "qwen2.5-1.5b-instruct-q4_k_m";
+/// Cores installed by older Nomadeer versions; nothing reads them any more.
+const LEGACY_MODEL_DIRECTORY_NAMES: &[&str] = &["qwen2-1.5b-instruct-q4"];
+/// Records the size and modification time of core files whose checksum matched, so
+/// later checks can trust them without hashing a gigabyte every frame.
+const VERIFIED_MARKER_FILE: &str = "verified";
 const BRIEFING_MAX_TOKENS: usize = 120;
+
+#[derive(Debug, Clone, Copy)]
+struct CoreFile<'a> {
+    name: &'a str,
+    display_name: &'a str,
+    size: u64,
+    sha256: &'a str,
+}
+
+const CORE_MODEL: CoreFile<'static> = CoreFile {
+    name: MODEL_FILE,
+    display_name: "Umbra's core",
+    size: MODEL_DOWNLOAD_SIZE,
+    sha256: MODEL_SHA256,
+};
+const CORE_TOKENIZER: CoreFile<'static> = CoreFile {
+    name: TOKENIZER_FILE,
+    display_name: "Umbra's vocabulary",
+    size: TOKENIZER_SIZE,
+    sha256: TOKENIZER_SHA256,
+};
+const CORE_FILES: [CoreFile<'static>; 2] = [CORE_MODEL, CORE_TOKENIZER];
 
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadProgress {
-    pub(crate) file: String,
-    pub(crate) downloaded: u64,
+    /// What is happening, e.g. "Downloading Umbra's core".
+    pub(crate) label: String,
+    pub(crate) done: u64,
     pub(crate) total: u64,
 }
 
-pub(crate) fn model_directory() -> PathBuf {
-    PathBuf::from(MODEL_DIRECTORY)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoreStatus {
+    /// A core file is absent or has the wrong size.
+    Missing,
+    /// The files look right but have not been checksummed since they last changed.
+    Unchecked,
+    /// The files match what was checksummed, so Umbra can use them.
+    Ready,
 }
 
-pub(crate) fn model_path() -> PathBuf {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified_nanos: u128,
+}
+
+fn model_directory() -> PathBuf {
+    Path::new(MODELS_ROOT).join(MODEL_DIRECTORY_NAME)
+}
+
+fn model_path() -> PathBuf {
     model_directory().join(MODEL_FILE)
 }
 
-pub(crate) fn tokenizer_path() -> PathBuf {
+fn tokenizer_path() -> PathBuf {
     model_directory().join(TOKENIZER_FILE)
 }
 
-pub(crate) fn is_model_installed() -> bool {
-    file_has_size(&model_path(), MODEL_DOWNLOAD_SIZE)
-        && file_has_size(&tokenizer_path(), TOKENIZER_SIZE)
+/// Cheap enough to call every frame: two metadata reads and a small marker file.
+pub(crate) fn core_status() -> CoreStatus {
+    core_status_in(&model_directory(), &CORE_FILES)
+}
+
+fn core_status_in(directory: &Path, files: &[CoreFile]) -> CoreStatus {
+    let stamps = files
+        .iter()
+        .map(|file| file_stamp(&directory.join(file.name)).filter(|stamp| stamp.len == file.size))
+        .collect::<Option<Vec<_>>>();
+    let Some(stamps) = stamps else {
+        return CoreStatus::Missing;
+    };
+    match fs::read_to_string(directory.join(VERIFIED_MARKER_FILE)) {
+        Ok(marker) if marker == marker_contents(files, &stamps) => CoreStatus::Ready,
+        _ => CoreStatus::Unchecked,
+    }
+}
+
+/// Checksums an installed core that has no verified marker, e.g. one installed by an
+/// older Nomadeer or changed on disk since.
+pub(crate) fn verify_core() -> Result<(), String> {
+    verify_core_in(&model_directory(), &CORE_FILES)
+}
+
+fn verify_core_in(directory: &Path, files: &[CoreFile]) -> Result<(), String> {
+    let _ = fs::remove_file(directory.join(VERIFIED_MARKER_FILE));
+    for file in files {
+        verify_file(&directory.join(file.name), file.sha256, file.size).map_err(|_| {
+            format!(
+                "{} is damaged. Reinstall Umbra to repair her.",
+                file.display_name
+            )
+        })?;
+    }
+    mark_verified_in(directory, files)
+}
+
+/// Records the current files as verified; call only straight after checksumming them.
+fn mark_verified_in(directory: &Path, files: &[CoreFile]) -> Result<(), String> {
+    let stamps = files
+        .iter()
+        .map(|file| file_stamp(&directory.join(file.name)))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "Umbra's core disappeared while it was being checked".to_owned())?;
+    let marker = directory.join(VERIFIED_MARKER_FILE);
+    let part_path = marker.with_extension("part");
+    fs::write(&part_path, marker_contents(files, &stamps)).map_err(|error| error.to_string())?;
+    fs::rename(part_path, marker).map_err(|error| error.to_string())
+}
+
+fn marker_contents(files: &[CoreFile], stamps: &[FileStamp]) -> String {
+    files
+        .iter()
+        .zip(stamps)
+        .map(|(file, stamp)| {
+            format!(
+                "{} {} {} {}\n",
+                file.name, file.sha256, stamp.len, stamp.modified_nanos
+            )
+        })
+        .collect()
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    // A filesystem without modification times still gets a stable stamp from the size.
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    Some(FileStamp {
+        len: metadata.len(),
+        modified_nanos,
+    })
 }
 
 pub(crate) fn install_model(mut progress: impl FnMut(DownloadProgress)) -> Result<(), String> {
-    fs::create_dir_all(model_directory()).map_err(|error| error.to_string())?;
-    download_verified(
-        MODEL_URL,
-        &model_path(),
-        MODEL_SHA256,
-        MODEL_DOWNLOAD_SIZE,
-        MODEL_FILE,
-        &mut progress,
-    )?;
+    let directory = model_directory();
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    for (file, url) in [(CORE_MODEL, MODEL_URL), (CORE_TOKENIZER, TOKENIZER_URL)] {
+        download_verified(url, &directory.join(file.name), file, &mut progress)?;
+    }
+    mark_verified_in(&directory, &CORE_FILES)?;
+    remove_legacy_cores();
+    Ok(())
+}
+
+/// Installs the core from a file the player already downloaded.
+pub(crate) fn import_model(
+    source: &Path,
+    mut progress: impl FnMut(DownloadProgress),
+) -> Result<(), String> {
+    if !source.is_file() {
+        return Err(format!("Choose the downloaded {MODEL_NAME} file"));
+    }
+    let directory = model_directory();
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    import_file(source, &model_path(), CORE_MODEL, &mut progress)?;
     download_verified(
         TOKENIZER_URL,
         &tokenizer_path(),
-        TOKENIZER_SHA256,
-        TOKENIZER_SIZE,
-        TOKENIZER_FILE,
+        CORE_TOKENIZER,
         &mut progress,
-    )
-}
-
-pub(crate) fn import_model(source: &Path) -> Result<(), String> {
-    if !source.is_file() {
-        return Err("Choose the downloaded Qwen2.5 GGUF model file".to_owned());
-    }
-    verify_file(source, MODEL_SHA256, MODEL_DOWNLOAD_SIZE)?;
-    fs::create_dir_all(model_directory()).map_err(|error| error.to_string())?;
-    fs::copy(source, model_path()).map_err(|error| error.to_string())?;
-
-    if !file_has_size(&tokenizer_path(), TOKENIZER_SIZE) {
-        download_verified(
-            TOKENIZER_URL,
-            &tokenizer_path(),
-            TOKENIZER_SHA256,
-            TOKENIZER_SIZE,
-            TOKENIZER_FILE,
-            &mut |_| {},
-        )?;
-    }
+    )?;
+    mark_verified_in(&directory, &CORE_FILES)?;
+    remove_legacy_cores();
     Ok(())
 }
 
+/// Copies a core file into place through a temporary file, checksumming as it goes,
+/// so a wrong, failed or interrupted copy never replaces the installed file.
+fn import_file(
+    source: &Path,
+    destination: &Path,
+    file: CoreFile,
+    progress: &mut impl FnMut(DownloadProgress),
+) -> Result<(), String> {
+    let not_official = || format!("That file is not the official {MODEL_NAME} release");
+    if let (Ok(source), Ok(installed)) = (source.canonicalize(), destination.canonicalize())
+        && source == installed
+    {
+        // Copying a file onto itself would empty it; it only needs checking.
+        return verify_file(destination, file.sha256, file.size).map_err(|_| not_official());
+    }
+    let size = fs::metadata(source)
+        .map_err(|error| error.to_string())?
+        .len();
+    if size != file.size {
+        return Err(not_official());
+    }
+
+    let part_path = destination.with_extension("part");
+    let mut input = File::open(source).map_err(|error| error.to_string())?;
+    let copied = write_hashed(
+        &mut input,
+        &part_path,
+        &format!("Copying {}", file.display_name),
+        file.size,
+        progress,
+    );
+    match copied {
+        Ok((bytes, hash)) if bytes == file.size && hash == file.sha256 => {
+            fs::rename(&part_path, destination).map_err(|error| error.to_string())
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(&part_path);
+            Err(not_official())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&part_path);
+            Err(error)
+        }
+    }
+}
+
+/// Removes Umbra's core along with any left behind by older Nomadeer versions.
 pub(crate) fn remove_model() -> Result<(), String> {
-    let directory = model_directory();
-    if directory.exists() {
-        fs::remove_dir_all(directory).map_err(|error| error.to_string())?;
+    remove_cores_in(Path::new(MODELS_ROOT))
+}
+
+/// True when an older Nomadeer left a core behind that only takes up space.
+pub(crate) fn has_legacy_cores() -> bool {
+    LEGACY_MODEL_DIRECTORY_NAMES
+        .iter()
+        .any(|name| Path::new(MODELS_ROOT).join(name).exists())
+}
+
+fn remove_legacy_cores() {
+    for name in LEGACY_MODEL_DIRECTORY_NAMES {
+        // Leftovers only cost disk space, and Remove Umbra tries again.
+        let _ = remove_directory_in(Path::new(MODELS_ROOT), name);
     }
-    Ok(())
+}
+
+fn remove_cores_in(root: &Path) -> Result<(), String> {
+    std::iter::once(&MODEL_DIRECTORY_NAME)
+        .chain(LEGACY_MODEL_DIRECTORY_NAMES)
+        .try_for_each(|name| remove_directory_in(root, name))
+}
+
+/// Deletes `root/name`, refusing any name that could reach outside `root`.
+fn remove_directory_in(root: &Path, name: &str) -> Result<(), String> {
+    let mut components = Path::new(name).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        return Err(format!("Refusing to remove {name}"));
+    }
+    let directory = root.join(name);
+    match fs::symlink_metadata(&directory) {
+        // remove_dir_all removes a symlink itself, never what it points to.
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&directory),
+        Ok(_) => fs::remove_file(&directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+    .map_err(|error| error.to_string())
 }
 
 /// W-space solar system IDs, Thera included.
@@ -382,77 +582,217 @@ fn join_phrases(phrases: &[String]) -> String {
     }
 }
 
-pub(crate) fn generate_briefing(assessment: &SystemAssessment) -> Result<String, String> {
-    if !is_model_installed() {
-        return Err("Install Umbra first".to_owned());
+/// What the briefing worker reports back to the UI.
+#[derive(Debug)]
+pub(crate) enum BriefingEvent {
+    /// Umbra's core is being read into memory before her first briefing this session.
+    Waking,
+    Writing,
+    Written {
+        source: SystemAssessment,
+        briefing: String,
+    },
+    Failed {
+        source: SystemAssessment,
+        error: String,
+        /// The core itself could not be loaded, so reinstalling is the fix.
+        needs_repair: bool,
+    },
+}
+
+/// A long-lived thread that keeps Umbra's core loaded between briefings, so only the
+/// first one pays for reading and unpacking the gigabyte-sized core. Dropping the
+/// worker ends the thread and frees the core once any briefing in progress finishes.
+pub(crate) struct BriefingWorker {
+    jobs: Sender<SystemAssessment>,
+}
+
+impl BriefingWorker {
+    pub(crate) fn spawn(on_event: impl Fn(BriefingEvent) + Send + 'static) -> Self {
+        Self::spawn_with(LoadedCore::load, LoadedCore::brief, on_event)
     }
 
-    let tokenizer = Tokenizer::from_file(tokenizer_path()).map_err(|error| error.to_string())?;
-    let mut file = File::open(model_path()).map_err(|error| error.to_string())?;
-    let content = gguf_file::Content::read(&mut file).map_err(|error| error.to_string())?;
-    let device = Device::Cpu;
-    let mut model =
-        Qwen2::from_gguf(content, &mut file, &device).map_err(|error| error.to_string())?;
-
-    let reply_prefix = format!("Threat is {}", score_label(assessment.threat_score));
-    let prompt = format!("{}{reply_prefix}", briefing_prompt(assessment));
-    let tokens = tokenizer
-        .encode(prompt, true)
-        .map_err(|error| error.to_string())?;
-    let input_ids = tokens.get_ids();
-    if input_ids.is_empty() {
-        return Err("The local model received an empty prompt".to_owned());
+    fn spawn_with<C: 'static>(
+        load: impl Fn() -> Result<C, String> + Send + 'static,
+        brief: impl Fn(&mut C, &SystemAssessment) -> Result<String, String> + Send + 'static,
+        on_event: impl Fn(BriefingEvent) + Send + 'static,
+    ) -> Self {
+        let (jobs, requests) = mpsc::channel::<SystemAssessment>();
+        thread::spawn(move || {
+            let mut core = None;
+            while let Ok(source) = requests.recv() {
+                // The core is taken out while it works, so a panic leaves none behind
+                // and the next request loads it afresh.
+                let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let mut loaded = match core.take() {
+                        Some(loaded) => loaded,
+                        None => {
+                            on_event(BriefingEvent::Waking);
+                            load().map_err(|error| (error, true))?
+                        }
+                    };
+                    on_event(BriefingEvent::Writing);
+                    let briefing = brief(&mut loaded, &source);
+                    core = Some(loaded);
+                    briefing.map_err(|error| (error, false))
+                }));
+                let event = match outcome {
+                    Ok(Ok(briefing)) => BriefingEvent::Written { source, briefing },
+                    Ok(Err((error, needs_repair))) => BriefingEvent::Failed {
+                        source,
+                        error,
+                        needs_repair,
+                    },
+                    Err(_) => BriefingEvent::Failed {
+                        source,
+                        error: "Umbra lost her train of thought. Ask her again.".to_owned(),
+                        needs_repair: false,
+                    },
+                };
+                on_event(event);
+            }
+        });
+        Self { jobs }
     }
 
-    let input = Tensor::new(input_ids, &device)
-        .and_then(|tensor| tensor.unsqueeze(0))
-        .map_err(|error| error.to_string())?;
-    let logits = model
-        .forward(&input, 0)
-        .and_then(|logits| logits.squeeze(0))
-        .map_err(|error| error.to_string())?;
-    // Greedy decoding keeps briefings reproducible and stops a small model from
-    // drifting away from the supplied facts.
-    let mut processor = LogitsProcessor::from_sampling(assessment.generated_at, Sampling::ArgMax);
-    let mut next_token = processor
-        .sample(&logits)
-        .map_err(|error| error.to_string())?;
-    let vocab = tokenizer.get_vocab(true);
-    let stop_tokens = ["<|im_end|>", "<|endoftext|>"]
-        .iter()
-        .filter_map(|token| vocab.get(*token).copied())
-        .collect::<Vec<_>>();
-    if stop_tokens.is_empty() {
-        return Err("Local model tokenizer has no end token".to_owned());
+    pub(crate) fn request(&self, assessment: SystemAssessment) -> Result<(), String> {
+        self.jobs
+            .send(assessment)
+            .map_err(|_| "Umbra stopped unexpectedly. Ask her again.".to_owned())
     }
-    let mut generated = Vec::new();
+}
 
-    for index in 0..BRIEFING_MAX_TOKENS {
-        if stop_tokens.contains(&next_token) {
-            break;
+/// Umbra's core read into memory, ready to write briefings.
+struct LoadedCore {
+    tokenizer: Tokenizer,
+    model: Qwen2,
+    device: Device,
+    stop_tokens: Vec<u32>,
+}
+
+impl LoadedCore {
+    fn load() -> Result<Self, String> {
+        if core_status() != CoreStatus::Ready {
+            return Err("Install Umbra first".to_owned());
         }
-        generated.push(next_token);
-        let input = Tensor::new(&[next_token], &device)
+        let unreadable =
+            |error: String| format!("Umbra's core could not be read ({error}). Reinstall Umbra.");
+        let tokenizer = Tokenizer::from_file(tokenizer_path())
+            .map_err(|error| unreadable(error.to_string()))?;
+        let mut file = File::open(model_path()).map_err(|error| unreadable(error.to_string()))?;
+        let content =
+            gguf_file::Content::read(&mut file).map_err(|error| unreadable(error.to_string()))?;
+        let device = Device::Cpu;
+        let model = Qwen2::from_gguf(content, &mut file, &device)
+            .map_err(|error| unreadable(error.to_string()))?;
+        let vocab = tokenizer.get_vocab(true);
+        let stop_tokens = ["<|im_end|>", "<|endoftext|>"]
+            .iter()
+            .filter_map(|token| vocab.get(*token).copied())
+            .collect::<Vec<_>>();
+        if stop_tokens.is_empty() {
+            return Err(unreadable("no end token".to_owned()));
+        }
+        Ok(Self {
+            tokenizer,
+            model,
+            device,
+            stop_tokens,
+        })
+    }
+
+    fn brief(&mut self, assessment: &SystemAssessment) -> Result<String, String> {
+        // Each briefing starts from an empty context.
+        self.model.clear_kv_cache();
+        let reply_prefix = format!("Threat is {}", score_label(assessment.threat_score));
+        let prompt = format!("{}{reply_prefix}", briefing_prompt(assessment));
+        let tokens = self
+            .tokenizer
+            .encode(prompt, true)
+            .map_err(|error| error.to_string())?;
+        let input_ids = tokens.get_ids();
+        if input_ids.is_empty() {
+            return Err("Umbra received an empty fact sheet".to_owned());
+        }
+
+        let input = Tensor::new(input_ids, &self.device)
             .and_then(|tensor| tensor.unsqueeze(0))
             .map_err(|error| error.to_string())?;
-        let logits = model
-            .forward(&input, input_ids.len() + index)
+        let logits = self
+            .model
+            .forward(&input, 0)
             .and_then(|logits| logits.squeeze(0))
             .map_err(|error| error.to_string())?;
-        next_token = processor
+        // Greedy decoding keeps briefings reproducible and stops a small model from
+        // drifting away from the supplied facts.
+        let mut processor =
+            LogitsProcessor::from_sampling(assessment.generated_at, Sampling::ArgMax);
+        let mut next_token = processor
             .sample(&logits)
             .map_err(|error| error.to_string())?;
-    }
+        let mut generated = Vec::new();
 
-    let decoded = tokenizer
-        .decode(&generated, true)
-        .map_err(|error| error.to_string())?;
-    let briefing = clean_briefing(&format!("{reply_prefix}{decoded}"));
-    if briefing == reply_prefix {
-        return Err("Local model returned an empty briefing".to_owned());
+        for index in 0..BRIEFING_MAX_TOKENS {
+            if self.stop_tokens.contains(&next_token) {
+                break;
+            }
+            generated.push(next_token);
+            let input = Tensor::new(&[next_token], &self.device)
+                .and_then(|tensor| tensor.unsqueeze(0))
+                .map_err(|error| error.to_string())?;
+            let logits = self
+                .model
+                .forward(&input, input_ids.len() + index)
+                .and_then(|logits| logits.squeeze(0))
+                .map_err(|error| error.to_string())?;
+            next_token = processor
+                .sample(&logits)
+                .map_err(|error| error.to_string())?;
+        }
+
+        let decoded = self
+            .tokenizer
+            .decode(&generated, true)
+            .map_err(|error| error.to_string())?;
+        let briefing = clean_briefing(&format!("{reply_prefix}{decoded}"));
+        if briefing == reply_prefix {
+            return Err("Umbra had nothing to add to the evidence".to_owned());
+        }
+        validate_briefing(&briefing, assessment)?;
+        Ok(briefing)
     }
-    validate_briefing(&briefing, assessment)?;
-    Ok(briefing)
+}
+
+/// True when two assessments rest on exactly the same scores and evidence, so a
+/// briefing written for one is just as true of the other.
+fn same_facts(a: &SystemAssessment, b: &SystemAssessment) -> bool {
+    a.system_id == b.system_id
+        && a.threat_score == b.threat_score
+        && a.activity_score == b.activity_score
+        && a.confidence == b.confidence
+        && a.evidence == b.evidence
+}
+
+/// Puts Umbra's briefing on the current assessment, unless a refresh replaced the
+/// assessment she was briefing from with different facts.
+pub(crate) fn attach_briefing(
+    current: &SystemAssessment,
+    source: &SystemAssessment,
+    briefing: String,
+) -> Option<SystemAssessment> {
+    same_facts(current, source).then(|| SystemAssessment {
+        briefing,
+        model_generated: true,
+        ..current.clone()
+    })
+}
+
+/// Keeps Umbra's briefing across a refresh that found exactly the same evidence.
+pub(crate) fn keep_briefing(refreshed: &mut SystemAssessment, previous: &SystemAssessment) {
+    if previous.model_generated && same_facts(refreshed, previous) {
+        refreshed.briefing = previous.briefing.clone();
+        refreshed.model_generated = true;
+    }
 }
 
 fn briefing_prompt(assessment: &SystemAssessment) -> String {
@@ -514,7 +854,7 @@ fn clean_briefing(text: &str) -> String {
 fn validate_briefing(briefing: &str, assessment: &SystemAssessment) -> Result<(), String> {
     let activity_label = score_label(assessment.activity_score).to_lowercase();
     if !briefing.to_lowercase().contains(&activity_label) {
-        return Err("Local model briefing left out the activity level".to_owned());
+        return Err("Umbra's briefing left out the activity level, so it was set aside".to_owned());
     }
 
     let facts = fact_sheet(assessment);
@@ -524,7 +864,7 @@ fn validate_briefing(briefing: &str, assessment: &SystemAssessment) -> Result<()
         .find(|number| !known_numbers.contains(number))
     {
         return Err(format!(
-            "Local model briefing used {number}, which is not in the evidence"
+            "Umbra's briefing quoted {number}, which is not in the evidence, so it was set aside"
         ));
     }
     Ok(())
@@ -569,12 +909,10 @@ pub(crate) fn score_label(score: u8) -> &'static str {
 fn download_verified(
     url: &str,
     destination: &Path,
-    expected_hash: &str,
-    expected_size: u64,
-    display_name: &str,
+    file: CoreFile,
     progress: &mut impl FnMut(DownloadProgress),
 ) -> Result<(), String> {
-    if destination.exists() && verify_file(destination, expected_hash, expected_size).is_ok() {
+    if destination.exists() && verify_file(destination, file.sha256, file.size).is_ok() {
         return Ok(());
     }
 
@@ -589,16 +927,50 @@ fn download_verified(
         .map_err(|error| error.to_string())?;
     if !response.status().is_success() {
         return Err(format!(
-            "Model host returned {} while downloading {display_name}",
-            response.status()
+            "The download server returned {} for {}",
+            response.status(),
+            file.display_name
         ));
     }
 
-    let total = response.content_length().unwrap_or(expected_size);
+    let total = response.content_length().unwrap_or(file.size);
     let mut reader = response;
-    let mut output = File::create(&part_path).map_err(|error| error.to_string())?;
+    let written = write_hashed(
+        &mut reader,
+        &part_path,
+        &format!("Downloading {}", file.display_name),
+        total,
+        progress,
+    );
+    let (downloaded, hash) = match written {
+        Ok(written) => written,
+        Err(error) => {
+            let _ = fs::remove_file(&part_path);
+            return Err(error);
+        }
+    };
+    if downloaded != file.size || hash != file.sha256 {
+        let _ = fs::remove_file(&part_path);
+        return Err(format!(
+            "{} arrived damaged. Try installing again.",
+            file.display_name
+        ));
+    }
+
+    fs::rename(part_path, destination).map_err(|error| error.to_string())
+}
+
+/// Streams `reader` into `path`, returning the byte count and SHA-256 of what was written.
+fn write_hashed(
+    reader: &mut impl Read,
+    path: &Path,
+    label: &str,
+    total: u64,
+    progress: &mut impl FnMut(DownloadProgress),
+) -> Result<(u64, String), String> {
+    let mut output = File::create(path).map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
-    let mut downloaded = 0_u64;
+    let mut done = 0_u64;
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count = reader
@@ -611,34 +983,21 @@ fn download_verified(
             .write_all(&buffer[..count])
             .map_err(|error| error.to_string())?;
         hasher.update(&buffer[..count]);
-        downloaded += count as u64;
+        done += count as u64;
         progress(DownloadProgress {
-            file: display_name.to_owned(),
-            downloaded,
+            label: label.to_owned(),
+            done,
             total,
         });
     }
     output.sync_all().map_err(|error| error.to_string())?;
-
-    if downloaded != expected_size {
-        let _ = fs::remove_file(&part_path);
-        return Err(format!(
-            "Downloaded {display_name} has the wrong size ({downloaded} bytes)"
-        ));
-    }
-    let hash = format!("{:x}", hasher.finalize());
-    if hash != expected_hash {
-        let _ = fs::remove_file(&part_path);
-        return Err(format!("Downloaded {display_name} failed verification"));
-    }
-
-    fs::rename(part_path, destination).map_err(|error| error.to_string())
+    Ok((done, format!("{:x}", hasher.finalize())))
 }
 
 fn verify_file(path: &Path, expected_hash: &str, expected_size: u64) -> Result<(), String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     if metadata.len() != expected_size {
-        return Err("Model file size does not match".to_owned());
+        return Err("size does not match".to_owned());
     }
     let mut file = File::open(path).map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
@@ -652,15 +1011,9 @@ fn verify_file(path: &Path, expected_hash: &str, expected_size: u64) -> Result<(
     }
     let hash = format!("{:x}", hasher.finalize());
     if hash != expected_hash {
-        return Err("Model checksum does not match".to_owned());
+        return Err("checksum does not match".to_owned());
     }
     Ok(())
-}
-
-fn file_has_size(path: &Path, expected_size: u64) -> bool {
-    fs::metadata(path)
-        .map(|metadata| metadata.len() == expected_size)
-        .unwrap_or(false)
 }
 
 fn format_isk(value: f64) -> String {
@@ -678,8 +1031,11 @@ fn format_isk(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        assess_system, clean_briefing, fact_sheet, generate_briefing, install_model,
-        is_model_installed, is_wormhole_space, numbers_in, score_label, validate_briefing,
+        BriefingEvent, BriefingWorker, CoreFile, CoreStatus, LEGACY_MODEL_DIRECTORY_NAMES,
+        LoadedCore, MODEL_DIRECTORY_NAME, VERIFIED_MARKER_FILE, assess_system, attach_briefing,
+        clean_briefing, core_status, core_status_in, fact_sheet, import_file, install_model,
+        is_wormhole_space, keep_briefing, numbers_in, remove_cores_in, remove_directory_in,
+        score_label, validate_briefing, verify_core, verify_core_in,
     };
     use crate::model::{
         KillCounts, KillboardCoverage, SystemAssessment, SystemNode, SystemTrafficHistory,
@@ -687,6 +1043,46 @@ mod tests {
     };
     use crate::util::{DAY_SECS, HOUR_SECS};
     use crate::zkill::{ZkillHistory, ZkillReport};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, SystemTime};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("nomadeer-umbra-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("temp dir should be created");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn sha256(contents: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(contents))
+    }
+
+    fn core_file<'a>(name: &'a str, contents: &[u8], hash: &'a str) -> CoreFile<'a> {
+        CoreFile {
+            name,
+            display_name: name,
+            size: contents.len() as u64,
+            sha256: hash,
+        }
+    }
 
     /// Twenty minutes into an hour, so data captured this hour is fresh.
     const NOW: u64 = 20_000 * HOUR_SECS + 1_200;
@@ -1076,7 +1472,17 @@ mod tests {
     #[test]
     #[ignore = "requires the installed local model"]
     fn installed_model_briefing_scenarios() {
-        assert!(is_model_installed(), "install the local model first");
+        if core_status() == CoreStatus::Unchecked {
+            verify_core().expect("installed core should verify");
+        }
+        assert_eq!(
+            core_status(),
+            CoreStatus::Ready,
+            "install the local model first"
+        );
+        let started = std::time::Instant::now();
+        let mut core = LoadedCore::load().expect("installed core should load");
+        println!("[{:.1}s] loaded", started.elapsed().as_secs_f32());
         let scenarios = [
             test_assessment(
                 68,
@@ -1125,7 +1531,7 @@ mod tests {
         let mut failures = 0;
         for assessment in scenarios {
             let started = std::time::Instant::now();
-            match generate_briefing(&assessment) {
+            match core.brief(&assessment) {
                 Ok(briefing) => println!("[{:.1}s] {briefing}", started.elapsed().as_secs_f32()),
                 Err(error) => {
                     failures += 1;
@@ -1165,8 +1571,217 @@ mod tests {
             model_generated: false,
             generated_at: 1,
         };
-        let briefing = generate_briefing(&assessment).expect("model should generate");
+        let briefing = LoadedCore::load()
+            .and_then(|mut core| core.brief(&assessment))
+            .expect("model should generate");
         println!("{briefing}");
         assert!(!briefing.trim().is_empty());
+    }
+
+    #[test]
+    fn core_counts_as_ready_only_after_its_checksum_matched() {
+        let dir = TempDir::new("marker");
+        let core_bytes = b"umbra core weights".to_vec();
+        let vocab_bytes = b"umbra vocabulary".to_vec();
+        let (core_hash, vocab_hash) = (sha256(&core_bytes), sha256(&vocab_bytes));
+        let files = [
+            core_file("core.gguf", &core_bytes, &core_hash),
+            core_file("vocab.json", &vocab_bytes, &vocab_hash),
+        ];
+        assert_eq!(core_status_in(&dir.path, &files), CoreStatus::Missing);
+
+        fs::write(dir.path.join("core.gguf"), &core_bytes).unwrap();
+        fs::write(dir.path.join("vocab.json"), &vocab_bytes).unwrap();
+        assert_eq!(core_status_in(&dir.path, &files), CoreStatus::Unchecked);
+        verify_core_in(&dir.path, &files).expect("matching files should verify");
+        assert_eq!(core_status_in(&dir.path, &files), CoreStatus::Ready);
+
+        // Same size, different bytes: the cheap check notices the change, the
+        // checksum catches the damage.
+        let mut damaged = core_bytes.clone();
+        damaged[0] ^= 0xff;
+        fs::write(dir.path.join("core.gguf"), &damaged).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(dir.path.join("core.gguf"))
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(core_status_in(&dir.path, &files), CoreStatus::Unchecked);
+        let error = verify_core_in(&dir.path, &files).expect_err("damaged core must fail");
+        assert!(error.contains("Reinstall Umbra"), "{error}");
+        assert!(!dir.path.join(VERIFIED_MARKER_FILE).exists());
+        assert_eq!(core_status_in(&dir.path, &files), CoreStatus::Unchecked);
+    }
+
+    #[test]
+    fn importing_the_installed_file_keeps_it() {
+        let dir = TempDir::new("import");
+        let contents = b"official umbra core".to_vec();
+        let hash = sha256(&contents);
+        let file = core_file("core.gguf", &contents, &hash);
+        let source = dir.path.join("download.gguf");
+        let installed = dir.path.join("core.gguf");
+        fs::write(&source, &contents).unwrap();
+
+        let mut reports = 0;
+        import_file(&source, &installed, file, &mut |_| reports += 1).unwrap();
+        assert_eq!(fs::read(&installed).unwrap(), contents);
+        assert!(reports > 0);
+
+        // Through a different spelling of the same path, too.
+        let same = dir.path.join(".").join("core.gguf");
+        import_file(&same, &installed, file, &mut |_| {}).unwrap();
+        assert_eq!(fs::read(&installed).unwrap(), contents);
+
+        // A wrong file is refused and the installed one is left alone.
+        let wrong = dir.path.join("wrong.gguf");
+        fs::write(&wrong, b"another file entirely").unwrap();
+        assert!(import_file(&wrong, &installed, file, &mut |_| {}).is_err());
+        let same_size = dir.path.join("same-size.gguf");
+        fs::write(&same_size, b"OFFICIAL UMBRA CORE").unwrap();
+        assert!(import_file(&same_size, &installed, file, &mut |_| {}).is_err());
+        assert_eq!(fs::read(&installed).unwrap(), contents);
+        assert!(!installed.with_extension("part").exists());
+    }
+
+    #[test]
+    fn removing_umbra_clears_old_cores_and_nothing_else() {
+        let dir = TempDir::new("remove");
+        let root = dir.path.join("models");
+        let current = root.join(MODEL_DIRECTORY_NAME);
+        let legacy = root.join(LEGACY_MODEL_DIRECTORY_NAMES[0]);
+        let unrelated = root.join("someone-elses-model");
+        for directory in [&current, &legacy, &unrelated] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("weights.gguf"), b"weights").unwrap();
+        }
+        fs::write(dir.path.join("outside.txt"), b"keep").unwrap();
+
+        remove_cores_in(&root).unwrap();
+        assert!(!current.exists());
+        assert!(!legacy.exists());
+        assert!(unrelated.join("weights.gguf").exists());
+        assert!(dir.path.join("outside.txt").exists());
+        // Removing again finds nothing to do.
+        remove_cores_in(&root).unwrap();
+
+        for name in ["..", "../models", "a/b", "/tmp", ""] {
+            assert!(remove_directory_in(&root, name).is_err(), "{name}");
+        }
+        assert!(unrelated.exists());
+        assert!(Path::new(&dir.path).join("outside.txt").exists());
+    }
+
+    fn next_event(events: &mpsc::Receiver<BriefingEvent>) -> BriefingEvent {
+        events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should answer")
+    }
+
+    /// Skips the progress events and returns how the briefing ended.
+    fn outcome(events: &mpsc::Receiver<BriefingEvent>) -> BriefingEvent {
+        loop {
+            match next_event(events) {
+                BriefingEvent::Waking | BriefingEvent::Writing => {}
+                event => return event,
+            }
+        }
+    }
+
+    #[test]
+    fn briefing_worker_keeps_the_core_loaded_between_briefings() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let load_count = Arc::clone(&loads);
+        let (tx, events) = mpsc::channel();
+        let worker = BriefingWorker::spawn_with(
+            move || {
+                // The first load fails, as a damaged core would.
+                match load_count.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err("unreadable".to_owned()),
+                    _ => Ok(0_usize),
+                }
+            },
+            |briefings: &mut usize, assessment: &SystemAssessment| {
+                *briefings += 1;
+                if assessment.threat_score == 99 {
+                    panic!("model fell over");
+                }
+                Ok(format!(
+                    "briefing {briefings} for {}",
+                    assessment.threat_score
+                ))
+            },
+            move |event| {
+                let _ = tx.send(event);
+            },
+        );
+
+        worker.request(test_assessment(10, 0, "Low", &[])).unwrap();
+        assert!(matches!(next_event(&events), BriefingEvent::Waking));
+        assert!(matches!(
+            next_event(&events),
+            BriefingEvent::Failed {
+                needs_repair: true,
+                ..
+            }
+        ));
+
+        for threat in [20, 30] {
+            worker
+                .request(test_assessment(threat, 0, "Low", &[]))
+                .unwrap();
+        }
+        let BriefingEvent::Written { briefing, source } = outcome(&events) else {
+            panic!("first briefing should be written");
+        };
+        assert_eq!(
+            (briefing.as_str(), source.threat_score),
+            ("briefing 1 for 20", 20)
+        );
+        let BriefingEvent::Written { briefing, .. } = outcome(&events) else {
+            panic!("second briefing should be written");
+        };
+        assert_eq!(briefing, "briefing 2 for 30");
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+
+        // A panic is reported, and the next briefing starts from a fresh core.
+        worker.request(test_assessment(99, 0, "Low", &[])).unwrap();
+        assert!(matches!(
+            outcome(&events),
+            BriefingEvent::Failed {
+                needs_repair: false,
+                ..
+            }
+        ));
+        worker.request(test_assessment(40, 0, "Low", &[])).unwrap();
+        let BriefingEvent::Written { briefing, .. } = outcome(&events) else {
+            panic!("briefing after a panic should be written");
+        };
+        assert_eq!(briefing, "briefing 1 for 40");
+        assert_eq!(loads.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn briefing_only_attaches_to_the_assessment_it_was_written_from() {
+        let source = test_assessment(68, 21, "Medium", &["1 kill in the last hour"]);
+        let mut same = source.clone();
+        same.generated_at = 500;
+        let briefed = attach_briefing(&same, &source, "Threat is Elevated.".to_owned())
+            .expect("identical facts should take the briefing");
+        assert!(briefed.model_generated);
+        assert_eq!(briefed.briefing, "Threat is Elevated.");
+        assert_eq!(briefed.generated_at, 500);
+
+        let newer = test_assessment(80, 21, "Medium", &["3 kills in the last hour"]);
+        assert!(attach_briefing(&newer, &source, "Threat is Elevated.".to_owned()).is_none());
+
+        let mut refreshed = same.clone();
+        keep_briefing(&mut refreshed, &briefed);
+        assert!(refreshed.model_generated);
+        assert_eq!(refreshed.briefing, "Threat is Elevated.");
+        let mut changed = newer.clone();
+        keep_briefing(&mut changed, &briefed);
+        assert!(!changed.model_generated);
     }
 }

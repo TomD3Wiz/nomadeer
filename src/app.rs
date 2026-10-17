@@ -2,11 +2,11 @@ use crate::chain_archive::{self, ChainSnapshot, ChainSnapshotMeta};
 use crate::config::theme;
 use crate::esi::{self, AccountAuthorization, LocationSync, SystemIntel};
 use crate::forms::*;
-use crate::local_intel::{self, DownloadProgress};
+use crate::local_intel::{self, BriefingEvent, BriefingWorker, CoreStatus, DownloadProgress};
 use crate::model::*;
 use crate::portrait;
 use crate::store::{KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS};
-use crate::util::{clean, now, open_url};
+use crate::util::{HOUR_SECS, clean, now, open_url};
 use crate::widgets::{pill, record_frame};
 use crate::zkill::{self, ZkillKill, ZkillReport};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const CHAIN_ARCHIVE_DIR: &str = "data/chains";
+/// The assessment weighs the last hour most, so after an hour it no longer describes
+/// the system as it is now.
+const ASSESSMENT_STALE_SECS: u64 = HOUR_SECS;
+const WARNING_TEXT: Color32 = Color32::from_rgb(255, 194, 87);
 
 enum EsiTaskResult {
     Authorized(AccountAuthorization),
@@ -48,12 +52,44 @@ struct TrafficFeedState {
 enum LocalIntelTaskResult {
     Installed,
     Imported,
-    Briefing { system_id: String, briefing: String },
+    Checked,
 }
 
 enum LocalIntelEvent {
     Progress(DownloadProgress),
     Finished(Result<LocalIntelTaskResult, String>),
+    Briefing(BriefingEvent),
+}
+
+/// What Umbra is busy with; she does one thing at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UmbraTask {
+    Installing,
+    Importing,
+    Checking,
+    Briefing { system_id: String, waking: bool },
+}
+
+impl UmbraTask {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Installing => "Installing Umbra...",
+            Self::Importing => "Installing Umbra from your file...",
+            Self::Checking => "Umbra is checking her core...",
+            Self::Briefing { waking: true, .. } => {
+                "Umbra is waking up for her first briefing this session..."
+            }
+            Self::Briefing { waking: false, .. } => "Umbra is writing a briefing...",
+        }
+    }
+}
+
+/// Umbra's last word, kept in her panels until her next task.
+struct UmbraNotice {
+    /// The system the notice is about, or None for install and repair news.
+    system_id: Option<String>,
+    message: String,
+    is_error: bool,
 }
 
 struct PortraitTaskResult {
@@ -99,11 +135,19 @@ pub(crate) struct NomadeerApp {
     traffic_rx: Receiver<TrafficTaskResult>,
     traffic_feeds: Vec<TrafficFeedState>,
     esi_busy: bool,
+    /// The player asked for the location update in flight, so report it even if unchanged.
+    announce_location_sync: bool,
     zkill_busy_system_id: Option<u64>,
     zkill_reports: HashMap<u64, ZkillReport>,
     selected_zkill_kill: Option<ZkillKill>,
     system_assessments: HashMap<String, SystemAssessment>,
-    local_intel_busy: bool,
+    umbra_task: Option<UmbraTask>,
+    umbra_worker: Option<BriefingWorker>,
+    umbra_notice: Option<UmbraNotice>,
+    /// Her core failed its checksum or could not be loaded; reinstalling repairs it.
+    umbra_needs_repair: bool,
+    /// Checks run once per process on their own; after that the player asks for them.
+    umbra_check_attempted: bool,
     local_intel_progress: Option<DownloadProgress>,
     local_model_import_path: String,
     portrait_textures: HashMap<String, egui::TextureHandle>,
@@ -154,11 +198,16 @@ impl NomadeerApp {
                 })
                 .collect(),
             esi_busy: false,
+            announce_location_sync: false,
             zkill_busy_system_id: None,
             zkill_reports: HashMap::new(),
             selected_zkill_kill: None,
             system_assessments: HashMap::new(),
-            local_intel_busy: false,
+            umbra_task: None,
+            umbra_worker: None,
+            umbra_notice: None,
+            umbra_needs_repair: false,
+            umbra_check_attempted: false,
             local_intel_progress: None,
             local_model_import_path: String::new(),
             portrait_textures: HashMap::new(),
@@ -455,28 +504,45 @@ impl NomadeerApp {
                 );
                 ui.add_space(8.0);
 
-                let installed = local_intel::is_model_installed();
+                let core = local_intel::core_status();
+                let idle = self.umbra_task.is_none();
                 ui.horizontal_wrapped(|ui| {
-                    pill(ui, if installed { "Online" } else { "Not installed" });
-                    if !installed
-                        && ui
-                            .add_enabled(
-                                !self.local_intel_busy,
-                                egui::Button::new("Install Umbra"),
-                            )
-                            .clicked()
-                    {
-                        self.start_local_model_install();
-                    }
-                    if installed
-                        && ui
-                            .add_enabled(
-                                !self.local_intel_busy,
-                                egui::Button::new("Remove Umbra"),
-                            )
-                            .clicked()
-                    {
-                        self.remove_local_model();
+                    pill(ui, self.umbra_state_label(core));
+                    let button = |ui: &mut egui::Ui, text: &str| {
+                        ui.add_enabled(idle, egui::Button::new(text)).clicked()
+                    };
+                    match core {
+                        CoreStatus::Missing => {
+                            if button(ui, "Install Umbra") {
+                                self.start_local_model_install();
+                            }
+                            if local_intel::has_legacy_cores()
+                                && button(ui, "Clear old Umbra files")
+                            {
+                                self.remove_local_model();
+                            }
+                        }
+                        _ if self.umbra_needs_repair => {
+                            if button(ui, "Reinstall Umbra") {
+                                self.start_local_model_install();
+                            }
+                            if button(ui, "Remove Umbra") {
+                                self.remove_local_model();
+                            }
+                        }
+                        CoreStatus::Unchecked => {
+                            if button(ui, "Check Umbra") {
+                                self.start_umbra_core_check();
+                            }
+                            if button(ui, "Remove Umbra") {
+                                self.remove_local_model();
+                            }
+                        }
+                        CoreStatus::Ready => {
+                            if button(ui, "Remove Umbra") {
+                                self.remove_local_model();
+                            }
+                        }
                     }
                 });
 
@@ -484,48 +550,105 @@ impl NomadeerApp {
                     let fraction = if progress.total == 0 {
                         0.0
                     } else {
-                        progress.downloaded as f32 / progress.total as f32
+                        progress.done as f32 / progress.total as f32
                     };
                     ui.add(
                         egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
-                            .text(format!("Downloading {} · {:.0}%", progress.file, fraction * 100.0)),
+                            .text(format!("{} · {:.0}%", progress.label, fraction * 100.0)),
                     );
                 }
+                self.umbra_feedback(ui, None);
 
-                ui.separator();
-                ui.label("Install Umbra from an existing official core file");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.local_model_import_path)
-                            .hint_text("/path/to/qwen2.5-1.5b-instruct-q4_k_m.gguf"),
-                    );
-                    if ui
-                        .add_enabled(
-                            !self.local_intel_busy,
-                            egui::Button::new("Import core"),
-                        )
-                        .clicked()
-                    {
-                        self.start_local_model_import();
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "Imported files are verified before Umbra uses them.",
-                    )
-                    .color(theme::muted_text()),
-                );
+                if core != CoreStatus::Ready {
+                    ui.separator();
+                    egui::CollapsingHeader::new("Already downloaded her core?")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(format!(
+                                "Point Nomadeer at your copy of {} to skip the download. Umbra only accepts the official release.",
+                                local_intel::MODEL_NAME
+                            ));
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.local_model_import_path)
+                                        .hint_text("Where you saved it"),
+                                );
+                                if ui
+                                    .add_enabled(idle, egui::Button::new("Install from file"))
+                                    .clicked()
+                                {
+                                    self.start_local_model_import();
+                                }
+                            });
+                        });
+                }
             });
         self.show_local_intel_settings = open;
     }
 
+    fn umbra_state_label(&self, core: CoreStatus) -> &'static str {
+        match (core, &self.umbra_task) {
+            (_, Some(UmbraTask::Checking)) => "Checking",
+            (CoreStatus::Missing, _) => "Not installed",
+            _ if self.umbra_needs_repair => "Needs repair",
+            (CoreStatus::Unchecked, _) => "Not checked yet",
+            (CoreStatus::Ready, _) => "Online",
+        }
+    }
+
+    /// Shows what Umbra is doing and her last word. With a system, briefings and notices
+    /// about other systems are left out.
+    fn umbra_feedback(&self, ui: &mut egui::Ui, system_id: Option<&str>) {
+        let concerns = |about: Option<&str>| system_id.is_none() || about == system_id;
+        if let Some(task) = &self.umbra_task {
+            let about = match task {
+                UmbraTask::Briefing { system_id, .. } => Some(system_id.as_str()),
+                _ => None,
+            };
+            // Installs and checks keep her from briefing anywhere, so show them everywhere.
+            if about.is_none() || concerns(about) {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(task.label());
+                });
+            }
+        }
+        if let Some(notice) = &self.umbra_notice
+            && (concerns(notice.system_id.as_deref())
+                || (notice.system_id.is_none() && notice.is_error))
+        {
+            let color = if notice.is_error {
+                WARNING_TEXT
+            } else {
+                theme::muted_text()
+            };
+            ui.label(egui::RichText::new(&notice.message).color(color));
+        }
+    }
+
+    fn set_umbra_notice(&mut self, system_id: Option<String>, message: String, is_error: bool) {
+        self.status = message.clone();
+        self.umbra_notice = Some(UmbraNotice {
+            system_id,
+            message,
+            is_error,
+        });
+    }
+
+    fn start_umbra_task(&mut self, task: UmbraTask) {
+        self.status = task.label().to_owned();
+        self.umbra_task = Some(task);
+        self.umbra_notice = None;
+        self.local_intel_progress = None;
+    }
+
     fn start_local_model_install(&mut self) {
-        if self.local_intel_busy {
+        if self.umbra_task.is_some() {
             return;
         }
-        self.local_intel_busy = true;
-        self.local_intel_progress = None;
-        self.status = "Installing Umbra...".to_owned();
+        // Her files may be replaced, so the loaded core must go.
+        self.umbra_worker = None;
+        self.start_umbra_task(UmbraTask::Installing);
         let tx = self.local_intel_tx.clone();
         thread::spawn(move || {
             let progress_tx = tx.clone();
@@ -538,28 +661,76 @@ impl NomadeerApp {
     }
 
     fn start_local_model_import(&mut self) {
-        if self.local_intel_busy {
+        if self.umbra_task.is_some() {
             return;
         }
         let path = PathBuf::from(clean(&self.local_model_import_path));
         if path.as_os_str().is_empty() {
-            self.status = "Enter the path to the official GGUF model".to_owned();
+            self.set_umbra_notice(
+                None,
+                "Enter where you saved Umbra's core first".to_owned(),
+                true,
+            );
             return;
         }
 
-        self.local_intel_busy = true;
-        self.status = "Importing Umbra's core...".to_owned();
+        self.umbra_worker = None;
+        self.start_umbra_task(UmbraTask::Importing);
         let tx = self.local_intel_tx.clone();
         thread::spawn(move || {
-            let result = local_intel::import_model(&path).map(|()| LocalIntelTaskResult::Imported);
+            let progress_tx = tx.clone();
+            let result = local_intel::import_model(&path, |progress| {
+                let _ = progress_tx.send(LocalIntelEvent::Progress(progress));
+            })
+            .map(|()| LocalIntelTaskResult::Imported);
+            let _ = tx.send(LocalIntelEvent::Finished(result));
+        });
+    }
+
+    /// Checksums a core that has not been verified since it last changed, e.g. one
+    /// installed by an older Nomadeer, once per session.
+    fn maybe_check_umbra_core(&mut self) {
+        if self.umbra_task.is_none()
+            && !self.umbra_check_attempted
+            && local_intel::core_status() == CoreStatus::Unchecked
+        {
+            self.start_umbra_core_check();
+        }
+    }
+
+    fn start_umbra_core_check(&mut self) {
+        if self.umbra_task.is_some() {
+            return;
+        }
+        self.umbra_check_attempted = true;
+        self.start_umbra_task(UmbraTask::Checking);
+        let tx = self.local_intel_tx.clone();
+        thread::spawn(move || {
+            let result = local_intel::verify_core().map(|()| LocalIntelTaskResult::Checked);
             let _ = tx.send(LocalIntelEvent::Finished(result));
         });
     }
 
     fn remove_local_model(&mut self) {
+        if self.umbra_task.is_some() {
+            return;
+        }
+        // Drop the loaded core first so its memory is freed with the files.
+        self.umbra_worker = None;
+        let message = if local_intel::core_status() == CoreStatus::Missing {
+            "Old Umbra files cleared"
+        } else {
+            "Umbra removed"
+        };
         match local_intel::remove_model() {
-            Ok(()) => self.status = "Umbra removed".to_owned(),
-            Err(error) => self.status = format!("Could not remove Umbra: {error}"),
+            Ok(()) => {
+                self.umbra_needs_repair = false;
+                self.umbra_check_attempted = false;
+                self.set_umbra_notice(None, message.to_owned(), false);
+            }
+            Err(error) => {
+                self.set_umbra_notice(None, format!("Could not remove Umbra: {error}"), true)
+            }
         }
     }
 
@@ -647,6 +818,7 @@ impl NomadeerApp {
 
     fn spawn_sync_location(&mut self, account: Account, show_status: bool) {
         self.esi_busy = true;
+        self.announce_location_sync = show_status;
         if show_status {
             self.status = format!("Updating {} location...", account.character_name);
         }
@@ -819,7 +991,10 @@ impl NomadeerApp {
                         .find(|system| system.solar_system_id == report.solar_system_id)
                         .map(|system| local_intel::assess_system(system, &report, &traffic, now()));
                     let mut save_error = save_error;
-                    if let Some(assessment) = assessment {
+                    if let Some(mut assessment) = assessment {
+                        if let Some(previous) = self.system_assessments.get(&assessment.system_id) {
+                            local_intel::keep_briefing(&mut assessment, previous);
+                        }
                         self.system_assessments
                             .insert(assessment.system_id.clone(), assessment.clone());
                         self.upsert_system_assessment(assessment);
@@ -908,32 +1083,59 @@ impl NomadeerApp {
     }
 
     fn start_local_briefing(&mut self, system_id: &str) {
-        if self.local_intel_busy {
+        if self.umbra_task.is_some() {
             self.status = "Umbra is already working".to_owned();
             return;
         }
-        if !local_intel::is_model_installed() {
-            self.show_local_intel_settings = true;
-            self.status = "Install Umbra first".to_owned();
-            return;
+        match local_intel::core_status() {
+            _ if self.umbra_needs_repair => {
+                self.show_local_intel_settings = true;
+                self.set_umbra_notice(
+                    Some(system_id.to_owned()),
+                    "Umbra needs repairing before she can brief you".to_owned(),
+                    true,
+                );
+                return;
+            }
+            CoreStatus::Missing => {
+                self.show_local_intel_settings = true;
+                self.set_umbra_notice(
+                    Some(system_id.to_owned()),
+                    "Umbra needs to be installed before she can brief you".to_owned(),
+                    true,
+                );
+                return;
+            }
+            CoreStatus::Unchecked => {
+                // Her core changed since it was last checked; check it, then ask again.
+                self.start_umbra_core_check();
+                return;
+            }
+            CoreStatus::Ready => {}
         }
         let Some(assessment) = self.system_assessments.get(system_id).cloned() else {
-            self.status = "Refresh zKill before generating a briefing".to_owned();
+            self.set_umbra_notice(
+                Some(system_id.to_owned()),
+                "Refresh zKill so Umbra has evidence to brief from".to_owned(),
+                true,
+            );
             return;
         };
 
-        self.local_intel_busy = true;
-        self.status = "Umbra is assessing the system...".to_owned();
         let tx = self.local_intel_tx.clone();
-        let system_id = system_id.to_owned();
-        thread::spawn(move || {
-            let result = local_intel::generate_briefing(&assessment).map(|briefing| {
-                LocalIntelTaskResult::Briefing {
-                    system_id,
-                    briefing,
-                }
-            });
-            let _ = tx.send(LocalIntelEvent::Finished(result));
+        let worker = self.umbra_worker.get_or_insert_with(|| {
+            BriefingWorker::spawn(move |event| {
+                let _ = tx.send(LocalIntelEvent::Briefing(event));
+            })
+        });
+        if let Err(error) = worker.request(assessment) {
+            self.umbra_worker = None;
+            self.set_umbra_notice(Some(system_id.to_owned()), error, true);
+            return;
+        }
+        self.start_umbra_task(UmbraTask::Briefing {
+            system_id: system_id.to_owned(),
+            waking: false,
         });
     }
 
@@ -943,45 +1145,90 @@ impl NomadeerApp {
                 Ok(LocalIntelEvent::Progress(progress)) => {
                     self.local_intel_progress = Some(progress);
                 }
-                Ok(LocalIntelEvent::Finished(Ok(LocalIntelTaskResult::Installed))) => {
-                    self.local_intel_busy = false;
+                Ok(LocalIntelEvent::Finished(result)) => {
+                    let task = self.umbra_task.take();
                     self.local_intel_progress = None;
-                    self.status = "Umbra is online".to_owned();
-                }
-                Ok(LocalIntelEvent::Finished(Ok(LocalIntelTaskResult::Imported))) => {
-                    self.local_intel_busy = false;
-                    self.local_intel_progress = None;
-                    self.status = "Umbra is online".to_owned();
-                }
-                Ok(LocalIntelEvent::Finished(Ok(LocalIntelTaskResult::Briefing {
-                    system_id,
-                    briefing,
-                }))) => {
-                    self.local_intel_busy = false;
-                    if let Some(assessment) = self.system_assessments.get_mut(&system_id) {
-                        assessment.briefing = briefing;
-                        assessment.model_generated = true;
-                        assessment.generated_at = now();
+                    match result {
+                        Ok(done) => {
+                            self.umbra_needs_repair = false;
+                            let message = match done {
+                                LocalIntelTaskResult::Installed
+                                | LocalIntelTaskResult::Imported => "Umbra is online",
+                                LocalIntelTaskResult::Checked => "Umbra's core checks out",
+                            };
+                            self.set_umbra_notice(None, message.to_owned(), false);
+                        }
+                        Err(error) => {
+                            if task == Some(UmbraTask::Checking) {
+                                self.umbra_needs_repair = true;
+                            }
+                            let message = match task {
+                                Some(UmbraTask::Checking) => error,
+                                _ => format!("Umbra could not be installed: {error}"),
+                            };
+                            self.set_umbra_notice(None, message, true);
+                        }
                     }
-                    if let Some(assessment) = self.system_assessments.get(&system_id).cloned() {
-                        self.upsert_system_assessment(assessment);
-                    }
-                    self.status = match self.store.save(&self.data) {
-                        Ok(()) => "Umbra's briefing is ready".to_owned(),
-                        Err(error) => format!("Briefing ready, but save failed: {error}"),
-                    };
                 }
-                Ok(LocalIntelEvent::Finished(Err(error))) => {
-                    self.local_intel_busy = false;
-                    self.local_intel_progress = None;
-                    self.status = format!("Umbra could not finish: {error}");
-                }
+                Ok(LocalIntelEvent::Briefing(event)) => self.apply_briefing_event(event),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.local_intel_busy = false;
+                    self.umbra_task = None;
                     self.local_intel_progress = None;
                     break;
                 }
+            }
+        }
+    }
+
+    fn apply_briefing_event(&mut self, event: BriefingEvent) {
+        match event {
+            BriefingEvent::Waking | BriefingEvent::Writing => {
+                let waking_up = matches!(event, BriefingEvent::Waking);
+                if let Some(UmbraTask::Briefing { waking, .. }) = &mut self.umbra_task {
+                    *waking = waking_up;
+                }
+                if let Some(task) = &self.umbra_task {
+                    self.status = task.label().to_owned();
+                }
+            }
+            BriefingEvent::Written { source, briefing } => {
+                self.umbra_task = None;
+                let briefed = self
+                    .system_assessments
+                    .get(&source.system_id)
+                    .and_then(|current| local_intel::attach_briefing(current, &source, briefing));
+                let Some(briefed) = briefed else {
+                    self.set_umbra_notice(
+                        Some(source.system_id),
+                        "The intel changed while Umbra was writing, so she set her briefing aside. Ask her again for the latest picture.".to_owned(),
+                        true,
+                    );
+                    return;
+                };
+                self.system_assessments
+                    .insert(briefed.system_id.clone(), briefed.clone());
+                self.upsert_system_assessment(briefed);
+                match self.store.save(&self.data) {
+                    Ok(()) => self.status = "Umbra's briefing is ready".to_owned(),
+                    Err(error) => self.set_umbra_notice(
+                        Some(source.system_id),
+                        format!("Umbra's briefing is ready, but it could not be saved: {error}"),
+                        true,
+                    ),
+                }
+            }
+            BriefingEvent::Failed {
+                source,
+                error,
+                needs_repair,
+            } => {
+                self.umbra_task = None;
+                if needs_repair {
+                    self.umbra_needs_repair = true;
+                    self.umbra_worker = None;
+                }
+                self.set_umbra_notice(Some(source.system_id), error, true);
             }
         }
     }
@@ -1095,7 +1342,10 @@ impl NomadeerApp {
         if self.selected_system_id.is_empty() {
             self.selected_system_id = system_id;
         }
-        self.status = format!("{character_name} is in {}", location.system.name);
+        // Background syncs only speak up on a move, so they do not bury other news.
+        if moved || std::mem::take(&mut self.announce_location_sync) {
+            self.status = format!("{character_name} is in {}", location.system.name);
+        }
     }
 
     fn upsert_system_assessment(&mut self, assessment: SystemAssessment) {
@@ -1906,6 +2156,18 @@ impl NomadeerApp {
         let ship_kills_1h = system.ship_kills_1h;
         let pod_kills_1h = system.pod_kills_1h;
         let npc_kills_1h = system.npc_kills_1h;
+        let assessment_summary = self.system_assessments.get(&system_id).map(|assessment| {
+            let (age, stale) = Self::assessment_age(assessment.generated_at, now());
+            (
+                format!(
+                    "Threat {} · Activity {} · {}",
+                    local_intel::score_label(assessment.threat_score),
+                    local_intel::score_label(assessment.activity_score),
+                    age.to_lowercase()
+                ),
+                stale,
+            )
+        });
         let pilots: Vec<String> = self
             .data
             .accounts
@@ -1964,6 +2226,13 @@ impl NomadeerApp {
                 "Last hour: {} jumps · {} ships · {} pods · {} NPCs",
                 jumps_1h, ship_kills_1h, pod_kills_1h, npc_kills_1h
             ));
+            if let Some((summary, stale)) = &assessment_summary {
+                ui.label(egui::RichText::new(summary).color(if *stale {
+                    theme::muted_text()
+                } else {
+                    theme::accent()
+                }));
+            }
             ui.label(format!(
                 "{} connections · {} visits",
                 connection_count, visit_count
@@ -2146,10 +2415,22 @@ impl NomadeerApp {
             }
         });
 
+        // Saved assessments outlive the session; the kill list below does not.
+        let assessment = self.system_assessments.get(&system.id).cloned();
+        match &assessment {
+            Some(assessment) => self.assessment_panel(ui, &system, assessment),
+            None => {
+                ui.label("No assessment for this system yet. Refresh zKill to score its threat and activity.");
+                self.umbra_feedback(ui, Some(&system.id));
+            }
+        }
+
         let Some(report) = self.zkill_reports.get(&system.solar_system_id) else {
-            ui.label(
-                "No zKillboard data loaded yet. Refresh to pull recent kills for this system.",
-            );
+            ui.label(if assessment.is_some() {
+                "Recent kills have not been loaded this session. Refresh zKill to see them."
+            } else {
+                "No zKillboard data loaded yet. Refresh to pull recent kills for this system."
+            });
             return;
         };
         let recent_kills = report.recent_kills.clone();
@@ -2157,69 +2438,6 @@ impl NomadeerApp {
         let solo_kills = report.solo_kills;
         let npc_kills = report.npc_kills;
         let history_kills = Self::killboard_kill_count(report);
-        let assessment = self.system_assessments.get(&system.id).cloned();
-
-        if let Some(assessment) = assessment {
-            record_frame(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.heading("System assessment");
-                    pill(
-                        ui,
-                        &format!(
-                            "Threat {} · {}",
-                            assessment.threat_score,
-                            local_intel::score_label(assessment.threat_score)
-                        ),
-                    );
-                    pill(
-                        ui,
-                        &format!(
-                            "Activity {} · {}",
-                            assessment.activity_score,
-                            local_intel::score_label(assessment.activity_score)
-                        ),
-                    );
-                    pill(ui, &format!("{} confidence", assessment.confidence));
-                });
-                ui.label(&assessment.briefing);
-                ui.horizontal_wrapped(|ui| {
-                    if assessment.model_generated {
-                        pill(ui, "Umbra briefing");
-                    } else {
-                        pill(ui, "Evidence summary");
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.local_intel_busy,
-                            egui::Button::new(if assessment.model_generated {
-                                "Ask Umbra again"
-                            } else {
-                                "Ask Umbra"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.start_local_briefing(&system.id);
-                    }
-                    if !local_intel::is_model_installed() && ui.button("Install Umbra").clicked() {
-                        self.show_local_intel_settings = true;
-                    }
-                });
-                egui::CollapsingHeader::new("Evidence")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        for evidence in &assessment.evidence {
-                            ui.label(format!("• {evidence}"));
-                        }
-                        ui.label(
-                            egui::RichText::new(
-                                "Public killmails may be delayed or absent; quiet never means safe.",
-                            )
-                            .color(theme::muted_text()),
-                        );
-                    });
-            });
-        }
 
         ui.label(format!(
             "Latest {} shown · {history_kills} kills in 7d · {} shown value · {} solo · {} NPC",
@@ -2284,6 +2502,123 @@ impl NomadeerApp {
                 }
             });
         }
+    }
+
+    fn assessment_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        system: &SystemNode,
+        assessment: &SystemAssessment,
+    ) {
+        let (age, stale) = Self::assessment_age(assessment.generated_at, now());
+        // An old assessment still shows, but muted, so it never reads as a live warning.
+        let score_color = if stale {
+            theme::muted_text()
+        } else {
+            theme::accent()
+        };
+        let core = local_intel::core_status();
+        let umbra_idle = self.umbra_task.is_none();
+        record_frame(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("System assessment");
+                for text in [
+                    format!(
+                        "Threat {} · {}",
+                        assessment.threat_score,
+                        local_intel::score_label(assessment.threat_score)
+                    ),
+                    format!(
+                        "Activity {} · {}",
+                        assessment.activity_score,
+                        local_intel::score_label(assessment.activity_score)
+                    ),
+                    format!("{} confidence", assessment.confidence),
+                ] {
+                    ui.label(egui::RichText::new(text).color(score_color));
+                }
+                ui.label(egui::RichText::new(age).color(if stale {
+                    WARNING_TEXT
+                } else {
+                    theme::muted_text()
+                }));
+            });
+            if stale {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Over an hour old: the last-hour figures no longer describe the system now.",
+                        )
+                        .color(WARNING_TEXT),
+                    );
+                    if ui
+                        .add_enabled(
+                            self.zkill_busy_system_id.is_none() && system.solar_system_id != 0,
+                            egui::Button::new("Refresh now"),
+                        )
+                        .clicked()
+                    {
+                        self.start_zkill_refresh();
+                    }
+                });
+            }
+            ui.label(&assessment.briefing);
+            ui.horizontal_wrapped(|ui| {
+                if assessment.model_generated {
+                    pill(ui, "Umbra briefing");
+                } else {
+                    pill(ui, "Evidence summary");
+                }
+                if core != CoreStatus::Missing && !self.umbra_needs_repair {
+                    // An unchecked core is being checked, or is checked on request.
+                    if ui
+                        .add_enabled(
+                            umbra_idle,
+                            egui::Button::new(if assessment.model_generated {
+                                "Ask Umbra again"
+                            } else {
+                                "Ask Umbra"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.start_local_briefing(&system.id);
+                    }
+                } else if ui
+                    .button(if self.umbra_needs_repair {
+                        "Repair Umbra"
+                    } else {
+                        "Install Umbra"
+                    })
+                    .clicked()
+                {
+                    self.show_local_intel_settings = true;
+                }
+            });
+            self.umbra_feedback(ui, Some(&system.id));
+            egui::CollapsingHeader::new("Evidence")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for evidence in &assessment.evidence {
+                        ui.label(format!("• {evidence}"));
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Public killmails may be delayed or absent; quiet never means safe.",
+                        )
+                        .color(theme::muted_text()),
+                    );
+                });
+        });
+    }
+
+    /// "Assessed 3h ago", and whether that is too old to describe the system now.
+    fn assessment_age(generated_at: u64, current_time: u64) -> (String, bool) {
+        let age = current_time.saturating_sub(generated_at);
+        (
+            format!("Assessed {}", Self::format_duration_ago(age)),
+            age > ASSESSMENT_STALE_SECS,
+        )
     }
 
     fn zkill_details_window(&mut self, ctx: &egui::Context) {
@@ -2764,6 +3099,7 @@ impl eframe::App for NomadeerApp {
         self.maybe_request_portraits();
         self.maybe_auto_sync();
         self.maybe_poll_traffic();
+        self.maybe_check_umbra_core();
         self.top_bar(ctx);
         self.esi_settings_window(ctx);
         self.local_intel_settings_window(ctx);
@@ -2845,6 +3181,27 @@ mod tests {
         assert_eq!(system.ship_kills_1h, 5);
         assert_eq!(system.intel_updated_at, 7_300);
         assert!(!NomadeerApp::apply_system_intel(&mut system, &intel()));
+    }
+
+    #[test]
+    fn assessments_show_their_age_and_go_stale_after_an_hour() {
+        assert_eq!(
+            NomadeerApp::assessment_age(1_000, 1_030),
+            ("Assessed just now".to_owned(), false)
+        );
+        assert_eq!(
+            NomadeerApp::assessment_age(1_000, 1_000 + 45 * 60),
+            ("Assessed 45m ago".to_owned(), false)
+        );
+        assert_eq!(
+            NomadeerApp::assessment_age(1_000, 1_000 + 3 * 3_600),
+            ("Assessed 3h ago".to_owned(), true)
+        );
+        // A clock that moved backwards never makes an assessment look fresher than new.
+        assert_eq!(
+            NomadeerApp::assessment_age(5_000, 1_000),
+            ("Assessed just now".to_owned(), false)
+        );
     }
 
     #[test]
