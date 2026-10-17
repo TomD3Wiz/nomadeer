@@ -19,6 +19,7 @@ mod probe_scan;
 mod recon;
 mod signatures;
 mod store;
+mod updates;
 mod util;
 mod widgets;
 mod wormhole;

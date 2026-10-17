@@ -6,6 +6,7 @@ use crate::model::{
     TrafficRows, TrafficSample, UmbraBriefing, VisitLog,
 };
 use crate::paths;
+use crate::updates::{Release, UpdateState};
 use crate::util::{DAY_SECS, hour_start, now};
 use rusqlite::{
     Connection as SqliteConnection, OptionalExtension, Row, TransactionBehavior, params,
@@ -33,6 +34,18 @@ const UMBRA_BRIEFS_AUTOMATICALLY_KEY: &str = "umbra_briefs_automatically";
 const RECON_DEFAULTS_APPLIED_KEY: &str = "recon_defaults_applied";
 const DASHBOARD_TABS_FRACTION_KEY: &str = "dashboard_tabs_fraction";
 const DASHBOARD_MAP_FRACTION_KEY: &str = "dashboard_map_fraction";
+/// Update check settings and state live under this prefix. They are written on
+/// their own, so saving the rest of the settings leaves them alone.
+const UPDATE_KEYS: &str = "update_*";
+const UPDATE_CHECK_KEY: &str = "update_check_automatically";
+const UPDATE_NOTICE_SHOWN_KEY: &str = "update_notice_shown";
+const UPDATE_LAST_CHECKED_KEY: &str = "update_last_checked_at";
+const UPDATE_ETAG_KEY: &str = "update_etag";
+const UPDATE_LATEST_VERSION_KEY: &str = "update_latest_version";
+const UPDATE_LATEST_RELEASE_KEY: &str = "update_latest_release";
+const UPDATE_SKIPPED_KEY: &str = "update_skipped_version";
+const UPDATE_RATE_LIMITED_KEY: &str = "update_rate_limited_until";
+const UPDATE_RETRY_KEY: &str = "update_retry_at";
 
 /// Everything kept in `app_settings`.
 #[derive(Default)]
@@ -93,9 +106,13 @@ impl Store {
         let mut conn = self.open()?;
         let tx = Self::write_transaction(&mut conn)?;
 
+        tx.execute(
+            "DELETE FROM app_settings WHERE key NOT GLOB ?1",
+            params![UPDATE_KEYS],
+        )
+        .map_err(|error| error.to_string())?;
         tx.execute_batch(
-            "DELETE FROM app_settings;
-             DELETE FROM accounts;
+            "DELETE FROM accounts;
              DELETE FROM systems;
              DELETE FROM connections;
              DELETE FROM signatures;
@@ -1456,6 +1473,84 @@ impl Store {
         })
     }
 
+    /// Update check settings and state; missing ones keep their defaults.
+    pub(crate) fn load_update_state(&self) -> Result<UpdateState, String> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM app_settings WHERE key GLOB ?1")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![UPDATE_KEYS], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+
+        let mut state = UpdateState::default();
+        for row in rows {
+            let (key, value) = row.map_err(|error| error.to_string())?;
+            match key.as_str() {
+                UPDATE_CHECK_KEY => state.check_automatically = value != "0",
+                UPDATE_NOTICE_SHOWN_KEY => state.notice_shown = value == "1",
+                UPDATE_LAST_CHECKED_KEY => state.last_checked_at = value.parse().ok(),
+                UPDATE_ETAG_KEY => state.etag = value,
+                // A release saved by another version that cannot be read is
+                // simply fetched again.
+                UPDATE_LATEST_RELEASE_KEY => {
+                    state.latest = serde_json::from_str::<Release>(&value).ok();
+                }
+                UPDATE_SKIPPED_KEY => state.skipped_version = value,
+                UPDATE_RATE_LIMITED_KEY => state.rate_limited_until = value.parse().ok(),
+                UPDATE_RETRY_KEY => state.retry_at = value.parse().ok(),
+                _ => {}
+            }
+        }
+        if state.latest.is_none() {
+            // Its ETag would only bring back "not modified" for a release we lost.
+            state.etag.clear();
+        }
+        Ok(state)
+    }
+
+    pub(crate) fn save_update_state(&self, state: &UpdateState) -> Result<(), String> {
+        let latest_release = state
+            .latest
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let flag = |enabled: bool| if enabled { "1" } else { "0" }.to_owned();
+        let time = |time: Option<u64>| time.map(|time| time.to_string());
+        let values: [(&str, Option<String>); 9] = [
+            (UPDATE_CHECK_KEY, Some(flag(state.check_automatically))),
+            (UPDATE_NOTICE_SHOWN_KEY, Some(flag(state.notice_shown))),
+            (UPDATE_LAST_CHECKED_KEY, time(state.last_checked_at)),
+            (UPDATE_ETAG_KEY, Some(state.etag.clone())),
+            (
+                UPDATE_LATEST_VERSION_KEY,
+                state.latest.as_ref().map(|release| release.version.clone()),
+            ),
+            (UPDATE_LATEST_RELEASE_KEY, latest_release),
+            (UPDATE_SKIPPED_KEY, Some(state.skipped_version.clone())),
+            (UPDATE_RATE_LIMITED_KEY, time(state.rate_limited_until)),
+            (UPDATE_RETRY_KEY, time(state.retry_at)),
+        ];
+
+        let mut conn = self.open()?;
+        let tx = Self::write_transaction(&mut conn)?;
+        for (key, value) in values {
+            match value {
+                Some(value) => tx.execute(
+                    "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![key, value],
+                ),
+                None => tx.execute("DELETE FROM app_settings WHERE key = ?1", params![key]),
+            }
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     /// Settings missing from the database, e.g. ones added after it was made, keep
     /// their defaults.
     fn load_settings(&self, conn: &SqliteConnection) -> Result<Settings, String> {
@@ -2296,6 +2391,74 @@ mod tests {
 
         assert_eq!(store.cached_killmails(1, 0).unwrap().len(), 1);
         assert_eq!(store.system_traffic(1, 0).unwrap().samples.len(), 1);
+    }
+
+    #[test]
+    fn update_state_persists_apart_from_other_settings() {
+        use crate::updates::{Release, ReleaseAsset, UpdateState};
+
+        let db = TestDb::new("update-state");
+        let store = db.store();
+        // A new database checks for updates and has not shown the notice yet.
+        assert_eq!(store.load_update_state().unwrap(), UpdateState::default());
+
+        let state = UpdateState {
+            check_automatically: false,
+            notice_shown: true,
+            last_checked_at: Some(NOW),
+            etag: "W/\"abc\"".to_owned(),
+            latest: Some(Release {
+                version: "0.2.0".to_owned(),
+                notes: "### Added\n\n- Bookmarks".to_owned(),
+                page_url: "https://github.com/TomD3Wiz/nomadeer/releases/tag/v0.2.0".to_owned(),
+                published_at: "2026-11-03T10:01:02Z".to_owned(),
+                assets: vec![ReleaseAsset {
+                    name: "Nomadeer-0.2.0-Setup.exe".to_owned(),
+                    size: 31_457_280,
+                    download_url: "https://github.com/TomD3Wiz/nomadeer/releases/download/v0.2.0/Nomadeer-0.2.0-Setup.exe".to_owned(),
+                }],
+            }),
+            skipped_version: "0.1.5".to_owned(),
+            rate_limited_until: Some(NOW + 600),
+            retry_at: Some(NOW + 3_600),
+        };
+        store.save_update_state(&state).unwrap();
+        assert_eq!(store.load_update_state().unwrap(), state);
+
+        // Saving everything else keeps it.
+        store.save(&data_with_client_id("pilot")).unwrap();
+        assert_eq!(store.load_update_state().unwrap(), state);
+        assert_eq!(store.load().unwrap().esi_settings.client_id, "pilot");
+
+        // Cleared times are removed, and saving it again leaves other settings be.
+        let cleared = UpdateState {
+            rate_limited_until: None,
+            retry_at: None,
+            latest: None,
+            etag: String::new(),
+            ..state.clone()
+        };
+        store.save_update_state(&cleared).unwrap();
+        assert_eq!(store.load_update_state().unwrap(), cleared);
+        assert_eq!(store.load().unwrap().esi_settings.client_id, "pilot");
+
+        // An ETag without the release it stands for is dropped.
+        {
+            let conn = SqliteConnection::open(&db.path).unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value = 'W/\"stale\"' WHERE key = 'update_etag'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES ('update_latest_release', '{not json')",
+                [],
+            )
+            .unwrap();
+        }
+        let loaded = store.load_update_state().unwrap();
+        assert_eq!(loaded.latest, None);
+        assert_eq!(loaded.etag, "");
     }
 
     #[test]
