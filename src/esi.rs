@@ -1,14 +1,17 @@
-use crate::model::{Account, EsiSettings};
-use crate::util::{now, open_url};
+use crate::model::{
+    Account, EsiSettings, KillCounts, TrafficFeed, TrafficHour, TrafficReading, TrafficRows,
+};
+use crate::util::{HOUR_SECS, hour_start, now, open_url, parse_http_date};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response as HttpResponse};
+use reqwest::header::{EXPIRES, HeaderName, LAST_MODIFIED};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use std::time::Instant;
 use tiny_http::{Response, Server, StatusCode};
 use url::Url;
 
@@ -17,13 +20,56 @@ const TOKEN_URL: &str = "https://login.eveonline.com/v2/oauth/token";
 const VERIFY_URL: &str = "https://login.eveonline.com/oauth/verify";
 const ESI_BASE_URL: &str = "https://esi.evetech.net/latest";
 const USER_AGENT: &str = "Nomadeer/0.1 private wormhole mapper";
-const SYSTEM_INTEL_CACHE_TIME: Duration = Duration::from_secs(60 * 60);
+const SYSTEM_JUMPS_PATH: &str = "/universe/system_jumps/";
+const SYSTEM_KILLS_PATH: &str = "/universe/system_kills/";
+const TRAFFIC_MIN_POLL: Duration = Duration::from_secs(60);
+const TRAFFIC_MAX_RETRY: Duration = Duration::from_secs(15 * 60);
+const TRAFFIC_EXPIRES_SLACK_SECS: u64 = 15;
 
-type TimedListCache<T> = OnceLock<Mutex<Option<(Instant, Vec<T>)>>>;
+type FeedCacheLock<T> = OnceLock<Mutex<Option<FeedCache<T>>>>;
 
-static SYSTEM_INTEL_CACHE: OnceLock<Mutex<HashMap<u64, (Instant, SystemIntel)>>> = OnceLock::new();
-static SYSTEM_JUMPS_CACHE: TimedListCache<SystemJumpResponse> = OnceLock::new();
-static SYSTEM_KILLS_CACHE: TimedListCache<SystemKillResponse> = OnceLock::new();
+// Static system details never change, so they are cached for the whole session.
+static SYSTEM_DETAILS_CACHE: OnceLock<Mutex<HashMap<u64, SystemIntel>>> = OnceLock::new();
+static SYSTEM_JUMPS_FEED: FeedCacheLock<SystemJumpResponse> = OnceLock::new();
+static SYSTEM_KILLS_FEED: FeedCacheLock<SystemKillResponse> = OnceLock::new();
+
+/// A universe-wide activity feed as ESI served it, valid until `expires_at`.
+#[derive(Debug)]
+struct FeedCache<T> {
+    hour: u64,
+    data_time: u64,
+    expires_at: u64,
+    entries: Arc<Vec<T>>,
+}
+
+// Manual impl so cloning shares the entries without requiring `T: Clone`.
+impl<T> Clone for FeedCache<T> {
+    fn clone(&self) -> Self {
+        Self {
+            hour: self.hour,
+            data_time: self.data_time,
+            expires_at: self.expires_at,
+            entries: Arc::clone(&self.entries),
+        }
+    }
+}
+
+impl<T> FeedCache<T> {
+    fn reading<V>(&self, value: V) -> TrafficReading<V> {
+        TrafficReading {
+            hour: self.hour,
+            data_time: self.data_time,
+            value,
+        }
+    }
+}
+
+/// One hour of a universe-wide feed plus when ESI will publish the next one.
+#[derive(Debug)]
+pub(crate) struct TrafficCapture {
+    pub(crate) traffic: TrafficHour,
+    pub(crate) expires_at: u64,
+}
 
 #[derive(Debug)]
 pub(crate) struct AccountAuthorization {
@@ -58,10 +104,9 @@ pub(crate) struct SystemIntel {
     pub(crate) planet_count: u32,
     pub(crate) stargate_count: u32,
     pub(crate) station_count: u32,
-    pub(crate) jumps_1h: u32,
-    pub(crate) ship_kills_1h: u32,
-    pub(crate) pod_kills_1h: u32,
-    pub(crate) npc_kills_1h: u32,
+    /// `None` when ESI's activity feed could not be read; keep the previous values then.
+    pub(crate) jumps: Option<TrafficReading<u32>>,
+    pub(crate) kills: Option<TrafficReading<KillCounts>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,7 +165,7 @@ struct SystemJumpResponse {
     ship_jumps: u32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SystemKillResponse {
     system_id: u64,
     ship_kills: u32,
@@ -350,10 +395,35 @@ fn fetch_system(solar_system_id: u64) -> Result<SystemResponse, String> {
 }
 
 fn fetch_system_intel(solar_system_id: u64) -> Result<SystemIntel, String> {
-    let cache = SYSTEM_INTEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut intel = fetch_system_details(solar_system_id)?;
+    intel.jumps = cached_feed(&SYSTEM_JUMPS_FEED, SYSTEM_JUMPS_PATH, true)
+        .ok()
+        .map(|feed| {
+            let jumps = feed
+                .entries
+                .iter()
+                .find(|jump| jump.system_id == solar_system_id)
+                .map_or(0, |jump| jump.ship_jumps);
+            feed.reading(jumps)
+        });
+    intel.kills = cached_feed(&SYSTEM_KILLS_FEED, SYSTEM_KILLS_PATH, true)
+        .ok()
+        .map(|feed| {
+            let kills = feed
+                .entries
+                .iter()
+                .find(|kill| kill.system_id == solar_system_id)
+                .map(kill_counts)
+                .unwrap_or_default();
+            feed.reading(kills)
+        });
+    Ok(intel)
+}
+
+fn fetch_system_details(solar_system_id: u64) -> Result<SystemIntel, String> {
+    let cache = SYSTEM_DETAILS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(cache) = cache.lock()
-        && let Some((cached_at, intel)) = cache.get(&solar_system_id)
-        && cached_at.elapsed() < SYSTEM_INTEL_CACHE_TIME
+        && let Some(intel) = cache.get(&solar_system_id)
     {
         return Ok(intel.clone());
     }
@@ -361,8 +431,6 @@ fn fetch_system_intel(solar_system_id: u64) -> Result<SystemIntel, String> {
     let system = fetch_system(solar_system_id)?;
     let constellation = fetch_constellation(system.constellation_id)?;
     let region = fetch_region(constellation.region_id)?;
-    let jumps = fetch_system_jumps(solar_system_id).unwrap_or_default();
-    let kills = fetch_system_kills(solar_system_id).unwrap_or_default();
 
     let intel = SystemIntel {
         solar_system_id,
@@ -387,14 +455,12 @@ fn fetch_system_intel(solar_system_id: u64) -> Result<SystemIntel, String> {
             .stations
             .map(|items| items.len() as u32)
             .unwrap_or_default(),
-        jumps_1h: jumps,
-        ship_kills_1h: kills.ship_kills,
-        pod_kills_1h: kills.pod_kills,
-        npc_kills_1h: kills.npc_kills,
+        jumps: None,
+        kills: None,
     };
 
     if let Ok(mut cache) = cache.lock() {
-        cache.insert(solar_system_id, (Instant::now(), intel.clone()));
+        cache.insert(solar_system_id, intel.clone());
     }
     Ok(intel)
 }
@@ -411,68 +477,152 @@ fn fetch_region(region_id: u64) -> Result<RegionResponse, String> {
     get_json(&url, None)
 }
 
-fn fetch_system_jumps(solar_system_id: u64) -> Result<u32, String> {
-    let cache = SYSTEM_JUMPS_CACHE.get_or_init(|| Mutex::new(None));
-    let cached = cache.lock().ok().and_then(|cache| {
-        cache
-            .as_ref()
-            .filter(|(cached_at, _)| cached_at.elapsed() < SYSTEM_INTEL_CACHE_TIME)
-            .map(|(_, jumps)| jumps.clone())
-    });
-    let jumps = if let Some(jumps) = cached {
-        jumps
-    } else {
-        let jumps: Vec<SystemJumpResponse> = get_json(
-            &format!("{ESI_BASE_URL}/universe/system_jumps/?datasource=tranquility"),
-            None,
-        )?;
-        if let Ok(mut cache) = cache.lock() {
-            *cache = Some((Instant::now(), jumps.clone()));
+/// Reads one universe-wide activity feed, reusing ESI's response until it expires.
+pub(crate) fn fetch_traffic_feed(feed: TrafficFeed) -> Result<TrafficCapture, String> {
+    let (hour, data_time, expires_at, rows) = match feed {
+        TrafficFeed::Jumps => {
+            let feed = cached_feed(&SYSTEM_JUMPS_FEED, SYSTEM_JUMPS_PATH, false)?;
+            let rows = feed
+                .entries
+                .iter()
+                .filter(|jump| jump.ship_jumps > 0)
+                .map(|jump| (jump.system_id, jump.ship_jumps))
+                .collect();
+            (
+                feed.hour,
+                feed.data_time,
+                feed.expires_at,
+                TrafficRows::Jumps(rows),
+            )
         }
-        jumps
+        TrafficFeed::Kills => {
+            let feed = cached_feed(&SYSTEM_KILLS_FEED, SYSTEM_KILLS_PATH, false)?;
+            let rows = feed
+                .entries
+                .iter()
+                .map(|kill| (kill.system_id, kill_counts(kill)))
+                .filter(|(_, kills)| *kills != KillCounts::default())
+                .collect();
+            (
+                feed.hour,
+                feed.data_time,
+                feed.expires_at,
+                TrafficRows::Kills(rows),
+            )
+        }
     };
-    Ok(jumps
-        .into_iter()
-        .find(|jump| jump.system_id == solar_system_id)
-        .map(|jump| jump.ship_jumps)
-        .unwrap_or_default())
+    Ok(TrafficCapture {
+        traffic: TrafficHour {
+            hour,
+            data_time,
+            rows,
+        },
+        expires_at,
+    })
 }
 
-fn fetch_system_kills(solar_system_id: u64) -> Result<SystemKillResponse, String> {
-    let cache = SYSTEM_KILLS_CACHE.get_or_init(|| Mutex::new(None));
-    let cached = cache.lock().ok().and_then(|cache| {
-        cache
-            .as_ref()
-            .filter(|(cached_at, _)| cached_at.elapsed() < SYSTEM_INTEL_CACHE_TIME)
-            .map(|(_, kills)| kills.clone())
-    });
-    let kills = if let Some(kills) = cached {
-        kills
-    } else {
-        let kills: Vec<SystemKillResponse> = get_json(
-            &format!("{ESI_BASE_URL}/universe/system_kills/?datasource=tranquility"),
-            None,
-        )?;
-        if let Ok(mut cache) = cache.lock() {
-            *cache = Some((Instant::now(), kills.clone()));
+/// How long to wait before polling a feed again after ESI served it.
+pub(crate) fn traffic_next_poll_delay(expires_at: u64, current_time: u64) -> Duration {
+    let wait = expires_at.saturating_sub(current_time) + TRAFFIC_EXPIRES_SLACK_SECS;
+    Duration::from_secs(wait).max(TRAFFIC_MIN_POLL)
+}
+
+/// Backoff after `failures` consecutive failed polls of a feed.
+pub(crate) fn traffic_retry_delay(failures: u32) -> Duration {
+    let factor = 1_u32 << failures.saturating_sub(1).min(8);
+    (TRAFFIC_MIN_POLL * factor).min(TRAFFIC_MAX_RETRY)
+}
+
+fn kill_counts(kill: &SystemKillResponse) -> KillCounts {
+    KillCounts {
+        ship_kills: kill.ship_kills,
+        pod_kills: kill.pod_kills,
+        npc_kills: kill.npc_kills,
+    }
+}
+
+/// Returns the cached feed while ESI says it is current, otherwise fetches it again.
+/// With `allow_stale`, a failed refresh falls back to the last good copy, which still
+/// carries its real data time.
+fn cached_feed<T>(
+    cache: &'static FeedCacheLock<T>,
+    path: &str,
+    allow_stale: bool,
+) -> Result<FeedCache<T>, String>
+where
+    T: DeserializeOwned,
+{
+    let cache = cache.get_or_init(|| Mutex::new(None));
+    let cached = cache.lock().ok().and_then(|cache| cache.clone());
+    if let Some(cached) = &cached
+        && now() < cached.expires_at
+    {
+        return Ok(cached.clone());
+    }
+
+    match fetch_feed(path) {
+        Ok(fresh) => {
+            if let Ok(mut cache) = cache.lock() {
+                *cache = Some(fresh.clone());
+            }
+            Ok(fresh)
         }
-        kills
-    };
-    Ok(kills
-        .into_iter()
-        .find(|kill| kill.system_id == solar_system_id)
-        .unwrap_or(SystemKillResponse {
-            system_id: solar_system_id,
-            ship_kills: 0,
-            pod_kills: 0,
-            npc_kills: 0,
-        }))
+        Err(error) => match cached {
+            Some(stale) if allow_stale => Ok(stale),
+            _ => Err(error),
+        },
+    }
+}
+
+fn fetch_feed<T>(path: &str) -> Result<FeedCache<T>, String>
+where
+    T: DeserializeOwned,
+{
+    let response = get_response(
+        &format!("{ESI_BASE_URL}{path}?datasource=tranquility"),
+        None,
+    )?;
+    let last_modified = header_time(&response, LAST_MODIFIED);
+    let expires = header_time(&response, EXPIRES);
+    let (data_time, expires_at) = feed_times(last_modified, expires)?;
+    let entries = response
+        .json::<Vec<T>>()
+        .map_err(|error| format!("Could not parse ESI response: {error}"))?;
+    Ok(FeedCache {
+        hour: hour_start(data_time),
+        data_time,
+        expires_at,
+        entries: Arc::new(entries),
+    })
+}
+
+fn header_time(response: &HttpResponse, header: HeaderName) -> Option<u64> {
+    response
+        .headers()
+        .get(header)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_http_date)
+}
+
+/// Works out when a feed's data was published and when ESI will replace it.
+fn feed_times(last_modified: Option<u64>, expires: Option<u64>) -> Result<(u64, u64), String> {
+    let data_time = last_modified
+        .or_else(|| expires.map(|expires| expires.saturating_sub(HOUR_SECS)))
+        .ok_or_else(|| "ESI did not say when this activity data was published".to_owned())?;
+    let expires_at = expires.unwrap_or(data_time + HOUR_SECS);
+    Ok((data_time, expires_at))
 }
 
 fn get_json<T>(url: &str, access_token: Option<&str>) -> Result<T, String>
 where
-    T: for<'de> Deserialize<'de>,
+    T: DeserializeOwned,
 {
+    get_response(url, access_token)?
+        .json::<T>()
+        .map_err(|error| format!("Could not parse ESI response: {error}"))
+}
+
+fn get_response(url: &str, access_token: Option<&str>) -> Result<HttpResponse, String> {
     let client = Client::new();
     let mut request = client.get(url).header("User-Agent", USER_AGENT);
     if let Some(access_token) = access_token {
@@ -490,7 +640,37 @@ where
         return Err(format!("ESI request returned {status}: {body}"));
     }
 
-    response
-        .json::<T>()
-        .map_err(|error| format!("Could not parse ESI response: {error}"))
+    Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{feed_times, traffic_next_poll_delay, traffic_retry_delay};
+    use std::time::Duration;
+
+    #[test]
+    fn feed_times_prefer_last_modified() {
+        assert_eq!(feed_times(Some(10_000), Some(12_000)), Ok((10_000, 12_000)));
+        assert_eq!(feed_times(None, Some(12_000)), Ok((8_400, 12_000)));
+        assert_eq!(feed_times(Some(10_000), None), Ok((10_000, 13_600)));
+        assert!(feed_times(None, None).is_err());
+    }
+
+    #[test]
+    fn traffic_polls_wait_for_expiry() {
+        assert_eq!(
+            traffic_next_poll_delay(2_000, 1_000),
+            Duration::from_secs(1_015)
+        );
+        assert_eq!(traffic_next_poll_delay(900, 1_000), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn traffic_retries_back_off_and_cap() {
+        assert_eq!(traffic_retry_delay(1), Duration::from_secs(60));
+        assert_eq!(traffic_retry_delay(2), Duration::from_secs(120));
+        assert_eq!(traffic_retry_delay(4), Duration::from_secs(480));
+        assert_eq!(traffic_retry_delay(5), Duration::from_secs(900));
+        assert_eq!(traffic_retry_delay(40), Duration::from_secs(900));
+    }
 }

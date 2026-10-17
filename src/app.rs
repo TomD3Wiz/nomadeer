@@ -5,7 +5,7 @@ use crate::forms::*;
 use crate::local_intel::{self, DownloadProgress};
 use crate::model::*;
 use crate::portrait;
-use crate::store::Store;
+use crate::store::{KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS};
 use crate::util::{clean, now, open_url};
 use crate::widgets::{pill, record_frame};
 use crate::zkill::{self, ZkillKill, ZkillReport};
@@ -25,7 +25,24 @@ enum EsiTaskResult {
 }
 
 enum ZkillTaskResult {
-    Report(ZkillReport),
+    Report {
+        report: ZkillReport,
+        traffic: SystemTrafficHistory,
+        save_error: Option<String>,
+    },
+}
+
+struct TrafficTaskResult {
+    feed: TrafficFeed,
+    /// When ESI will publish the next hour of this feed.
+    result: Result<u64, String>,
+}
+
+struct TrafficFeedState {
+    feed: TrafficFeed,
+    next_poll: Instant,
+    failures: u32,
+    busy: bool,
 }
 
 enum LocalIntelTaskResult {
@@ -78,6 +95,9 @@ pub(crate) struct NomadeerApp {
     portrait_rx: Receiver<Result<PortraitTaskResult, String>>,
     local_intel_tx: Sender<LocalIntelEvent>,
     local_intel_rx: Receiver<LocalIntelEvent>,
+    traffic_tx: Sender<TrafficTaskResult>,
+    traffic_rx: Receiver<TrafficTaskResult>,
+    traffic_feeds: Vec<TrafficFeedState>,
     esi_busy: bool,
     zkill_busy_system_id: Option<u64>,
     zkill_reports: HashMap<u64, ZkillReport>,
@@ -103,6 +123,7 @@ impl NomadeerApp {
         let (zkill_tx, zkill_rx) = mpsc::channel();
         let (portrait_tx, portrait_rx) = mpsc::channel();
         let (local_intel_tx, local_intel_rx) = mpsc::channel();
+        let (traffic_tx, traffic_rx) = mpsc::channel();
         let mut app = Self {
             data: AppData::default(),
             store,
@@ -121,6 +142,17 @@ impl NomadeerApp {
             portrait_rx,
             local_intel_tx,
             local_intel_rx,
+            traffic_tx,
+            traffic_rx,
+            traffic_feeds: TrafficFeed::ALL
+                .into_iter()
+                .map(|feed| TrafficFeedState {
+                    feed,
+                    next_poll: Instant::now(),
+                    failures: 0,
+                    busy: false,
+                })
+                .collect(),
             esi_busy: false,
             zkill_busy_system_id: None,
             zkill_reports: HashMap::new(),
@@ -665,27 +697,104 @@ impl NomadeerApp {
 
         let solar_system_id = system.solar_system_id;
         let system_name = system.name.clone();
-        let cached_killmails = self
-            .data
-            .cached_killmails
-            .iter()
-            .filter(|kill| kill.solar_system_id == solar_system_id)
-            .cloned()
-            .collect();
         self.zkill_busy_system_id = Some(solar_system_id);
         self.status = format!("Fetching killboard intel for {system_name}...");
         let tx = self.zkill_tx.clone();
+        let store = self.store.clone();
         thread::spawn(move || {
-            let result = zkill::fetch_system_report(solar_system_id, cached_killmails)
-                .map(ZkillTaskResult::Report);
-            let _ = tx.send(result);
+            let _ = tx.send(Self::run_zkill_refresh(&store, solar_system_id));
         });
+    }
+
+    /// Runs on a worker thread: merges cached killmails with fresh zKill data, stores
+    /// the result and reads the system's traffic history for the assessment.
+    fn run_zkill_refresh(store: &Store, solar_system_id: u64) -> Result<ZkillTaskResult, String> {
+        let current_time = now();
+        let mut save_error = None;
+        let cached_killmails = store
+            .cached_killmails(
+                solar_system_id,
+                current_time.saturating_sub(KILLMAIL_RETENTION_SECS),
+            )
+            .unwrap_or_else(|error| {
+                save_error = Some(error);
+                Vec::new()
+            });
+        let mut report = zkill::fetch_system_report(solar_system_id, cached_killmails)?;
+        if let Err(error) = store.store_killmails(&report.cached_killmails, current_time) {
+            save_error.get_or_insert(error);
+        }
+        // The merged killmails now live in the database; the report keeps its summary.
+        report.cached_killmails = Vec::new();
+        let traffic = store
+            .system_traffic(
+                solar_system_id,
+                current_time.saturating_sub(TRAFFIC_RETENTION_SECS),
+            )
+            .unwrap_or_else(|error| {
+                save_error.get_or_insert(error);
+                SystemTrafficHistory::default()
+            });
+        Ok(ZkillTaskResult::Report {
+            report,
+            traffic,
+            save_error,
+        })
+    }
+
+    fn maybe_poll_traffic(&mut self) {
+        let current = Instant::now();
+        for state in &mut self.traffic_feeds {
+            if state.busy || current < state.next_poll {
+                continue;
+            }
+            state.busy = true;
+            let feed = state.feed;
+            let store = self.store.clone();
+            let tx = self.traffic_tx.clone();
+            thread::spawn(move || {
+                let result = esi::fetch_traffic_feed(feed).and_then(|capture| {
+                    store.record_traffic_hour(&capture.traffic, now())?;
+                    Ok(capture.expires_at)
+                });
+                let _ = tx.send(TrafficTaskResult { feed, result });
+            });
+        }
+    }
+
+    fn poll_traffic_tasks(&mut self) {
+        while let Ok(task) = self.traffic_rx.try_recv() {
+            let Some(state) = self
+                .traffic_feeds
+                .iter_mut()
+                .find(|state| state.feed == task.feed)
+            else {
+                continue;
+            };
+            state.busy = false;
+            match task.result {
+                Ok(expires_at) => {
+                    state.failures = 0;
+                    state.next_poll =
+                        Instant::now() + esi::traffic_next_poll_delay(expires_at, now());
+                }
+                Err(_error) => {
+                    // Traffic history is background intel; a missed hour is just a gap.
+                    state.failures = state.failures.saturating_add(1);
+                    state.next_poll = Instant::now() + esi::traffic_retry_delay(state.failures);
+                }
+            }
+        }
     }
 
     fn poll_zkill_tasks(&mut self) {
         loop {
             match self.zkill_rx.try_recv() {
-                Ok(Ok(ZkillTaskResult::Report(report))) => {
+                Ok(Ok(ZkillTaskResult::Report {
+                    report,
+                    traffic,
+                    save_error,
+                })) => {
                     let kill_count = report.history.kills_7d;
                     let assessment = self
                         .data
@@ -693,29 +802,22 @@ impl NomadeerApp {
                         .iter()
                         .find(|system| system.solar_system_id == report.solar_system_id)
                         .map(|system| {
-                            local_intel::assess_system(
-                                system,
-                                &report,
-                                &self.data.activity_snapshots,
-                            )
+                            local_intel::assess_system(system, &report, &traffic.samples)
                         });
+                    let mut save_error = save_error;
                     if let Some(assessment) = assessment {
                         self.system_assessments
                             .insert(assessment.system_id.clone(), assessment.clone());
                         self.upsert_system_assessment(assessment);
+                        if let Err(error) = self.store.save(&self.data) {
+                            save_error.get_or_insert(error);
+                        }
                     }
-                    self.data.cached_killmails.retain(|kill| {
-                        kill.solar_system_id != report.solar_system_id
-                            && kill.killmail_time >= now().saturating_sub(7 * 24 * 60 * 60)
-                    });
-                    self.data
-                        .cached_killmails
-                        .extend(report.cached_killmails.iter().cloned());
                     self.zkill_busy_system_id = None;
                     self.zkill_reports.insert(report.solar_system_id, report);
-                    self.status = match self.store.save(&self.data) {
-                        Ok(()) => format!("Loaded {kill_count} kills from the last 7 days"),
-                        Err(error) => format!("Intel loaded, but cache save failed: {error}"),
+                    self.status = match save_error {
+                        None => format!("Loaded {kill_count} kills from the last 7 days"),
+                        Some(error) => format!("Intel loaded, but it could not be saved: {error}"),
                     };
                 }
                 Ok(Err(error)) => {
@@ -900,8 +1002,7 @@ impl NomadeerApp {
     }
 
     fn apply_location_sync(&mut self, location: LocationSync) {
-        let system_id = self.ensure_esi_system(&location.system);
-        self.record_activity_snapshot(&system_id);
+        let (system_id, system_changed) = self.ensure_esi_system(&location.system);
 
         let Some(account_index) = self
             .data
@@ -916,15 +1017,26 @@ impl NomadeerApp {
         let previous_system_id = self.data.accounts[account_index].last_system_id.clone();
         let character_name = self.data.accounts[account_index].character_name.clone();
 
-        self.data.accounts[account_index].access_token = Some(location.access_token);
-        self.data.accounts[account_index].refresh_token = Some(location.refresh_token);
-        self.data.accounts[account_index].token_expires_at = Some(location.token_expires_at);
-        self.data.accounts[account_index].last_system_id = system_id.clone();
-        self.data.accounts[account_index].last_system_name = location.system.name.clone();
-        self.data.accounts[account_index].auth_status = "authorized".to_owned();
-        self.data.accounts[account_index].updated_at = now();
+        let account = &mut self.data.accounts[account_index];
+        let account_changed = account.access_token.as_deref()
+            != Some(location.access_token.as_str())
+            || account.refresh_token.as_deref() != Some(location.refresh_token.as_str())
+            || account.token_expires_at != Some(location.token_expires_at)
+            || account.last_system_id != system_id
+            || account.last_system_name != location.system.name
+            || account.auth_status != "authorized";
+        if account_changed {
+            account.access_token = Some(location.access_token);
+            account.refresh_token = Some(location.refresh_token);
+            account.token_expires_at = Some(location.token_expires_at);
+            account.last_system_id = system_id.clone();
+            account.last_system_name = location.system.name.clone();
+            account.auth_status = "authorized".to_owned();
+            account.updated_at = now();
+        }
 
-        if previous_system_id.is_empty() || previous_system_id != system_id {
+        let moved = previous_system_id.is_empty() || previous_system_id != system_id;
+        if moved {
             let visit_id = self.new_id("visit");
             self.data.visits.push(VisitLog {
                 id: visit_id,
@@ -944,36 +1056,14 @@ impl NomadeerApp {
             self.ensure_connection(&previous_system_id, &system_id, &character_name);
         }
 
-        self.save();
+        // Auto-sync runs every few seconds, so only write when something changed.
+        if system_changed || account_changed || moved {
+            self.save();
+        }
         if self.selected_system_id.is_empty() {
             self.selected_system_id = system_id;
         }
         self.status = format!("{character_name} is in {}", location.system.name);
-    }
-
-    fn record_activity_snapshot(&mut self, system_id: &str) {
-        let Some(system) = self.system_by_id(system_id) else {
-            return;
-        };
-        let snapshot = SystemActivitySnapshot {
-            system_id: system_id.to_owned(),
-            captured_at: system.intel_updated_at / 3_600 * 3_600,
-            jumps_1h: system.jumps_1h,
-            ship_kills_1h: system.ship_kills_1h,
-            pod_kills_1h: system.pod_kills_1h,
-            npc_kills_1h: system.npc_kills_1h,
-        };
-        if self.data.activity_snapshots.iter().any(|existing| {
-            existing.system_id == system_id && existing.captured_at == snapshot.captured_at
-        }) {
-            return;
-        }
-        self.data.activity_snapshots.push(snapshot);
-
-        let cutoff = now().saturating_sub(30 * 24 * 60 * 60);
-        self.data
-            .activity_snapshots
-            .retain(|snapshot| snapshot.captured_at >= cutoff);
     }
 
     fn upsert_system_assessment(&mut self, assessment: SystemAssessment) {
@@ -989,7 +1079,8 @@ impl NomadeerApp {
         }
     }
 
-    fn ensure_esi_system(&mut self, intel: &SystemIntel) -> String {
+    /// Returns the map node id for the system and whether the node changed.
+    fn ensure_esi_system(&mut self, intel: &SystemIntel) -> (String, bool) {
         let esi_id = format!("esi_sys_{}", intel.solar_system_id);
         if let Some(existing) = self
             .data
@@ -997,8 +1088,8 @@ impl NomadeerApp {
             .iter_mut()
             .find(|system| system.id == esi_id)
         {
-            Self::apply_system_intel(existing, intel);
-            return esi_id;
+            let changed = Self::apply_system_intel(existing, intel);
+            return (esi_id, changed);
         }
         if let Some(existing) = self
             .data
@@ -1006,11 +1097,11 @@ impl NomadeerApp {
             .iter_mut()
             .find(|system| system.name == intel.name)
         {
-            Self::apply_system_intel(existing, intel);
-            return existing.id.clone();
+            let changed = Self::apply_system_intel(existing, intel);
+            return (existing.id.clone(), changed);
         }
 
-        self.data.systems.push(SystemNode {
+        let mut system = SystemNode {
             id: esi_id.clone(),
             solar_system_id: intel.solar_system_id,
             name: intel.name.clone(),
@@ -1023,21 +1114,27 @@ impl NomadeerApp {
             planet_count: intel.planet_count,
             stargate_count: intel.stargate_count,
             station_count: intel.station_count,
-            jumps_1h: intel.jumps_1h,
-            ship_kills_1h: intel.ship_kills_1h,
-            pod_kills_1h: intel.pod_kills_1h,
-            npc_kills_1h: intel.npc_kills_1h,
-            intel_updated_at: now(),
+            jumps_1h: 0,
+            ship_kills_1h: 0,
+            pod_kills_1h: 0,
+            npc_kills_1h: 0,
+            intel_updated_at: 0,
             effect: String::new(),
             status: "scouted".to_owned(),
             owner: String::new(),
             notes: format!("Solar system ID {}", intel.solar_system_id),
             created_at: now(),
-        });
-        esi_id
+        };
+        Self::apply_system_intel(&mut system, intel);
+        self.data.systems.push(system);
+        (esi_id, true)
     }
 
-    fn apply_system_intel(system: &mut SystemNode, intel: &SystemIntel) {
+    /// Copies ESI intel onto a map node and reports whether anything changed. Activity
+    /// that ESI could not provide keeps its previous values, and `intel_updated_at` is
+    /// the ESI time of the oldest activity reading on the node.
+    fn apply_system_intel(system: &mut SystemNode, intel: &SystemIntel) -> bool {
+        let before = system.clone();
         system.solar_system_id = intel.solar_system_id;
         system.name = intel.name.clone();
         system.class = intel.security_class.clone();
@@ -1049,11 +1146,19 @@ impl NomadeerApp {
         system.planet_count = intel.planet_count;
         system.stargate_count = intel.stargate_count;
         system.station_count = intel.station_count;
-        system.jumps_1h = intel.jumps_1h;
-        system.ship_kills_1h = intel.ship_kills_1h;
-        system.pod_kills_1h = intel.pod_kills_1h;
-        system.npc_kills_1h = intel.npc_kills_1h;
-        system.intel_updated_at = now();
+        let previous_update = system.intel_updated_at;
+        let jumps_time = intel.jumps.map_or(previous_update, |jumps| {
+            system.jumps_1h = jumps.value;
+            jumps.data_time
+        });
+        let kills_time = intel.kills.map_or(previous_update, |kills| {
+            system.ship_kills_1h = kills.value.ship_kills;
+            system.pod_kills_1h = kills.value.pod_kills;
+            system.npc_kills_1h = kills.value.npc_kills;
+            kills.data_time
+        });
+        system.intel_updated_at = jumps_time.min(kills_time);
+        *system != before
     }
 
     fn ensure_connection(&mut self, from_system: &str, to_system: &str, character_name: &str) {
@@ -1153,6 +1258,7 @@ impl NomadeerApp {
                 self.data.notes = snapshot.notes;
                 self.selected_system_id = snapshot.selected_system_id;
                 self.clear_account_locations_outside_chain();
+                self.retain_assessments_in_chain();
                 self.reconcile_selected_system();
                 self.save();
                 self.status = format!("Loaded chain {name}");
@@ -1182,8 +1288,25 @@ impl NomadeerApp {
             account.last_system_id.clear();
             account.last_system_name.clear();
         }
+        self.retain_assessments_in_chain();
         self.save();
         self.status = "Cleared current chain".to_owned();
+    }
+
+    /// Assessments belong to map nodes, so drop any whose node is no longer mapped.
+    /// Killmails and traffic history are keyed by solar system and kept.
+    fn retain_assessments_in_chain(&mut self) {
+        let system_ids = self
+            .data
+            .systems
+            .iter()
+            .map(|system| system.id.clone())
+            .collect::<HashSet<_>>();
+        self.data
+            .system_assessments
+            .retain(|assessment| system_ids.contains(&assessment.system_id));
+        self.system_assessments
+            .retain(|system_id, _| system_ids.contains(system_id));
     }
 
     fn clear_account_locations_outside_chain(&mut self) {
@@ -1236,14 +1359,8 @@ impl NomadeerApp {
             .retain(|visit| visit.system_id != system_id);
         self.data.notes.retain(|note| note.system_id != system_id);
         self.data
-            .activity_snapshots
-            .retain(|snapshot| snapshot.system_id != system_id);
-        self.data
             .system_assessments
             .retain(|assessment| assessment.system_id != system_id);
-        self.data
-            .cached_killmails
-            .retain(|kill| kill.solar_system_id != solar_system_id);
         self.system_assessments.remove(system_id);
         self.zkill_reports.remove(&solar_system_id);
         for account in &mut self.data.accounts {
@@ -2609,10 +2726,12 @@ impl eframe::App for NomadeerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_esi_tasks();
         self.poll_zkill_tasks();
+        self.poll_traffic_tasks();
         self.poll_portrait_tasks(ctx);
         self.poll_local_intel_tasks();
         self.maybe_request_portraits();
         self.maybe_auto_sync();
+        self.maybe_poll_traffic();
         self.top_bar(ctx);
         self.esi_settings_window(ctx);
         self.local_intel_settings_window(ctx);
@@ -2620,5 +2739,98 @@ impl eframe::App for NomadeerApp {
         self.central_panel(ctx);
         self.zkill_details_window(ctx);
         ctx.request_repaint_after(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NomadeerApp;
+    use crate::esi::SystemIntel;
+    use crate::model::{KillCounts, SystemNode, TrafficReading};
+
+    fn intel() -> SystemIntel {
+        SystemIntel {
+            solar_system_id: 30_002_187,
+            name: "Amamake".to_owned(),
+            security_class: "C".to_owned(),
+            security_status: 0.4,
+            constellation_id: 20_000_320,
+            constellation_name: "Hed".to_owned(),
+            region_id: 10_000_042,
+            region_name: "Metropolis".to_owned(),
+            planet_count: 10,
+            stargate_count: 5,
+            station_count: 3,
+            jumps: Some(TrafficReading {
+                hour: 7_200,
+                data_time: 7_300,
+                value: 400,
+            }),
+            kills: Some(TrafficReading {
+                hour: 7_200,
+                data_time: 7_500,
+                value: KillCounts {
+                    ship_kills: 5,
+                    pod_kills: 2,
+                    npc_kills: 30,
+                },
+            }),
+        }
+    }
+
+    fn node() -> SystemNode {
+        SystemNode {
+            id: "esi_sys_30002187".to_owned(),
+            solar_system_id: 0,
+            name: String::new(),
+            class: String::new(),
+            security_status: 0.0,
+            constellation_id: 0,
+            constellation_name: String::new(),
+            region_id: 0,
+            region_name: String::new(),
+            planet_count: 0,
+            stargate_count: 0,
+            station_count: 0,
+            jumps_1h: 0,
+            ship_kills_1h: 0,
+            pod_kills_1h: 0,
+            npc_kills_1h: 0,
+            intel_updated_at: 0,
+            effect: String::new(),
+            status: "scouted".to_owned(),
+            owner: String::new(),
+            notes: String::new(),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn system_intel_uses_esi_data_time_and_reports_changes() {
+        let mut system = node();
+        assert!(NomadeerApp::apply_system_intel(&mut system, &intel()));
+        assert_eq!(system.jumps_1h, 400);
+        assert_eq!(system.ship_kills_1h, 5);
+        assert_eq!(system.intel_updated_at, 7_300);
+        assert!(!NomadeerApp::apply_system_intel(&mut system, &intel()));
+    }
+
+    #[test]
+    fn failed_activity_feed_keeps_previous_values() {
+        let mut system = node();
+        NomadeerApp::apply_system_intel(&mut system, &intel());
+
+        let mut newer = intel();
+        newer.jumps = None;
+        newer.kills = Some(TrafficReading {
+            hour: 10_800,
+            data_time: 11_000,
+            value: KillCounts::default(),
+        });
+        assert!(NomadeerApp::apply_system_intel(&mut system, &newer));
+        assert_eq!(system.jumps_1h, 400);
+        assert_eq!(system.ship_kills_1h, 0);
+        // The node still holds older jump data, so it is only as fresh as that.
+        assert_eq!(system.intel_updated_at, 7_300);
     }
 }
