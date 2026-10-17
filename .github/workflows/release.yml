@@ -16,7 +16,6 @@ on:
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "CHANGELOG.md"
       - "rust-toolchain.toml"
       - "Makefile"
       - "tools/release.py"
