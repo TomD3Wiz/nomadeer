@@ -3,6 +3,13 @@
 //! shows the security band with a badge for the NPC faction holding it, and
 //! connections are styled by mass and age. Every design here is original.
 
+use std::f32::consts::{PI, TAU};
+use std::time::Duration;
+
+use eframe::egui::{
+    Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, Vec2, pos2, vec2,
+};
+
 use super::NomadeerApp;
 use crate::config::theme;
 use crate::data::factions::{self, Faction};
@@ -11,11 +18,6 @@ use crate::local_intel;
 use crate::model::{Connection, SystemNode};
 pub(super) use crate::wormhole::MassState;
 use crate::wormhole::{self, LifeState};
-use eframe::egui::{
-    Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, Vec2, pos2, vec2,
-};
-use std::f32::consts::{PI, TAU};
-use std::time::Duration;
 
 /// Below this on-screen radius a system drops its finer art: fewer spiral arms, no
 /// halo, and a faction dot instead of a badge.

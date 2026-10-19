@@ -1,14 +1,16 @@
 //! Umbra on screen: her voice in the intel panels, and her own panel beside the
 //! dashboard tabs with a feed of everything she has briefed.
 
+use std::collections::{HashMap, HashSet};
+
+use eframe::egui::{self, Sense, Stroke, Vec2};
+
 use super::{NomadeerApp, UmbraTask, WARNING_TEXT};
 use crate::config::theme;
 use crate::local_intel::{self, CoreStatus};
 use crate::model::{SystemAssessment, SystemNode, UmbraBriefing};
 use crate::util::now;
 use crate::widgets::pill;
-use eframe::egui::{self, Sense, Stroke, Vec2};
-use std::collections::{HashMap, HashSet};
 
 /// Her portrait: Aura's hologram half taken by Sleeper plating, one eye gone amber.
 /// Square; larger art is scaled down on load.
@@ -628,13 +630,14 @@ pub(super) fn sidebar_words(assessment: &SystemAssessment) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::{
         AVATAR_PNG, AVATAR_TEXTURE_SIZE, BriefingVoice, COMPACT_HEADER_AVATAR_SIZE, ChainLookup,
         FEED_SHOWN, HEADER_AVATAR_SIZE, avatar_image, evidence_heading, feed_class_label,
         feed_entry, header_avatar_size, message_time, push_feed_entry, sidebar_words,
     };
     use crate::model::{SystemAssessment, SystemNode};
-    use std::io::Cursor;
 
     const NOW: u64 = 1_760_000_000;
 

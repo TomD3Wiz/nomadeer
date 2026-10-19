@@ -1,9 +1,11 @@
 //! The chain map's geometry: where systems sit in map units, and the camera that
 //! turns map units into points on screen as the player pans and zooms.
 
-use crate::model::{Connection, MapPosition, SystemNode};
-use eframe::egui::{Pos2, Rect, Vec2, pos2, vec2};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+use eframe::egui::{Pos2, Rect, Vec2, pos2, vec2};
+
+use crate::model::{Connection, MapPosition, SystemNode};
 
 /// A system's radius in map units; at 100% zoom a map unit is a pixel.
 pub(super) const NODE_RADIUS: f32 = 38.0;
@@ -451,14 +453,16 @@ fn topology_layout(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use eframe::egui::{Pos2, Rect, pos2, vec2};
+
     use super::{
         COLUMN_SPACING, Camera, HANDLE_RADIUS, MAX_ZOOM, MIN_SPACING, MIN_ZOOM, NODE_RADIUS,
         chain_bounds, connection_at, connector_handle, detail_opacity, distance_to_segment,
         handle_at, handle_radius, layout, name_opacity, system_at, target_at,
     };
     use crate::model::{Connection, MapPosition, SystemNode};
-    use eframe::egui::{Pos2, Rect, pos2, vec2};
-    use std::collections::HashMap;
 
     fn view() -> Rect {
         Rect::from_min_size(pos2(100.0, 50.0), vec2(800.0, 400.0))

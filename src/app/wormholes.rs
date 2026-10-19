@@ -2,6 +2,11 @@
 //! from the chain map's right-click menu or the Connections tab, and links it to the
 //! signatures it was found by.
 
+use eframe::egui::{
+    self, PopupCloseBehavior,
+    containers::menu::{MenuButton, MenuConfig, SubMenuButton},
+};
+
 use super::{NomadeerApp, WARNING_TEXT, umbra};
 use crate::config::theme;
 use crate::data::wormhole_types::{self, TargetClass, WormholeType};
@@ -11,10 +16,6 @@ use crate::signatures;
 use crate::util::now;
 use crate::widgets::record_frame;
 use crate::wormhole::{self, LifeState, MassState};
-use eframe::egui::{
-    self, PopupCloseBehavior,
-    containers::menu::{MenuButton, MenuConfig, SubMenuButton},
-};
 
 /// Pochven's region: its systems are null-sec by security, but a wormhole type of
 /// their own.
@@ -652,9 +653,10 @@ impl NomadeerApp {
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui;
+
     use super::{type_choice_label, wormhole_type_picker};
     use crate::data::wormhole_types::{self, TargetClass};
-    use eframe::egui;
 
     #[test]
     fn type_choices_name_where_they_lead() {
