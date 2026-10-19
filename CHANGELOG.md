@@ -6,6 +6,8 @@ uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-19
+
 ### Added
 
 - Install Umbra straight from her panel. While she is not installed, her panel
@@ -86,5 +88,6 @@ systems you pass through.
   AppImage then update themselves: the download is checked against its
   published checksum, installed and Nomadeer restarts, keeping your data.
 
-[Unreleased]: https://github.com/TomD3Wiz/nomadeer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/TomD3Wiz/nomadeer/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/TomD3Wiz/nomadeer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/TomD3Wiz/nomadeer/releases/tag/v0.1.0
