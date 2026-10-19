@@ -6,6 +6,17 @@ uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Umbra's briefings always cover both threat and activity, and each half now
+  backs its level with a fact from the evidence instead of only repeating it,
+  so briefings in quiet systems no longer all read the same.
+
+### Fixed
+
+- A briefing could leave out the activity level when threat and activity were
+  both Quiet, because the threat sentence was taken as covering it.
+
 ## [0.1.0] - 2026-10-18
 
 The first release of Nomadeer, a companion that rides alongside your EVE

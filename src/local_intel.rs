@@ -903,7 +903,8 @@ impl LoadedCore {
     ) -> Result<String, String> {
         // Each briefing starts from an empty context.
         self.model.clear_kv_cache();
-        let reply_prefix = format!("Threat is {}", score_label(assessment.threat_score));
+        // Each sentence is started up to "with", so she goes straight into a fact.
+        let reply_prefix = format!("Threat is {}, with", score_label(assessment.threat_score));
         let prompt = format!("{}{reply_prefix}", briefing_prompt(assessment));
         let tokens = self
             .tokenizer
@@ -930,23 +931,55 @@ impl LoadedCore {
             .sample(&logits)
             .map_err(|error| error.to_string())?;
         let mut generated = Vec::new();
+        let mut position = input_ids.len();
+        // Sentence two is started for her too, so the activity level is never dropped.
+        let steer = format!(
+            " Activity is {}, with",
+            score_label(assessment.activity_score)
+        );
+        let mut steered = false;
 
-        for index in 0..BRIEFING_MAX_TOKENS {
+        for _ in 0..BRIEFING_MAX_TOKENS {
             if stop.load(Ordering::Relaxed) {
                 return Err("Umbra was pulled off this briefing".to_owned());
+            }
+            if !steered {
+                let next_text = self
+                    .tokenizer
+                    .decode(&[next_token], false)
+                    .map_err(|error| error.to_string())?;
+                let ends_sentence = self.stop_tokens.contains(&next_token)
+                    || next_text.starts_with(char::is_whitespace);
+                let so_far = self
+                    .tokenizer
+                    .decode(&generated, true)
+                    .map_err(|error| error.to_string())?;
+                if ends_sentence && first_sentence_done(&format!("{reply_prefix}{so_far}")) {
+                    steered = true;
+                    let steer_ids = self
+                        .tokenizer
+                        .encode(steer.as_str(), false)
+                        .map_err(|error| error.to_string())?;
+                    let mut logits = None;
+                    for &token in steer_ids.get_ids() {
+                        generated.push(token);
+                        logits = Some(self.step(token, position)?);
+                        position += 1;
+                    }
+                    if let Some(logits) = logits {
+                        next_token = processor
+                            .sample(&logits)
+                            .map_err(|error| error.to_string())?;
+                        continue;
+                    }
+                }
             }
             if self.stop_tokens.contains(&next_token) {
                 break;
             }
             generated.push(next_token);
-            let input = Tensor::new(&[next_token], &self.device)
-                .and_then(|tensor| tensor.unsqueeze(0))
-                .map_err(|error| error.to_string())?;
-            let logits = self
-                .model
-                .forward(&input, input_ids.len() + index)
-                .and_then(|logits| logits.squeeze(0))
-                .map_err(|error| error.to_string())?;
+            let logits = self.step(next_token, position)?;
+            position += 1;
             next_token = processor
                 .sample(&logits)
                 .map_err(|error| error.to_string())?;
@@ -963,6 +996,24 @@ impl LoadedCore {
         validate_briefing(&briefing, assessment)?;
         Ok(briefing)
     }
+
+    /// Feeds one token at `position` and returns the logits for the next one.
+    fn step(&mut self, token: u32, position: usize) -> Result<Tensor, String> {
+        let input = Tensor::new(&[token], &self.device)
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .map_err(|error| error.to_string())?;
+        self.model
+            .forward(&input, position)
+            .and_then(|logits| logits.squeeze(0))
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// True once the text holds a finished first sentence, so sentence two can begin.
+/// A full stop inside a number ("490.7m") does not count, because the caller only
+/// asks when the next token starts with a space or ends the reply.
+fn first_sentence_done(text: &str) -> bool {
+    text.trim_end().ends_with(['.', '!', '?'])
 }
 
 /// True when two assessments rest on exactly the same scores and evidence, so a
@@ -1007,8 +1058,9 @@ fn briefing_prompt(assessment: &SystemAssessment) -> String {
 }
 
 const BRIEFING_INSTRUCTIONS: &str = "You are Umbra, a concise EVE Online intel officer. Turn the fact sheet into a two-sentence briefing for a pilot.
-- Sentence one: the Threat label and the kill evidence behind it, quoting its numbers.
-- Sentence two: the Activity label and the remaining evidence, quoting its numbers.
+- Sentence one: \"Threat is <Threat label>, with\" and the most telling kill fact, quoting its numbers: recent kills first, then ISK destroyed, then kills at this time of day.
+- Sentence two: \"Activity is <Activity label>, with\" and the most telling remaining fact, quoting its numbers: traffic or live intel if the sheet lists them, otherwise the weekly kills. Never mention facts the sheet does not list.
+- If the facts are all zeros, say what was checked, for example no kills in the last 24 hours.
 - Use only the fact sheet. Never mention pilots, corporations, alliances, factions, fleets, ships, motives or routes unless the fact sheet names them.
 - Use the Threat and Activity labels exactly as written.
 - Copy numbers exactly as written and never add new ones.
@@ -1054,8 +1106,14 @@ fn clean_briefing(text: &str) -> String {
 /// Rejects briefings that contradict the evidence: a small model can drop the
 /// activity label or invent numbers, and an evidence summary is safer than that.
 fn validate_briefing(briefing: &str, assessment: &SystemAssessment) -> Result<(), String> {
+    // The threat label opens the reply, so the activity label has to appear after
+    // it; otherwise a "Quiet" threat would hide a missing "Quiet" activity.
     let activity_label = score_label(assessment.activity_score).to_lowercase();
-    if !briefing.to_lowercase().contains(&activity_label) {
+    let threat_opening =
+        format!("threat is {}", score_label(assessment.threat_score)).to_lowercase();
+    let lower = briefing.to_lowercase();
+    let after_threat = lower.strip_prefix(&threat_opening).unwrap_or(&lower);
+    if !after_threat.contains(&activity_label) {
         return Err("Umbra's briefing left out the activity level, so it was set aside".to_owned());
     }
 
@@ -1246,10 +1304,10 @@ mod tests {
         BriefingEvent, BriefingWorker, CoreFile, CoreStatus, LEGACY_MODEL_DIRECTORY_NAMES,
         LoadedCore, MODEL_DIRECTORY_NAME, VERIFIED_MARKER_FILE, assess_system,
         assess_with_live_intel, attach_briefing, clean_briefing, confidence_label, core_status,
-        core_status_in, fact_sheet, import_file, import_path_hint_for, import_source_path,
-        install_model, is_wormhole_space, keep_briefing, numbers_in, remove_cores_in,
-        remove_directory_in, score_label, umbra_thread_count, validate_briefing, verify_core,
-        verify_core_in,
+        core_status_in, fact_sheet, first_sentence_done, import_file, import_path_hint_for,
+        import_source_path, install_model, is_wormhole_space, keep_briefing, numbers_in,
+        remove_cores_in, remove_directory_in, score_label, umbra_thread_count, validate_briefing,
+        verify_core, verify_core_in,
     };
     use crate::live_intel::LiveContribution;
     use crate::model::{
@@ -1844,6 +1902,32 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_label_cannot_stand_in_for_the_missing_activity() {
+        // Seen in play: both levels Quiet, and only the threat half was written.
+        let quiet = test_assessment(4, 12, "Medium", &["8 kills in the last 7 days"]);
+        assert!(validate_briefing("Threat is Quiet. 8 kills in the last 7 days.", &quiet).is_err());
+        assert!(
+            validate_briefing(
+                "Threat is Quiet, with 8 kills in the last 7 days. Activity is Quiet.",
+                &quiet
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn sentence_one_ends_at_a_full_stop_not_inside_a_number() {
+        assert!(first_sentence_done(
+            "Threat is Quiet, with no recent kills."
+        ));
+        assert!(first_sentence_done("Threat is High!  "));
+        assert!(!first_sentence_done("Threat is High with 490.7m"));
+        assert!(!first_sentence_done(
+            "Threat is Quiet, with no recent kills"
+        ));
+    }
+
+    #[test]
     fn numbers_in_keeps_decimals_and_drops_punctuation() {
         assert_eq!(
             numbers_in("3.4b ISK, 42% and 2140 jumps."),
@@ -1896,6 +1980,27 @@ mod tests {
         let mut core = LoadedCore::load().expect("installed core should load");
         println!("[{:.1}s] loaded", started.elapsed().as_secs_f32());
         let scenarios = [
+            // Quiet wormholes as seen in play, where briefings used to repeat "Quiet".
+            test_assessment(
+                13,
+                32,
+                "Medium",
+                &[
+                    "0 kills in the last hour, 1 in the last 4 hours and 1 in the last 24 hours",
+                    "13 kills in the last 7 days",
+                    "490.7m ISK destroyed in the last 24 hours",
+                    "D-scan shows no ships",
+                ],
+            ),
+            test_assessment(
+                4,
+                12,
+                "Medium",
+                &[
+                    "No kills in the last 24 hours",
+                    "8 kills in the last 7 days",
+                ],
+            ),
             test_assessment(
                 68,
                 21,
