@@ -811,17 +811,7 @@ impl NomadeerApp {
 
                 self.umbra_auto_brief_toggle(ui);
 
-                if let Some(progress) = &self.local_intel_progress {
-                    let fraction = if progress.total == 0 {
-                        0.0
-                    } else {
-                        progress.done as f32 / progress.total as f32
-                    };
-                    ui.add(
-                        egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
-                            .text(format!("{} · {:.0}%", progress.label, fraction * 100.0)),
-                    );
-                }
+                self.umbra_progress_bar(ui);
                 self.umbra_feedback(ui, None);
 
                 if core != CoreStatus::Ready {

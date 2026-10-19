@@ -5,7 +5,9 @@ Builds the Nomadeer Windows installer and portable zip from release binaries.
 .DESCRIPTION
 Runs Inno Setup on packaging\windows\nomadeer.iss to produce
 Nomadeer-<version>-Setup.exe, builds Nomadeer-<version>-Windows-Portable.zip
-and writes a .sha256 file (sha256sum format) next to each. The release
+and writes a .sha256 file (sha256sum format) next to each. Setup's Umbra
+download defines come from tools/release.py inno-defines, so Python 3 must
+be on PATH. The release
 workflow runs it after building both editions with a static C runtime, so
 the exes start without the Visual C++ Redistributable:
 
@@ -42,6 +44,17 @@ function Find-Iscc {
     throw 'Inno Setup 6 (ISCC.exe) was not found. Install it with: choco install innosetup'
 }
 
+function Find-Python {
+    foreach ($name in @('python', 'python3', 'py')) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if (-not $command) { continue }
+        # Skip the Microsoft Store placeholder, which only offers to install Python.
+        & $command.Source --version *> $null
+        if ($LASTEXITCODE -eq 0) { return $command.Source }
+    }
+    throw 'Python 3 was not found. Setup needs it to generate the Umbra download defines.'
+}
+
 function Write-Checksum([string] $Path) {
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
     $name = Split-Path -Leaf $Path
@@ -60,11 +73,22 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
 if (-not $Iscc) { $Iscc = Find-Iscc }
 
+Write-Host '== Umbra download defines'
+$python = Find-Python
+$umbraDefines = Join-Path ([IO.Path]::GetTempPath()) "nomadeer-umbra-defines-$([Guid]::NewGuid()).iss"
+& $python (Join-Path $root 'tools/release.py') inno-defines --output $umbraDefines
+if ($LASTEXITCODE -ne 0) { throw "tools/release.py inno-defines failed with exit code $LASTEXITCODE" }
+
 Write-Host "== installer ($Iscc)"
-& $Iscc /Q "/DAppVersion=$Version" "/DOptimizedExe=$OptimizedExe" `
-    "/DCompatibleExe=$CompatibleExe" "/O$OutDir" `
-    (Join-Path $root 'packaging/windows/nomadeer.iss')
-if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+try {
+    & $Iscc /Q "/DAppVersion=$Version" "/DOptimizedExe=$OptimizedExe" `
+        "/DCompatibleExe=$CompatibleExe" "/DUmbraDefines=$umbraDefines" "/O$OutDir" `
+        (Join-Path $root 'packaging/windows/nomadeer.iss')
+    if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+}
+finally {
+    Remove-Item -LiteralPath $umbraDefines -ErrorAction SilentlyContinue
+}
 $setup = Join-Path $OutDir "Nomadeer-$Version-Setup.exe"
 Write-Checksum $setup
 Write-Host "wrote $setup"

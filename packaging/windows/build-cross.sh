@@ -6,7 +6,8 @@
 #
 # with the repository mounted read-only at /src, a writable build directory at
 # /build and the output directory at /dist. The installer itself is compiled
-# afterwards with Inno Setup from the binaries left in /build/stage.
+# afterwards with Inno Setup from the binaries and the Umbra download defines
+# (tools/release.py inno-defines) left in /build/stage.
 set -eu
 
 version=${1:?usage: build-cross.sh <version>}
@@ -24,7 +25,7 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
-    gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip >/dev/null
+    gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip python3 >/dev/null
 
 # Keep the registry cache between runs and stay on the image's pinned
 # toolchain instead of letting rust-toolchain.toml download the newest stable.
@@ -45,6 +46,8 @@ rm -rf "$stage"
 mkdir -p "$stage"
 cp "$build/optimized/$target/release/nomadeer.exe" "$stage/nomadeer-optimized.exe"
 cp "$build/compatible/$target/release/nomadeer.exe" "$stage/nomadeer-compatible.exe"
+# Setup downloads Umbra from the same URLs, with the same checksums, as the app.
+python3 tools/release.py inno-defines --output "$stage/umbra-defines.iss"
 
 # Text files in the zip get Windows line endings so Notepad shows them as-is.
 crlf() {

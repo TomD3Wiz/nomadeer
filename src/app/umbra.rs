@@ -3,7 +3,7 @@
 
 use super::{NomadeerApp, UmbraTask, WARNING_TEXT};
 use crate::config::theme;
-use crate::local_intel::{self, CoreStatus};
+use crate::local_intel::{self, CoreStatus, DownloadProgress};
 use crate::model::{SystemAssessment, SystemNode, UmbraBriefing};
 use crate::util::now;
 use crate::widgets::pill;
@@ -29,6 +29,75 @@ const MIN_FEED_HEIGHT: f32 = 120.0;
 pub(super) const FEED_SHOWN: usize = 200;
 const QUIET_NOTE: &str = "Public killmails may be delayed or absent; quiet never means safe.";
 const EMPTY_FEED_LINE: &str = "Nothing assessed yet. Fly a recon pilot into a system, or press Ask Umbra in Intel, and I will tell you what the evidence says.";
+const INSTALL_LINE: &str = "I am not aboard yet. Bring my core onto this computer and I will brief you on every system your pilots fly into.";
+const REPAIR_LINE: &str = "My core is damaged and I will not brief you from it. Let me pull a clean copy and I will be back on watch.";
+
+/// The card in her panel that brings her aboard, while she cannot brief.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InstallCard {
+    /// Her core is not on this computer.
+    Install,
+    /// Her core failed its check or could not be loaded.
+    Repair,
+}
+
+impl InstallCard {
+    /// The card her panel shows, if any: none once her core is in place, even
+    /// before it has been checked.
+    pub(super) fn for_core(core: CoreStatus, needs_repair: bool) -> Option<Self> {
+        if needs_repair {
+            Some(Self::Repair)
+        } else if core == CoreStatus::Missing {
+            Some(Self::Install)
+        } else {
+            None
+        }
+    }
+
+    fn line(self) -> &'static str {
+        match self {
+            Self::Install => INSTALL_LINE,
+            Self::Repair => REPAIR_LINE,
+        }
+    }
+
+    fn button(self) -> &'static str {
+        match self {
+            Self::Install => "Install Umbra",
+            Self::Repair => "Repair Umbra",
+        }
+    }
+
+    /// What it costs and where she runs.
+    fn details(self, size: &str) -> String {
+        match self {
+            Self::Install => {
+                format!("A one-time download of about {size}. She runs entirely on this computer.")
+            }
+            Self::Repair => format!(
+                "Whatever is still sound is kept; the rest is downloaded again, up to {size}. She runs entirely on this computer."
+            ),
+        }
+    }
+}
+
+/// How far an install has got, and the words on its progress bar.
+pub(super) fn progress_bar_text(progress: &DownloadProgress) -> (f32, String) {
+    let fraction = if progress.total == 0 {
+        0.0
+    } else {
+        (progress.done as f64 / progress.total as f64).clamp(0.0, 1.0) as f32
+    };
+    let megabytes = |bytes: u64| (bytes as f64 / 1_000_000.0).round() as u64;
+    let text = format!(
+        "{} · {} of {} MB · {:.0}%",
+        progress.label,
+        megabytes(progress.done),
+        megabytes(progress.total),
+        fraction * 100.0
+    );
+    (fraction, text)
+}
 
 /// Whose words an assessment shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +468,77 @@ impl NomadeerApp {
         }
     }
 
+    /// The install's progress bar, while her core is coming aboard.
+    pub(super) fn umbra_progress_bar(&self, ui: &mut egui::Ui) {
+        if let Some(progress) = &self.local_intel_progress {
+            let (fraction, text) = progress_bar_text(progress);
+            ui.add(egui::ProgressBar::new(fraction).text(text));
+        }
+    }
+
+    /// Brings her aboard from her own panel: what she needs, the button that starts
+    /// it, and how it is going, including why it failed.
+    fn umbra_install_card(&mut self, ui: &mut egui::Ui, card: InstallCard) {
+        let installing = matches!(
+            self.umbra_task,
+            Some(UmbraTask::Installing | UmbraTask::Importing)
+        );
+        egui::Frame::new()
+            .stroke(Stroke::new(1.0_f32, theme::umbra()))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                umbra_quote(ui, card.line());
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(card.details(&local_intel::download_size_label()))
+                        .color(theme::muted_text()),
+                );
+                ui.add_space(6.0);
+                if installing {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(match card {
+                                InstallCard::Install => "Bringing Umbra aboard...",
+                                InstallCard::Repair => "Repairing Umbra...",
+                            })
+                            .color(theme::umbra()),
+                        );
+                    });
+                    self.umbra_progress_bar(ui);
+                } else {
+                    let free = self.umbra_free_for_player();
+                    let button = egui::Button::new(
+                        egui::RichText::new(card.button())
+                            .strong()
+                            .color(theme::umbra_text()),
+                    )
+                    .fill(theme::umbra_background())
+                    .stroke(Stroke::new(1.0_f32, theme::umbra()))
+                    .min_size(Vec2::new(160.0, 32.0));
+                    let response = ui.add_enabled(free, button);
+                    if response.clicked() {
+                        self.start_local_model_install();
+                    }
+                    if !free {
+                        response.on_disabled_hover_text("Umbra is busy; try again in a moment.");
+                    }
+                }
+                if let Some(notice) = &self.umbra_notice
+                    && notice.system_id.is_none()
+                {
+                    let color = if notice.is_error {
+                        WARNING_TEXT
+                    } else {
+                        theme::muted_text()
+                    };
+                    ui.label(egui::RichText::new(&notice.message).color(color));
+                }
+            });
+    }
+
     /// Her own panel: who she is, what she is doing, and every briefing she has written.
     /// It fills `ui`; the feed takes whatever height the header leaves. When the header
     /// leaves less than the feed's minimum, the panel stays scrolled to the feed's bottom so
@@ -413,7 +553,13 @@ impl NomadeerApp {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 let header_top = ui.cursor().top();
-                self.umbra_header(ui, avatar.as_ref(), avatar_size);
+                let card =
+                    InstallCard::for_core(local_intel::core_status(), self.umbra_needs_repair);
+                self.umbra_header(ui, avatar.as_ref(), avatar_size, card.is_some());
+                if let Some(card) = card {
+                    ui.add_space(6.0);
+                    self.umbra_install_card(ui, card);
+                }
                 ui.separator();
                 let header_height = ui.cursor().top() - header_top;
                 let feed_height = (viewport_height - header_height).max(MIN_FEED_HEIGHT);
@@ -528,6 +674,7 @@ impl NomadeerApp {
         ui: &mut egui::Ui,
         avatar: Option<&egui::TextureHandle>,
         avatar_size: f32,
+        install_card_shown: bool,
     ) {
         let core = local_intel::core_status();
         ui.horizontal_top(|ui| {
@@ -599,7 +746,12 @@ impl NomadeerApp {
                         }
                     });
                 }
-                if let Some(notice) = &self.umbra_notice {
+                // While her install card is up, her own news is shown on it instead.
+                if let Some(notice) = self
+                    .umbra_notice
+                    .as_ref()
+                    .filter(|notice| !install_card_shown || notice.system_id.is_some())
+                {
                     let color = if notice.is_error {
                         WARNING_TEXT
                     } else {
@@ -630,9 +782,11 @@ pub(super) fn sidebar_words(assessment: &SystemAssessment) -> Option<&str> {
 mod tests {
     use super::{
         AVATAR_PNG, AVATAR_TEXTURE_SIZE, BriefingVoice, COMPACT_HEADER_AVATAR_SIZE, ChainLookup,
-        FEED_SHOWN, HEADER_AVATAR_SIZE, avatar_image, evidence_heading, feed_class_label,
-        feed_entry, header_avatar_size, message_time, push_feed_entry, sidebar_words,
+        FEED_SHOWN, HEADER_AVATAR_SIZE, InstallCard, avatar_image, evidence_heading,
+        feed_class_label, feed_entry, header_avatar_size, message_time, progress_bar_text,
+        push_feed_entry, sidebar_words,
     };
+    use crate::local_intel::{CoreStatus, DownloadProgress};
     use crate::model::{SystemAssessment, SystemNode};
     use std::io::Cursor;
 
@@ -856,5 +1010,47 @@ mod tests {
         assert_eq!(header_avatar_size(640.0, 480.0), HEADER_AVATAR_SIZE);
         assert_eq!(header_avatar_size(300.0, 480.0), COMPACT_HEADER_AVATAR_SIZE);
         assert_eq!(header_avatar_size(640.0, 200.0), COMPACT_HEADER_AVATAR_SIZE);
+    }
+
+    #[test]
+    fn her_install_card_shows_until_her_core_is_in_place() {
+        assert_eq!(
+            InstallCard::for_core(CoreStatus::Missing, false),
+            Some(InstallCard::Install)
+        );
+        assert_eq!(InstallCard::for_core(CoreStatus::Ready, false), None);
+        // A core that is only waiting for its check is in place.
+        assert_eq!(InstallCard::for_core(CoreStatus::Unchecked, false), None);
+        for core in [
+            CoreStatus::Missing,
+            CoreStatus::Unchecked,
+            CoreStatus::Ready,
+        ] {
+            assert_eq!(InstallCard::for_core(core, true), Some(InstallCard::Repair));
+        }
+        assert_eq!(InstallCard::Install.button(), "Install Umbra");
+        assert_eq!(InstallCard::Repair.button(), "Repair Umbra");
+        assert!(
+            InstallCard::Install
+                .details("1.1 GB")
+                .contains("about 1.1 GB")
+        );
+        for card in [InstallCard::Install, InstallCard::Repair] {
+            assert!(card.details("1.1 GB").contains("entirely on this computer"));
+        }
+    }
+
+    #[test]
+    fn install_progress_reads_in_megabytes() {
+        let progress = |done, total| DownloadProgress {
+            label: "Downloading Umbra's core".to_owned(),
+            done,
+            total,
+        };
+        let (fraction, text) = progress_bar_text(&progress(558_660_368, 1_117_320_736));
+        assert!((fraction - 0.5).abs() < 1e-6);
+        assert_eq!(text, "Downloading Umbra's core · 559 of 1117 MB · 50%");
+        assert_eq!(progress_bar_text(&progress(10, 0)).0, 0.0);
+        assert_eq!(progress_bar_text(&progress(20, 10)).0, 1.0);
     }
 }
