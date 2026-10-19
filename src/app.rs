@@ -1,3 +1,10 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use eframe::egui::{self, Color32, Sense, Stroke, Vec2};
+
 use crate::auto_intel::{self, AutoBriefings, IntelQueue, IntelRequest, LocationFix};
 use crate::chain_archive::{self, ChainSnapshot, ChainSnapshotMeta};
 use crate::config::theme;
@@ -14,11 +21,6 @@ use crate::util::{clean, now, open_url};
 use crate::widgets::{pill, record_frame};
 use crate::window_fit;
 use crate::zkill::{self, ZkillKill, ZkillReport};
-use eframe::egui::{self, Color32, Sense, Stroke, Vec2};
-use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread;
-use std::time::{Duration, Instant};
 
 mod chain_art;
 mod chain_map;

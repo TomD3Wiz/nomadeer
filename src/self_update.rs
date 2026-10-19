@@ -7,14 +7,16 @@
 //! a folder of its own under the system's temp folder, and a new AppImage is
 //! written next to the old one before it takes its place.
 
-use crate::updates::{self, Edition, InstallKind, Release, ReleaseAsset};
-use reqwest::blocking::{Client, Response};
-use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use reqwest::blocking::{Client, Response};
+use sha2::{Digest, Sha256};
+
+use crate::updates::{self, Edition, InstallKind, Release, ReleaseAsset};
 
 /// Every release file is downloaded from under here, as `v<version>/<name>`.
 const DOWNLOAD_ROOT: &str = "https://github.com/TomD3Wiz/nomadeer/releases/download/";
@@ -827,10 +829,11 @@ fn keep_descriptors_from_children() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+
+    use super::*;
 
     const VERSION: &str = "0.2.0";
     const SETUP: &str = "Nomadeer-0.2.0-Setup.exe";

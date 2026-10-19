@@ -20,8 +20,16 @@ uses [semantic versioning](https://semver.org/).
   installing for yourself; installing for all users leaves her to each
   player's panel.
 
+### Changed
+
+- Umbra's briefings always cover both threat and activity, and each half now
+  backs its level with a fact from the evidence instead of only repeating it,
+  so briefings in quiet systems no longer all read the same.
+
 ### Fixed
 
+- A briefing could leave out the activity level when threat and activity were
+  both Quiet, because the threat sentence was taken as covering it.
 - The window no longer opens larger than the screen. On smaller screens, such
   as 1280x800 or 1366x768 laptops, Nomadeer now opens maximized instead of
   partly off-screen.

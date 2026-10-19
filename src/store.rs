@@ -1,3 +1,15 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use rusqlite::{
+    Connection as SqliteConnection, OptionalExtension, Row, TransactionBehavior, params,
+    types::Type,
+};
+
 use crate::live_intel::LIVE_INTEL_RETENTION_SECS;
 use crate::model::{
     Account, AppData, AutoIntelSettings, CachedKillmail, CharacterAffiliation, Connection,
@@ -8,16 +20,6 @@ use crate::model::{
 use crate::paths;
 use crate::updates::{Release, UpdateState};
 use crate::util::{DAY_SECS, hour_start, now};
-use rusqlite::{
-    Connection as SqliteConnection, OptionalExtension, Row, TransactionBehavior, params,
-    types::Type,
-};
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 /// Killboard history covers the last week.
 pub(crate) const KILLMAIL_RETENTION_SECS: u64 = 7 * DAY_SECS;
@@ -1864,6 +1866,11 @@ fn traffic_kills(row: &Row<'_>, first_column: usize) -> rusqlite::Result<KillCou
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use rusqlite::Connection as SqliteConnection;
+
     use super::{
         KILLMAIL_RETENTION_SECS, LIVE_INTEL_RETENTION_SECS, LOOKUP_RETENTION_SECS, Store,
         TRAFFIC_RETENTION_SECS, UMBRA_FEED_MAX_KEPT, UMBRA_FEED_RETENTION_SECS,
@@ -1873,9 +1880,6 @@ mod tests {
         KillCounts, KillboardCoverage, MapPosition, TrafficHour, TrafficReading, TrafficRows,
         TrafficSample, UmbraBriefing,
     };
-    use rusqlite::Connection as SqliteConnection;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     const HOUR: u64 = 3_600;
     const NOW: u64 = 1_760_000_000 / HOUR * HOUR + 1_800;

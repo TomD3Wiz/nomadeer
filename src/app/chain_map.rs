@@ -1,17 +1,19 @@
 //! The chain map on screen: a view the player pans and zooms, systems they can drag
 //! into place, and connections drawn by dragging from one system to another.
 
+use std::collections::HashMap;
+
+use eframe::egui::{
+    self, Align, Align2, Color32, CursorIcon, FontId, Layout, PointerButton, Pos2, Rect, Sense,
+    Stroke, Vec2, pos2, vec2,
+};
+
 use super::chain_art::{self, ConnectionStyle, Detail, Legend, NodeLook};
 use super::chain_view::{self, CONNECTION_PICK_DISTANCE, Camera, NODE_RADIUS};
 use super::{ChainMapTarget, NomadeerApp, umbra};
 use crate::config::theme;
 use crate::util::now;
 use crate::wormhole;
-use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, FontId, Layout, PointerButton, Pos2, Rect, Sense,
-    Stroke, Vec2, pos2, vec2,
-};
-use std::collections::HashMap;
 
 /// The hint beside the map's heading.
 pub(super) const CHAIN_MAP_HINT: &str =

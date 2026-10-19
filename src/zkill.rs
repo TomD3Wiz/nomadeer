@@ -1,10 +1,12 @@
-use crate::model::{CachedKillmail, KillboardCoverage};
-use crate::util::{DAY_SECS, HOUR_SECS, hour_start};
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+
+use crate::model::{CachedKillmail, KillboardCoverage};
+use crate::util::{DAY_SECS, HOUR_SECS, hour_start};
 
 const USER_AGENT: &str = "Nomadeer/0.1 private wormhole mapper";
 const ZKILL_PAGE_SIZE: usize = 200;
@@ -714,13 +716,14 @@ fn parse_killmail_time(value: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::{
         ApiKillmail, KILL_WINDOW_SECS, MAX_ZKILL_PAGES, ZKILL_PAGE_SIZE, cached_from_fetched,
         merge_cached_killmails, page_kills, parse_killmail_time, partial_since, summarize_history,
     };
     use crate::model::{CachedKillmail, KillboardCoverage};
     use crate::util::{DAY_SECS, HOUR_SECS};
-    use std::cell::RefCell;
 
     /// Thirty minutes into an hour.
     const NOW: u64 = 20_000 * HOUR_SECS + 1_800;

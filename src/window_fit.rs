@@ -42,11 +42,12 @@ pub(crate) fn is_known_monitor(monitor: Vec2) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui::Vec2;
+
     use super::{
         DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, SMALLEST_MIN_SIZE, WindowFit, fit_to_monitor,
         is_known_monitor,
     };
-    use eframe::egui::Vec2;
 
     fn fit(width: f32, height: f32) -> WindowFit {
         fit_to_monitor(Vec2::new(width, height))

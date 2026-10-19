@@ -6,12 +6,14 @@
 //!
 //! Everything here is pure; `eve_lookup` resolves names and types through ESI.
 
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
 use crate::local_intel::{count_label, join_phrases};
 use crate::model::{CachedKillmail, EveType, KillboardCoverage};
 use crate::probe_scan;
 use crate::util::{DAY_SECS, HOUR_SECS};
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 
 /// How long a paste shapes the assessment; after that it is earlier intel.
 pub(crate) const LIVE_INTEL_FRESH_SECS: u64 = 15 * 60;
@@ -725,6 +727,8 @@ fn add_dscan(live: &mut LiveContribution, report: &DscanReport) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         DscanRow, KillerOverlap, LIVE_INTEL_FRESH_SECS, LocalPilot, LocalReport, SystemKills,
         SystemLiveIntel, ThreatClass, contribution, group_count_text, killer_overlap, local_groups,
@@ -732,7 +736,6 @@ mod tests {
     };
     use crate::model::{CachedKillmail, EveType, KillboardCoverage};
     use crate::util::{DAY_SECS, HOUR_SECS};
-    use std::collections::HashMap;
 
     const NOW: u64 = 1_000 * DAY_SECS;
 

@@ -1,6 +1,7 @@
+use std::time::Duration;
+
 use eframe::egui::ColorImage;
 use reqwest::blocking::Client;
-use std::time::Duration;
 
 const USER_AGENT: &str = "Nomadeer/0.1 private wormhole mapper";
 

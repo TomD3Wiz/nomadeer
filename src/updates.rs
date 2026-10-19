@@ -5,13 +5,14 @@
 //! Nothing is downloaded or installed here; this only reads the release and works
 //! out which of its files suits the way this copy was installed.
 
-use reqwest::StatusCode;
-use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use reqwest::StatusCode;
+use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 
 use crate::util::{DAY_SECS, HOUR_SECS};
 
@@ -929,9 +930,10 @@ fn rate_limit_until(header: &dyn Fn(&str) -> Option<String>, now: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
+
+    use super::*;
 
     const NOW: u64 = 1_792_000_000;
     const PORTABLE_MARKER: &str = "portable";

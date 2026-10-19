@@ -1,5 +1,6 @@
-use crate::config::theme;
 use eframe::egui;
+
+use crate::config::theme;
 
 pub(crate) fn record_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::group(ui.style())

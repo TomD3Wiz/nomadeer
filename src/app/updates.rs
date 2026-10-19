@@ -2,6 +2,14 @@
 //! update settings, the one-time note that Nomadeer checks for updates, and
 //! the download and hand-over once the player presses Update.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use eframe::egui::{self, RichText};
+
 use super::NomadeerApp;
 use crate::config::theme;
 use crate::self_update::{self, Prepared, Sources, Stage, UpdateError};
@@ -10,12 +18,6 @@ use crate::updates::{
     UpdateState,
 };
 use crate::util::now;
-use eframe::egui::{self, RichText};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread;
-use std::time::{Duration, Instant};
 
 /// The first automatic check waits this long after launch, so it never competes
 /// with loading the chain and signing characters in.

@@ -1,7 +1,9 @@
-use crate::model::{Connection, Note, Signature, SystemNode, VisitLog};
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::model::{Connection, Note, Signature, SystemNode, VisitLog};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ChainSnapshot {
@@ -130,9 +132,10 @@ fn slugify_snapshot_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{ChainSnapshot, safe_snapshot_path};
     use crate::model::MapPosition;
-    use std::path::Path;
 
     #[test]
     fn snapshots_keep_hand_placed_systems_and_older_ones_still_load() {
