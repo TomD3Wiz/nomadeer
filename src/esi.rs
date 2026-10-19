@@ -1,8 +1,7 @@
-use crate::model::{
-    Account, CharacterAffiliation, EsiSettings, KillCounts, TrafficFeed, TrafficHour,
-    TrafficReading, TrafficRows,
-};
-use crate::util::{HOUR_SECS, hour_start, now, open_url, parse_http_date};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::blocking::{Client, Response as HttpResponse};
@@ -10,11 +9,14 @@ use reqwest::header::{DATE, EXPIRES, HeaderName, LAST_MODIFIED};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 use tiny_http::{Response, Server, StatusCode};
 use url::Url;
+
+use crate::model::{
+    Account, CharacterAffiliation, EsiSettings, KillCounts, TrafficFeed, TrafficHour,
+    TrafficReading, TrafficRows,
+};
+use crate::util::{HOUR_SECS, hour_start, now, open_url, parse_http_date};
 
 const AUTHORIZE_URL: &str = "https://login.eveonline.com/v2/oauth/authorize/";
 const TOKEN_URL: &str = "https://login.eveonline.com/v2/oauth/token";
@@ -1002,13 +1004,15 @@ fn affiliation_lifetime(date: Option<u64>, expires: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
     use super::{
         ONLINE_SCOPE, affiliation_lifetime, feed_times, lookup_pause, online_cache_lifetime,
         token_has_scope, token_scopes, traffic_next_poll_delay, traffic_retry_delay, with_scope,
     };
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use std::time::Duration;
 
     fn jwt(claims: &str) -> String {
         format!(

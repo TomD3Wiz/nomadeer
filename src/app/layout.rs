@@ -1,8 +1,9 @@
 //! How the dashboard is shared: the chain map above, and under it the dashboard tabs
 //! on the left and Umbra on the right, with dividers the player can drag between them.
 
-use crate::model::DashboardLayout;
 use eframe::egui::{Pos2, Rect, pos2};
+
+use crate::model::DashboardLayout;
 
 /// Neither side is squeezed narrower than this; below twice this the two stack.
 pub(super) const MIN_PANE_WIDTH: f32 = 260.0;
@@ -146,13 +147,14 @@ pub(super) fn grip_dots(divider: Rect) -> [Pos2; 3] {
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui::{Rect, pos2};
+
     use super::{
         DIVIDER_WIDTH, MIN_BELOW_MAP_HEIGHT, MIN_MAP_HEIGHT, MIN_PANE_WIDTH, STACK_GAP,
         clamp_map_fraction, clamp_tabs_fraction, dashboard_panes, fraction_at, grip_dots,
         map_fraction_at, map_split, stacks,
     };
     use crate::model::DashboardLayout;
-    use eframe::egui::{Rect, pos2};
 
     const DEFAULT: f32 = DashboardLayout::DEFAULT_TABS_FRACTION;
 

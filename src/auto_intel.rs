@@ -1,11 +1,12 @@
 //! Intel Nomadeer gathers on its own as recon pilots move: killboard refreshes queued
 //! when one arrives somewhere, and Umbra's briefing once the fresh assessment is in.
 
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
 use crate::local_intel;
 use crate::model::SystemAssessment;
 use crate::util::HOUR_SECS;
-use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
 
 /// The assessment weighs the last hour most, so after an hour it no longer describes
 /// the system as it is now.
@@ -306,13 +307,14 @@ impl AutoBriefings {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
     use super::{
         ASSESSMENT_STALE_SECS, AutoBriefings, IntelQueue, IntelRequest, LocationFix, Presence,
         is_arrival, logged_in, wants_intel_on_arrival,
     };
     use crate::model::SystemAssessment;
-    use std::collections::HashMap;
-    use std::time::{Duration, Instant};
 
     const NOW: u64 = 1_760_000_000;
 

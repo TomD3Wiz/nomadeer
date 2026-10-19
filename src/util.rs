@@ -135,8 +135,9 @@ pub(crate) fn open_url(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hour_start, is_transient_lock, parse_http_date, replace_file};
     use std::io::{Error, ErrorKind};
+
+    use super::{hour_start, is_transient_lock, parse_http_date, replace_file};
 
     #[test]
     fn replace_file_overwrites_an_existing_file() {

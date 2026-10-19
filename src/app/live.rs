@@ -2,6 +2,12 @@
 //! its signatures and, while fresh, folded into its assessment. A new paste
 //! re-assesses the system, and Umbra briefs it if she briefs on her own.
 
+use std::collections::HashSet;
+use std::thread;
+use std::time::Instant;
+
+use eframe::egui;
+
 use super::{NomadeerApp, WARNING_TEXT};
 use crate::auto_intel::{self, IntelRequest};
 use crate::config::theme;
@@ -17,10 +23,6 @@ use crate::store::KILLMAIL_RETENTION_SECS;
 use crate::util::now;
 use crate::wormhole;
 use crate::zkill::ZkillReport;
-use eframe::egui;
-use std::collections::HashSet;
-use std::thread;
-use std::time::Instant;
 
 /// How each kind of paste is kept in the database.
 const LOCAL: &str = "local";
@@ -865,9 +867,10 @@ fn ship_count_text(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui;
+
     use super::{dscan_panel, dscan_status, paste_heading, pilot_count_text};
     use crate::live_intel::{DscanEntry, DscanReport, LIVE_INTEL_FRESH_SECS, ThreatClass};
-    use eframe::egui;
 
     fn report(captured_at: u64) -> DscanReport {
         DscanReport {

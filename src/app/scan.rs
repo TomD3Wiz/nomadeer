@@ -2,6 +2,13 @@
 //! reads the clipboard and applies it to the selected system. Probe scans update its
 //! signatures, which the sidebar lists; local and d-scans are read in `live`.
 
+use std::time::{Duration, Instant};
+
+use eframe::egui::{
+    self, PopupCloseBehavior,
+    containers::menu::{MenuButton, MenuConfig, SubMenuButton},
+};
+
 use super::wormholes::{ConnectionAction, SignatureAction, state_color, wormhole_type_picker};
 use super::{NomadeerApp, WARNING_TEXT};
 use crate::config::theme;
@@ -12,11 +19,6 @@ use crate::probe_scan::{ProbeScan, ScanGroup, SiteKind};
 use crate::signatures;
 use crate::util::now;
 use crate::wormhole;
-use eframe::egui::{
-    self, PopupCloseBehavior,
-    containers::menu::{MenuButton, MenuConfig, SubMenuButton},
-};
-use std::time::{Duration, Instant};
 
 /// How long the Paste scan button waits for the clipboard before giving up.
 const PASTE_WAIT: Duration = Duration::from_secs(1);

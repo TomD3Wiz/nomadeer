@@ -1,11 +1,12 @@
 //! Recon pilots, the characters whose arrivals gather intel, and whether each
 //! character is logged in.
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use crate::auto_intel::Presence;
 use crate::esi::{self, ONLINE_SCOPE};
 use crate::model::{Account, AppData};
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 /// Recon pilots at a time, so a large roster does not queue intel for every system.
 pub(crate) const MAX_RECON_CHARACTERS: usize = 3;
@@ -195,6 +196,11 @@ impl OnlinePolls {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
     use super::{
         MAX_RECON_CHARACTERS, OnlinePolls, apply_recon_default, can_mark_recon,
         mark_added_character, online_scope, recon_count, set_recon,
@@ -202,9 +208,6 @@ mod tests {
     use crate::auto_intel::Presence;
     use crate::esi::ONLINE_SCOPE;
     use crate::model::{Account, AppData};
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use std::time::{Duration, Instant};
 
     fn secs(secs: u64) -> Duration {
         Duration::from_secs(secs)
