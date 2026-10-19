@@ -25,7 +25,7 @@ Every release on the [Releases page](https://github.com/TomD3Wiz/nomadeer/releas
 
 | Platform | File | Notes |
 |---|---|---|
-| Windows | `Nomadeer-<version>-Setup.exe` | Recommended. Installs for your user without admin rights and picks the right edition for your CPU. |
+| Windows | `Nomadeer-<version>-Setup.exe` | Recommended. Installs for your user without admin rights, picks the right edition for your CPU and can install Umbra along the way. |
 | Windows | `Nomadeer-<version>-Windows-Portable.zip` | No install. Keeps its data in a `data` folder next to the exe. |
 | Linux | `Nomadeer-<version>-x86_64.AppImage` | One file. `chmod +x` and run. Picks the right edition at launch. |
 | Linux | `Nomadeer-<version>-x86_64.flatpak` | Sandboxed. `flatpak install --user Nomadeer-<version>-x86_64.flatpak`. Picks the right edition at launch. |
@@ -118,7 +118,9 @@ Umbra has her own panel under the chain map, beside the Movement, Connections, S
 >
 > *Umbra watches the killboards, counts the jumps and remembers the hours when hunters come out. She does not guess and she does not reassure. She tells you what the evidence says, and nothing more.*
 
-Nomadeer embeds the inference runtime but does not include model weights in the repository or any download. Open **Umbra** and choose **Install Umbra** to download her core into the data folder's `models/` directory. You can also install it from a copy of the official file you already have (not available in the Flatpak, which has no access to your files).
+Nomadeer embeds the inference runtime but does not include model weights in the repository or any download. Until her core is installed, her panel shows an **Install Umbra** button that downloads it into the data folder's `models/` directory, with its progress right there; the same panel offers **Repair Umbra** if her core is ever damaged. The **Umbra** button in the top bar has the same controls, and can also install her from a copy of the official file you already have (not available in the Flatpak, which has no access to your files).
+
+The Windows installer offers to install Umbra too, for a per-user install: leave **Install Umbra, Nomadeer's intel companion** ticked and Setup downloads and checks her core so she is online the first time Nomadeer starts. If that download fails or you cancel it, Nomadeer is still installed and her panel offers to install her later. An install for all users leaves her to each player's panel, as she lives in each Windows user's own data folder.
 
 Umbra's core is Qwen2.5 1.5B Instruct Q4_K_M from Hugging Face (Apache 2.0, approximately 1.1 GB), pinned to a specific repository revision. Downloads are SHA-256 verified. After installation, briefings run entirely on your computer without an AI service or account.
 
