@@ -1,0 +1,5 @@
+# Imports in three blocks: std/core/alloc, then external crates, then this
+# crate (crate::, super::, self::). group_imports is still a nightly-only
+# rustfmt option, so `make fmt` and CI format with the pinned nightly in
+# RUSTFMT_TOOLCHAIN; the app itself builds on stable.
+group_imports = "StdExternalCrate"

@@ -180,6 +180,8 @@ make coverage   # run coverage via cargo-llvm-cov
 make qa         # fmt-check + clippy + test + audit + deny
 ```
 
+Formatting groups imports into std, external crates, then this crate (`rustfmt.toml`). That rustfmt option is still nightly-only, so `make fmt` and CI format with a pinned nightly (`RUSTFMT_TOOLCHAIN` in the Makefile) while everything else builds on stable. Install it once with `rustup toolchain install nightly-2026-10-01 --profile minimal --component rustfmt`. Plain stable `cargo fmt` keeps the grouping but prints a warning that it cannot apply the option itself.
+
 Umbra's real-model tests are ignored by default; with the core installed, run them with `cargo test --release -- --ignored`.
 
 ## Roadmap ideas

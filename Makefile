@@ -6,6 +6,10 @@ else
 CARGO ?= cargo
 endif
 
+# rustfmt.toml uses nightly-only options (group_imports), so formatting runs on
+# this pinned nightly; everything else builds on the stable toolchain.
+RUSTFMT_TOOLCHAIN ?= nightly-2026-10-01
+
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 DIST_DIR := dist
 OPTIMIZED_TARGET_DIR := target/optimized
@@ -116,10 +120,10 @@ release-notes:
 	@python3 tools/release.py notes $(VERSION)
 
 fmt:
-	$(CARGO) fmt
+	$(CARGO) +$(RUSTFMT_TOOLCHAIN) fmt
 
 fmt-check:
-	$(CARGO) fmt --check
+	$(CARGO) +$(RUSTFMT_TOOLCHAIN) fmt --check
 
 clippy:
 	$(CARGO) clippy -- -D warnings
