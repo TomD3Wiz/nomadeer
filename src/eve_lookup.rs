@@ -3,14 +3,15 @@
 //! threads. Answers are cached in SQLite, so a paste only asks ESI about what
 //! Nomadeer has not seen before, and a failed lookup still leaves a usable report.
 
-use crate::esi;
-use crate::live_intel::{self, DscanReport, DscanRow, LocalPilot, LocalReport};
-use crate::model::{CharacterAffiliation, EveType};
-use crate::store::Store;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+
+use crate::esi;
+use crate::live_intel::{self, DscanReport, DscanRow, LocalPilot, LocalReport};
+use crate::model::{CharacterAffiliation, EveType};
+use crate::store::Store;
 
 const CHARACTER: &str = "character";
 const INVENTORY_TYPE: &str = "inventory_type";
@@ -328,10 +329,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{affiliate, in_parallel};
     use crate::live_intel::LocalPilot;
     use crate::model::CharacterAffiliation;
-    use std::collections::HashMap;
 
     #[test]
     fn parallel_lookups_keep_their_order() {

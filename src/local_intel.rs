@@ -1,13 +1,3 @@
-use crate::live_intel::LiveContribution;
-use crate::model::{SystemAssessment, SystemNode, SystemTrafficHistory, TrafficSample};
-use crate::paths;
-use crate::util::{DAY_SECS, HOUR_SECS, replace_file};
-use crate::zkill::ZkillReport;
-use candle_core::quantized::gguf_file;
-use candle_core::{Device, Tensor};
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2;
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::ops::RangeInclusive;
@@ -18,7 +8,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::UNIX_EPOCH;
+
+use candle_core::quantized::gguf_file;
+use candle_core::{Device, Tensor};
+use candle_transformers::generation::{LogitsProcessor, Sampling};
+use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2;
+use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
+
+use crate::live_intel::LiveContribution;
+use crate::model::{SystemAssessment, SystemNode, SystemTrafficHistory, TrafficSample};
+use crate::paths;
+use crate::util::{DAY_SECS, HOUR_SECS, replace_file};
+use crate::zkill::ZkillReport;
 
 pub(crate) const UMBRA_TAGLINE: &str = "Sleeper-fused intel companion";
 pub(crate) const UMBRA_LORE: &[&str] = &[
@@ -1230,6 +1232,16 @@ fn format_isk(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime};
+
+    use sha2::{Digest, Sha256};
+
     use super::{
         BriefingEvent, BriefingWorker, CoreFile, CoreStatus, LEGACY_MODEL_DIRECTORY_NAMES,
         LoadedCore, MODEL_DIRECTORY_NAME, VERIFIED_MARKER_FILE, assess_system,
@@ -1246,14 +1258,6 @@ mod tests {
     };
     use crate::util::{DAY_SECS, HOUR_SECS};
     use crate::zkill::{ZkillHistory, ZkillReport};
-    use sha2::{Digest, Sha256};
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::{Duration, SystemTime};
 
     struct TempDir {
         path: PathBuf,

@@ -160,10 +160,11 @@ fn is_absolute_on(os: &str, path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DataDirInputs, legacy_dirs_for, resolve_data_dir};
     use std::collections::{HashMap, HashSet};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+
+    use super::{DataDirInputs, legacy_dirs_for, resolve_data_dir};
 
     struct Case {
         os: &'static str,
