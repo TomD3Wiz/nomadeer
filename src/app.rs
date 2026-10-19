@@ -12,6 +12,7 @@ use crate::recon::{self, MAX_RECON_CHARACTERS, OnlinePolls};
 use crate::store::{KILLMAIL_RETENTION_SECS, Store, TRAFFIC_RETENTION_SECS};
 use crate::util::{clean, now, open_url};
 use crate::widgets::{pill, record_frame};
+use crate::window_fit;
 use crate::zkill::{self, ZkillKill, ZkillReport};
 use eframe::egui::{self, Color32, Sense, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -263,6 +264,8 @@ pub(crate) struct NomadeerApp {
     next_auto_sync: Instant,
     auto_sync_index: usize,
     updates: updates::UpdateUi,
+    /// The window has been fitted to the screen it opened on.
+    window_fitted: bool,
 }
 
 impl NomadeerApp {
@@ -350,6 +353,7 @@ impl NomadeerApp {
             next_auto_sync: Instant::now() + Duration::from_secs(5),
             auto_sync_index: 0,
             updates: updates::UpdateUi::new(),
+            window_fitted: false,
         };
         app.load();
         app
@@ -3557,8 +3561,33 @@ impl NomadeerApp {
     }
 }
 
+impl NomadeerApp {
+    /// Opens the window maximized on a screen too small for its default size, and
+    /// keeps its minimum size within the screen, once the screen's size is known.
+    fn fit_window_to_screen(&mut self, ctx: &egui::Context) {
+        if self.window_fitted {
+            return;
+        }
+        let Some(monitor) = ctx
+            .input(|input| input.viewport().monitor_size)
+            .filter(|monitor| window_fit::is_known_monitor(*monitor))
+        else {
+            return;
+        };
+        self.window_fitted = true;
+        let fit = window_fit::fit_to_monitor(monitor);
+        if fit.min_size != window_fit::MIN_WINDOW_SIZE {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(fit.min_size));
+        }
+        if fit.maximize {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+    }
+}
+
 impl eframe::App for NomadeerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.fit_window_to_screen(ctx);
         self.poll_esi_tasks();
         self.poll_zkill_tasks();
         self.poll_traffic_tasks();
