@@ -68,6 +68,25 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.1" date="2026-10-19">
+      <url type="details">https://github.com/TomD3Wiz/nomadeer/releases/tag/v0.1.1</url>
+      <description>
+        <p>Added</p>
+        <ul>
+          <li>Install Umbra straight from her panel. While she is not installed, her panel says what she needs (a one-time download of about 1.1 GB; she runs entirely on your computer) and has an Install Umbra button, with the download's progress and any problem shown right there. If her core is ever damaged, the same card offers Repair Umbra. It goes away once she is online.</li>
+          <li>The Windows installer can install Umbra for you. Leave Install Umbra, Nomadeer's intel companion ticked and she is online the first time Nomadeer starts. If her download fails or you cancel it, Nomadeer is still installed and you can install her later from her panel. It is offered when installing for yourself; installing for all users leaves her to each player's panel.</li>
+        </ul>
+        <p>Changed</p>
+        <ul>
+          <li>Umbra's briefings always cover both threat and activity, and each half now backs its level with a fact from the evidence instead of only repeating it, so briefings in quiet systems no longer all read the same.</li>
+        </ul>
+        <p>Fixed</p>
+        <ul>
+          <li>A briefing could leave out the activity level when threat and activity were both Quiet, because the threat sentence was taken as covering it.</li>
+          <li>The window no longer opens larger than the screen. On smaller screens, such as 1280x800 or 1366x768 laptops, Nomadeer now opens maximized instead of partly off-screen.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-18">
       <description>
         <p>First release.</p>
