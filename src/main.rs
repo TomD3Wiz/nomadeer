@@ -23,6 +23,7 @@ mod store;
 mod updates;
 mod util;
 mod widgets;
+mod window_fit;
 mod wormhole;
 mod zkill;
 
@@ -60,14 +61,17 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Nomadeer")
         .with_app_id(APP_ID)
-        .with_inner_size([1280.0, 820.0])
-        .with_min_inner_size([960.0, 640.0]);
+        .with_inner_size(window_fit::DEFAULT_WINDOW_SIZE)
+        .with_min_inner_size(window_fit::MIN_WINDOW_SIZE)
+        // Never larger than the screen, even before the first frame fits it.
+        .with_clamp_size_to_monitor_size(true);
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }
 
     let options = eframe::NativeOptions {
         viewport,
+        centered: true,
         ..Default::default()
     };
 

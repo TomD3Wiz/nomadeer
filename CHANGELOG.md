@@ -6,6 +6,20 @@ uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Install Umbra straight from her panel. While she is not installed, her panel
+  says what she needs (a one-time download of about 1.1 GB; she runs entirely
+  on your computer) and has an **Install Umbra** button, with the download's
+  progress and any problem shown right there. If her core is ever damaged, the
+  same card offers **Repair Umbra**. It goes away once she is online.
+- The Windows installer can install Umbra for you. Leave **Install Umbra,
+  Nomadeer's intel companion** ticked and she is online the first time
+  Nomadeer starts. If her download fails or you cancel it, Nomadeer is still
+  installed and you can install her later from her panel. It is offered when
+  installing for yourself; installing for all users leaves her to each
+  player's panel.
+
 ### Changed
 
 - Umbra's briefings always cover both threat and activity, and each half now
@@ -16,6 +30,9 @@ uses [semantic versioning](https://semver.org/).
 
 - A briefing could leave out the activity level when threat and activity were
   both Quiet, because the threat sentence was taken as covering it.
+- The window no longer opens larger than the screen. On smaller screens, such
+  as 1280x800 or 1366x768 laptops, Nomadeer now opens maximized instead of
+  partly off-screen.
 
 ## [0.1.0] - 2026-10-18
 

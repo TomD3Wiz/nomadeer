@@ -105,6 +105,7 @@ windows-installer:
 		$(WINDOWS_INNOSETUP_IMAGE) /Q /DAppVersion=$(VERSION) \
 		'/DOptimizedExe=Z:\stage\nomadeer-optimized.exe' \
 		'/DCompatibleExe=Z:\stage\nomadeer-compatible.exe' \
+		'/DUmbraDefines=Z:\stage\umbra-defines.iss' \
 		'/OZ:\dist' packaging/windows/nomadeer.iss
 	cd $(WINDOWS_DIST_DIR) && sha256sum Nomadeer-$(VERSION)-Setup.exe > Nomadeer-$(VERSION)-Setup.exe.sha256
 

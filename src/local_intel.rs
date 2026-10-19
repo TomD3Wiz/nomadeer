@@ -38,6 +38,8 @@ const TOKENIZER_FILE: &str = "tokenizer.json";
 const TOKENIZER_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/resolve/989aa7980e4cf806f80c7fef2b1adb7bc71aa306/tokenizer.json";
 const TOKENIZER_SHA256: &str = "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539";
 const TOKENIZER_SIZE: u64 = 7_031_645;
+/// Everything installing Umbra downloads: her core and her vocabulary.
+pub(crate) const CORE_DOWNLOAD_SIZE: u64 = MODEL_DOWNLOAD_SIZE + TOKENIZER_SIZE;
 const MODEL_DIRECTORY_NAME: &str = "qwen2.5-1.5b-instruct-q4_k_m";
 /// Cores installed by older Nomadeer versions; nothing reads them any more.
 const LEGACY_MODEL_DIRECTORY_NAMES: &[&str] = &["qwen2-1.5b-instruct-q4"];
@@ -102,6 +104,12 @@ fn model_path() -> PathBuf {
 
 fn tokenizer_path() -> PathBuf {
     model_directory().join(TOKENIZER_FILE)
+}
+
+/// How much installing Umbra downloads, e.g. "1.1 GB". The Windows installer
+/// offers her with the same figure (tools/release.py inno-defines).
+pub(crate) fn download_size_label() -> String {
+    format!("{:.1} GB", CORE_DOWNLOAD_SIZE as f64 / 1_000_000_000.0)
 }
 
 /// Cheap enough to call every frame: two metadata reads and a small marker file.
@@ -1172,8 +1180,17 @@ fn download_verified(
     file: CoreFile,
     progress: &mut impl FnMut(DownloadProgress),
 ) -> Result<(), String> {
-    if destination.exists() && verify_file(destination, file.sha256, file.size).is_ok() {
-        return Ok(());
+    if destination.exists()
+        && fs::metadata(destination).is_ok_and(|metadata| metadata.len() == file.size)
+    {
+        // A copy already here, e.g. from an install that stopped part way, is kept
+        // when it checks out.
+        let checking = format!("Checking {}", file.display_name);
+        if hash_file(destination, &checking, file.size, progress)
+            .is_ok_and(|hash| hash == file.sha256)
+        {
+            return Ok(());
+        }
     }
 
     let part_path = destination.with_extension("part");
@@ -1209,6 +1226,11 @@ fn download_verified(
             return Err(error);
         }
     };
+    progress(DownloadProgress {
+        label: format!("Verifying {}", file.display_name),
+        done: downloaded,
+        total: downloaded,
+    });
     if downloaded != file.size || hash != file.sha256 {
         let _ = fs::remove_file(&part_path);
         return Err(format!(
@@ -1259,8 +1281,23 @@ fn verify_file(path: &Path, expected_hash: &str, expected_size: u64) -> Result<(
     if metadata.len() != expected_size {
         return Err("size does not match".to_owned());
     }
+    let hash = hash_file(path, "", expected_size, &mut |_| {})?;
+    if hash != expected_hash {
+        return Err("checksum does not match".to_owned());
+    }
+    Ok(())
+}
+
+/// The SHA-256 of the file at `path`, reporting progress under `label` as it reads.
+fn hash_file(
+    path: &Path,
+    label: &str,
+    total: u64,
+    progress: &mut impl FnMut(DownloadProgress),
+) -> Result<String, String> {
     let mut file = File::open(path).map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
+    let mut done = 0_u64;
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
@@ -1268,12 +1305,14 @@ fn verify_file(path: &Path, expected_hash: &str, expected_size: u64) -> Result<(
             break;
         }
         hasher.update(&buffer[..count]);
+        done += count as u64;
+        progress(DownloadProgress {
+            label: label.to_owned(),
+            done,
+            total,
+        });
     }
-    let hash = format!("{:x}", hasher.finalize());
-    if hash != expected_hash {
-        return Err("checksum does not match".to_owned());
-    }
-    Ok(())
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn format_isk(value: f64) -> String {
@@ -1301,13 +1340,15 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        BriefingEvent, BriefingWorker, CoreFile, CoreStatus, LEGACY_MODEL_DIRECTORY_NAMES,
-        LoadedCore, MODEL_DIRECTORY_NAME, VERIFIED_MARKER_FILE, assess_system,
-        assess_with_live_intel, attach_briefing, clean_briefing, confidence_label, core_status,
-        core_status_in, fact_sheet, first_sentence_done, import_file, import_path_hint_for,
-        import_source_path, install_model, is_wormhole_space, keep_briefing, numbers_in,
-        remove_cores_in, remove_directory_in, score_label, umbra_thread_count, validate_briefing,
-        verify_core, verify_core_in,
+        BriefingEvent, BriefingWorker, CORE_DOWNLOAD_SIZE, CORE_FILES, CoreFile, CoreStatus,
+        FileStamp, LEGACY_MODEL_DIRECTORY_NAMES, LoadedCore, MODEL_DIRECTORY_NAME,
+        MODEL_DOWNLOAD_SIZE, MODEL_FILE, MODEL_SHA256, MODEL_URL, TOKENIZER_FILE, TOKENIZER_SHA256,
+        TOKENIZER_SIZE, TOKENIZER_URL, VERIFIED_MARKER_FILE, assess_system, assess_with_live_intel,
+        attach_briefing, clean_briefing, confidence_label, core_status, core_status_in,
+        download_size_label, download_verified, fact_sheet, first_sentence_done, import_file,
+        import_path_hint_for, import_source_path, install_model, is_wormhole_space, keep_briefing,
+        marker_contents, numbers_in, remove_cores_in, remove_directory_in, score_label,
+        umbra_thread_count, validate_briefing, verify_core, verify_core_in,
     };
     use crate::live_intel::LiveContribution;
     use crate::model::{
@@ -2163,6 +2204,26 @@ mod tests {
     }
 
     #[test]
+    fn a_sound_file_already_in_place_is_checked_not_downloaded() {
+        let dir = TempDir::new("in-place");
+        let contents = b"official umbra core".to_vec();
+        let hash = sha256(&contents);
+        let file = core_file("core.gguf", &contents, &hash);
+        let installed = dir.path.join("core.gguf");
+        fs::write(&installed, &contents).unwrap();
+
+        // Nothing listens here, so any download attempt would fail.
+        let mut labels = Vec::new();
+        download_verified("http://127.0.0.1:9/core.gguf", &installed, file, &mut |p| {
+            labels.push(p.label);
+        })
+        .expect("the sound copy should be kept");
+        assert_eq!(fs::read(&installed).unwrap(), contents);
+        assert!(!labels.is_empty());
+        assert!(labels.iter().all(|label| label == "Checking core.gguf"));
+    }
+
+    #[test]
     fn removing_umbra_clears_old_cores_and_nothing_else() {
         let dir = TempDir::new("remove");
         let root = dir.path.join("models");
@@ -2349,5 +2410,108 @@ mod tests {
         let mut changed = newer.clone();
         keep_briefing(&mut changed, &briefed);
         assert!(!changed.model_generated);
+    }
+
+    /// The ISPP defines tools/release.py generates for the Windows installer.
+    fn windows_setup_defines() -> std::collections::HashMap<String, String> {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/release.py");
+        let mut failures = Vec::new();
+        for python in ["python3", "python"] {
+            match std::process::Command::new(python)
+                .arg(&script)
+                .arg("inno-defines")
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    return String::from_utf8(output.stdout)
+                        .expect("defines should be UTF-8")
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("#define "))
+                        .map(|define| {
+                            let (name, value) = define.split_once(' ').expect("name and value");
+                            (name.to_owned(), value.trim_matches('"').to_owned())
+                        })
+                        .collect();
+                }
+                Ok(output) => failures.push(format!(
+                    "{python}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(error) => failures.push(format!("{python}: {error}")),
+            }
+        }
+        panic!(
+            "tools/release.py inno-defines needs Python 3: {}",
+            failures.join("; ")
+        );
+    }
+
+    #[test]
+    fn windows_setup_installs_umbra_where_nomadeer_looks() {
+        let defines = windows_setup_defines();
+        let define = |name: &str| {
+            defines
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is not generated"))
+                .as_str()
+        };
+        let expected = [
+            ("UmbraDataDir", crate::paths::APP_DIR_NAME.to_owned()),
+            ("UmbraModelsDir", crate::paths::MODELS_DIR_NAME.to_owned()),
+            ("UmbraCoreDir", MODEL_DIRECTORY_NAME.to_owned()),
+            ("UmbraMarkerFile", VERIFIED_MARKER_FILE.to_owned()),
+            ("UmbraModelFile", MODEL_FILE.to_owned()),
+            ("UmbraModelUrl", MODEL_URL.to_owned()),
+            ("UmbraModelSha256", MODEL_SHA256.to_owned()),
+            ("UmbraModelSize", MODEL_DOWNLOAD_SIZE.to_string()),
+            ("UmbraTokenizerFile", TOKENIZER_FILE.to_owned()),
+            ("UmbraTokenizerUrl", TOKENIZER_URL.to_owned()),
+            ("UmbraTokenizerSha256", TOKENIZER_SHA256.to_owned()),
+            ("UmbraTokenizerSize", TOKENIZER_SIZE.to_string()),
+            ("UmbraDownloadSize", download_size_label()),
+        ];
+        for (name, value) in &expected {
+            assert_eq!(define(name), value, "{name}");
+        }
+        assert_eq!(defines.len(), expected.len(), "{defines:?}");
+
+        // Setup writes the verified marker itself, a line per file in this order;
+        // it must read exactly as Nomadeer's own.
+        let stamps = [
+            FileStamp {
+                len: MODEL_DOWNLOAD_SIZE,
+                modified_nanos: 1_760_000_000_123_456_700,
+            },
+            FileStamp {
+                len: TOKENIZER_SIZE,
+                modified_nanos: 1_760_000_001_000_000_000,
+            },
+        ];
+        let setup_marker = format!(
+            "{} {} {} {}\n{} {} {} {}\n",
+            define("UmbraModelFile"),
+            define("UmbraModelSha256"),
+            define("UmbraModelSize"),
+            stamps[0].modified_nanos,
+            define("UmbraTokenizerFile"),
+            define("UmbraTokenizerSha256"),
+            define("UmbraTokenizerSize"),
+            stamps[1].modified_nanos,
+        );
+        assert_eq!(setup_marker, marker_contents(&CORE_FILES, &stamps));
+        assert_eq!(
+            Path::new(define("UmbraModelsDir"))
+                .join(define("UmbraCoreDir"))
+                .join(define("UmbraModelFile")),
+            Path::new(crate::paths::MODELS_DIR_NAME)
+                .join(MODEL_DIRECTORY_NAME)
+                .join(MODEL_FILE)
+        );
+    }
+
+    #[test]
+    fn the_download_size_reads_in_gigabytes() {
+        assert_eq!(CORE_DOWNLOAD_SIZE, 1_124_352_381);
+        assert_eq!(download_size_label(), "1.1 GB");
     }
 }

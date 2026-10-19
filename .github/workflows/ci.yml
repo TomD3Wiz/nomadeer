@@ -54,6 +54,9 @@ jobs:
       - name: Check release version files agree
         run: python3 tools/release.py check
 
+      - name: Check the Windows installer's Umbra downloads can be generated
+        run: python3 tools/release.py inno-defines
+
       - name: Check formatting
         run: cargo +nightly-2026-10-01 fmt --all --check
 

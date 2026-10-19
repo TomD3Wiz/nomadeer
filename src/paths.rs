@@ -16,6 +16,11 @@ pub(crate) const LEGACY_DATABASE_FILE: &str = "eve_wanderer.sqlite3";
 pub(crate) const LEGACY_JSON_FILES: [&str; 2] = ["nomadeer.json", "eve_wanderer.json"];
 /// A file with this name next to the executable keeps data beside it.
 const PORTABLE_MARKER: &str = "portable";
+/// The per-user data folder's name on Windows and macOS. The Windows installer
+/// puts Umbra under it too (tools/release.py inno-defines).
+pub(crate) const APP_DIR_NAME: &str = "Nomadeer";
+/// Where Umbra's cores live inside the data folder.
+pub(crate) const MODELS_DIR_NAME: &str = "models";
 
 /// Everything the data folder choice depends on, so it can be decided without
 /// touching the real environment.
@@ -59,7 +64,7 @@ pub(crate) fn chain_archive_dir() -> PathBuf {
 }
 
 pub(crate) fn models_dir() -> PathBuf {
-    data_dir().join("models")
+    data_dir().join(MODELS_DIR_NAME)
 }
 
 /// Folders older Nomadeer versions may have left data in: the data folder itself and
@@ -131,11 +136,11 @@ fn per_user_data_dir(os: &str, env: &dyn Fn(&str) -> Option<OsString>) -> Option
     match os {
         "windows" => absolute_var("LOCALAPPDATA")
             .or_else(|| absolute_var("APPDATA"))
-            .map(|base| base.join("Nomadeer")),
+            .map(|base| base.join(APP_DIR_NAME)),
         "macos" => absolute_var("HOME").map(|home| {
             home.join("Library")
                 .join("Application Support")
-                .join("Nomadeer")
+                .join(APP_DIR_NAME)
         }),
         _ => absolute_var("XDG_DATA_HOME")
             .or_else(|| absolute_var("HOME").map(|home| home.join(".local").join("share")))
